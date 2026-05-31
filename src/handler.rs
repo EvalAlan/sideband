@@ -284,7 +284,7 @@ async fn handle_file_chunk(
                     .unwrap_or("download.bin")
                     .to_string();
                 let out_path = downloads_dir.join(&safe_name);
-                match std::fs::write(&out_path, &data) {
+                match write_file_atomically(&out_path, &data) {
                     Ok(_) => {
                         body = format!("[file received: {}]", out_path.display());
                     }
@@ -317,6 +317,10 @@ async fn handle_file_chunk(
     Ok(())
 }
 
+fn ack_is_acceptable(ack: &FileAckPayload) -> bool {
+    ack.status == "received" && ack.chunk_index < ack.total_chunks
+}
+
 async fn handle_file_ack(
     tui_tx: &mpsc::Sender<TuiEvent>,
     contacts: &ContactsMap,
@@ -332,13 +336,21 @@ async fn handle_file_ack(
         });
 
     if verified {
+        let mut accepted = false;
         if let Ok(ack) = serde_json::from_str::<FileAckPayload>(&plaintext) {
-            if let Ok(mut set) = crate::file_ack_set().lock() {
-                set.insert(crate::ack_key(&ack.hash, ack.chunk_index));
+            if ack_is_acceptable(&ack) {
+                if let Ok(mut set) = crate::file_ack_set().lock() {
+                    set.insert(crate::ack_key(&ack.hash, ack.chunk_index));
+                    accepted = true;
+                }
             }
         }
         let contact_name = contact_name_for_pubkey(contacts, &msg.from, true);
-        let body = format!("[file ack] {plaintext}");
+        let body = if accepted {
+            format!("[file ack] {plaintext}")
+        } else {
+            format!("[file ack ignored] {plaintext}")
+        };
         let _ = tui_tx
             .send(TuiEvent::InboundMessage {
                 contact: contact_name,
@@ -349,6 +361,37 @@ async fn handle_file_ack(
             .await;
     }
 
+    Ok(())
+}
+
+fn write_file_atomically(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("output path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+
+    let pid = std::process::id();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("download.bin");
+    let tmp_name = format!(".{}.{}.{}.part", base_name, pid, ts);
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
 
@@ -365,4 +408,49 @@ fn contact_name_for_pubkey(contacts: &ContactsMap, pubkey: &str, verified: bool)
                 pubkey.to_string()
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ack_is_acceptable, write_file_atomically};
+    use crate::FileAckPayload;
+
+    #[test]
+    fn atomic_write_replaces_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("recv.bin");
+
+        write_file_atomically(&out, b"hello").unwrap();
+        let first = std::fs::read(&out).unwrap();
+        assert_eq!(first, b"hello");
+
+        write_file_atomically(&out, b"world").unwrap();
+        let second = std::fs::read(&out).unwrap();
+        assert_eq!(second, b"world");
+    }
+
+    #[test]
+    fn ack_acceptance_requires_received_and_valid_index() {
+        let ok = FileAckPayload {
+            hash: "abc".to_string(),
+            chunk_index: 1,
+            total_chunks: 4,
+            status: "received".to_string(),
+        };
+        assert!(ack_is_acceptable(&ok));
+
+        let bad_status = FileAckPayload {
+            status: "error".to_string(),
+            ..ok
+        };
+        assert!(!ack_is_acceptable(&bad_status));
+
+        let out_of_range = FileAckPayload {
+            hash: "abc".to_string(),
+            chunk_index: 4,
+            total_chunks: 4,
+            status: "received".to_string(),
+        };
+        assert!(!ack_is_acceptable(&out_of_range));
+    }
 }

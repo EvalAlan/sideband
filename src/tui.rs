@@ -1076,7 +1076,7 @@ fn chat_scroll_position(
 }
 
 fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
-    let lines: Vec<Line> = app
+    let items: Vec<ListItem> = app
         .messages
         .iter()
         .map(|m| {
@@ -1119,27 +1119,25 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(color),
                 ));
             }
-            Line::from(spans)
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
-    let msg_len = lines.len();
+    let msg_len = items.len();
     // Chat UIs should follow the bottom by default. Treat scroll_offset as
     // "lines back from newest": 0 = bottom, PgUp = older, PgDn = newer.
     let visible_height = area.height.saturating_sub(2) as usize; // subtract borders
     let scroll = chat_scroll_position(msg_len, visible_height, app.scroll_offset);
 
-    let widget = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title("Messages")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::White)),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: true })
-        .scroll((scroll as u16, 0));
+    let widget = List::new(items).block(
+        Block::default()
+            .title("Messages")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White)),
+    );
 
-    f.render_widget(widget, area);
+    let mut state = ListState::default().with_offset(scroll);
+    f.render_stateful_widget(widget, area, &mut state);
 
     // Scrollbar
     if msg_len > visible_height {
