@@ -54,16 +54,25 @@ class SidebandCli {
   SidebandCli();
 
   final String? _overridePath = Platform.environment['SIDEBAND_BIN'];
+  final String _profile =
+      Platform.environment['SIDEBAND_PROFILE'] ?? '~/.sideband';
 
-  Future<String> _run(List<String> args) async {
+  String get profile => _profile;
+
+  Future<CliResult> _run(List<String> args) async {
     final executable = await _resolveExecutable();
-    final result = await Process.run(executable, args);
+    final fullArgs = ['--profile', _profile, ...args];
+    final result = await Process.run(executable, fullArgs);
     if (result.exitCode != 0) {
       throw Exception((result.stderr as String).trim().isEmpty
           ? 'sideband failed with code ${result.exitCode}'
           : (result.stderr as String).trim());
     }
-    return (result.stdout as String).trim();
+    return CliResult(
+      executable: executable,
+      args: fullArgs,
+      stdout: (result.stdout as String).trim(),
+    );
   }
 
   Future<String> _resolveExecutable() async {
@@ -83,7 +92,8 @@ class SidebandCli {
   }
 
   Future<List<Contact>> contacts() async {
-    final raw = await _run(['contact', 'list']);
+    final out = await _run(['contact', 'list']);
+    final raw = out.stdout;
     if (raw.isEmpty) {
       return [];
     }
@@ -104,15 +114,21 @@ class SidebandCli {
     }).toList();
   }
 
-  Future<List<ChatMessage>> history({String? contact, int limit = 80}) async {
+  Future<HistoryResult> history({String? contact, int limit = 80}) async {
     final args = ['history', '--limit', '$limit'];
     if (contact != null && contact.trim().isNotEmpty) {
       args.addAll(['--contact', contact.trim()]);
     }
 
-    final raw = await _run(args);
+    final out = await _run(args);
+    final raw = out.stdout;
     if (raw.isEmpty) {
-      return [];
+      return HistoryResult(
+          messages: const [],
+          rawLineCount: 0,
+          parsedLineCount: 0,
+          maxId: null,
+          executable: out.executable);
     }
 
     final pattern = RegExp(
@@ -120,11 +136,11 @@ class SidebandCli {
     );
 
     final parsed = <ChatMessage>[];
-    for (final line
-        in raw.split('\n').where((line) => line.trim().isNotEmpty)) {
+    final lines =
+        raw.split('\n').where((line) => line.trim().isNotEmpty).toList();
+    for (final line in lines) {
       final m = pattern.firstMatch(line.trim());
       if (m == null) {
-        // Don't drop the entire timeline because one row format changed.
         continue;
       }
       parsed.add(
@@ -139,13 +155,49 @@ class SidebandCli {
       );
     }
 
-    return parsed.reversed.toList();
+    final ordered = parsed.reversed.toList();
+    final maxId = parsed.isEmpty
+        ? null
+        : parsed.map((m) => m.id).reduce((a, b) => a > b ? a : b);
+
+    return HistoryResult(
+      messages: ordered,
+      rawLineCount: lines.length,
+      parsedLineCount: parsed.length,
+      maxId: maxId,
+      executable: out.executable,
+    );
   }
 
   Future<void> sendMessage(
       {required String to, required String message}) async {
     await _run(['send', '--to', to, '--message', message]);
   }
+}
+
+class CliResult {
+  CliResult(
+      {required this.executable, required this.args, required this.stdout});
+
+  final String executable;
+  final List<String> args;
+  final String stdout;
+}
+
+class HistoryResult {
+  HistoryResult({
+    required this.messages,
+    required this.rawLineCount,
+    required this.parsedLineCount,
+    required this.maxId,
+    required this.executable,
+  });
+
+  final List<ChatMessage> messages;
+  final int rawLineCount;
+  final int parsedLineCount;
+  final int? maxId;
+  final String executable;
 }
 
 class ChatScreen extends StatefulWidget {
@@ -166,6 +218,11 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _sending = false;
   String? _error;
   Timer? _refreshTimer;
+  DateTime? _lastRefreshAt;
+  int? _lastMaxMessageId;
+  int _lastRawLines = 0;
+  int _lastParsedLines = 0;
+  String _activeBinary = 'resolving...';
 
   @override
   void initState() {
@@ -201,12 +258,17 @@ class _ChatScreenState extends State<ChatScreen> {
             : (contacts.isNotEmpty ? contacts.first : null);
       }
 
-      final history = await _cli.history(contact: selected?.name);
+      final historyResult = await _cli.history(contact: selected?.name);
 
       setState(() {
         _contacts = contacts;
         _selectedContact = selected;
-        _messages = history;
+        _messages = historyResult.messages;
+        _lastRefreshAt = DateTime.now();
+        _lastMaxMessageId = historyResult.maxId;
+        _lastRawLines = historyResult.rawLineCount;
+        _lastParsedLines = historyResult.parsedLineCount;
+        _activeBinary = historyResult.executable;
         _loading = false;
       });
     } catch (e) {
@@ -222,9 +284,14 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
     try {
-      final history = await _cli.history(contact: _selectedContact!.name);
+      final historyResult = await _cli.history(contact: _selectedContact!.name);
       setState(() {
-        _messages = history;
+        _messages = historyResult.messages;
+        _lastRefreshAt = DateTime.now();
+        _lastMaxMessageId = historyResult.maxId;
+        _lastRawLines = historyResult.rawLineCount;
+        _lastParsedLines = historyResult.parsedLineCount;
+        _activeBinary = historyResult.executable;
         if (!silent) {
           _error = null;
         }
@@ -252,11 +319,25 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     try {
+      final now = DateTime.now();
+      final optimistic = ChatMessage(
+        id: -now.millisecondsSinceEpoch,
+        direction: 'out',
+        status: 'sending',
+        contact: contact.name,
+        text: text,
+        timestampMs: now.millisecondsSinceEpoch,
+      );
+      setState(() {
+        _messages = [..._messages, optimistic];
+      });
+
       await _cli.sendMessage(to: contact.name, message: text);
       _inputController.clear();
       await _refreshMessages();
     } catch (e) {
       setState(() => _error = e.toString());
+      await _refreshMessages(silent: true);
     } finally {
       if (mounted) {
         setState(() => _sending = false);
@@ -345,7 +426,8 @@ class _ChatScreenState extends State<ChatScreen> {
       children: [
         ListTile(
           title: Text(selected.name),
-          subtitle: Text('${selected.onion}\nprofile: ~/.sideband'),
+          subtitle: Text(
+              '${selected.onion}\nprofile: ${_cli.profile}\nbin: $_activeBinary'),
           isThreeLine: true,
         ),
         const Divider(height: 1),
@@ -359,6 +441,15 @@ class _ChatScreenState extends State<ChatScreen> {
               style: const TextStyle(color: Colors.white),
             ),
           ),
+        Container(
+          width: double.infinity,
+          color: Colors.black54,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Text(
+            'refresh: ${_lastRefreshAt == null ? 'never' : _formatTime(_lastRefreshAt!)}  rows: $_lastParsedLines/$_lastRawLines  max_id: ${_lastMaxMessageId ?? '-'}',
+            style: TextStyle(fontSize: 11, color: Colors.grey.shade300),
+          ),
+        ),
         Expanded(
           child: _messages.isEmpty
               ? const Center(child: Text('No messages yet.'))

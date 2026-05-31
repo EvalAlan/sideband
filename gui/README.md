@@ -17,10 +17,11 @@ This is now a working desktop chat client shell backed by the Sideband CLI.
 - Existing Sideband profile + contacts (create via CLI)
 - Linux desktop session for `flutter run -d linux` (not headless SSH shell)
 
-Optional override:
+Optional overrides:
 
 ```bash
 export SIDEBAND_BIN=/absolute/path/to/sideband
+export SIDEBAND_PROFILE=~/.sideband
 ```
 
 ## Run (Linux)
