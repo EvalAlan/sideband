@@ -233,10 +233,22 @@ struct FileAckPayload {
     status: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct IncomingFileState {
     total_chunks: usize,
     chunks: Vec<Option<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OutboundTransferState {
+    contact_name: String,
+    onion: String,
+    file_name: String,
+    file_path: String,
+    hash: String,
+    total_size: usize,
+    total_chunks: usize,
+    next_chunk_index: usize,
 }
 
 static INCOMING_FILES: std::sync::OnceLock<
@@ -256,6 +268,70 @@ fn file_ack_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>
 
 fn ack_key(hash: &str, chunk_index: usize) -> String {
     format!("{hash}:{chunk_index}")
+}
+
+fn incoming_state_path(profile: &Path) -> std::path::PathBuf {
+    profile.join("transfers").join("incoming_state.json")
+}
+
+fn outbound_state_path(profile: &Path, hash: &str) -> std::path::PathBuf {
+    profile
+        .join("transfers")
+        .join(format!("outbound_{hash}.json"))
+}
+
+fn persist_incoming_states(profile: &Path) -> Result<()> {
+    let path = incoming_state_path(profile);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let snapshot = {
+        let map = incoming_files_map()
+            .lock()
+            .map_err(|_| anyhow!("incoming file map lock poisoned"))?;
+        map.clone()
+    };
+    fs::write(path, serde_json::to_vec_pretty(&snapshot)?)?;
+    Ok(())
+}
+
+fn load_incoming_states(profile: &Path) -> Result<()> {
+    let path = incoming_state_path(profile);
+    if !path.exists() {
+        return Ok(());
+    }
+    let data = fs::read(&path)?;
+    let parsed: std::collections::HashMap<String, IncomingFileState> =
+        serde_json::from_slice(&data)?;
+    let mut map = incoming_files_map()
+        .lock()
+        .map_err(|_| anyhow!("incoming file map lock poisoned"))?;
+    *map = parsed;
+    Ok(())
+}
+
+fn persist_outbound_state(profile: &Path, state: &OutboundTransferState) -> Result<()> {
+    let path = outbound_state_path(profile, &state.hash);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    Ok(())
+}
+
+fn load_outbound_state(profile: &Path, hash: &str) -> Result<Option<OutboundTransferState>> {
+    let path = outbound_state_path(profile, hash);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read(path)?;
+    let st: OutboundTransferState = serde_json::from_slice(&data)?;
+    Ok(Some(st))
+}
+
+fn clear_outbound_state(profile: &Path, hash: &str) {
+    let path = outbound_state_path(profile, hash);
+    let _ = fs::remove_file(path);
 }
 
 /// Send a file to a contact. Sends `file_offer` then all `file_chunk` messages.
@@ -291,24 +367,47 @@ pub(crate) async fn send_file(
 
     let onion = crate::resolve_to(profile, contact_name)?;
 
-    let offer = FileOfferPayload {
-        name: file_name.clone(),
-        size: total_size,
-        hash: hash.clone(),
-        total_chunks,
-    };
-    let offer_json = serde_json::to_string(&offer)?;
-    send_typed_message(
-        profile,
-        &onion,
-        contact_name,
-        "file_offer",
-        &offer_json,
-        Arc::clone(&tor_client),
-    )
-    .await?;
+    let mut outbound_state =
+        load_outbound_state(profile, &hash)?.unwrap_or(OutboundTransferState {
+            contact_name: contact_name.to_string(),
+            onion: onion.clone(),
+            file_name: file_name.clone(),
+            file_path: file_path.to_string(),
+            hash: hash.clone(),
+            total_size,
+            total_chunks,
+            next_chunk_index: 0,
+        });
 
-    for chunk_index in 0..total_chunks {
+    // Ensure state reflects current invocation paths.
+    outbound_state.contact_name = contact_name.to_string();
+    outbound_state.onion = onion.clone();
+    outbound_state.file_name = file_name.clone();
+    outbound_state.file_path = file_path.to_string();
+    outbound_state.total_size = total_size;
+    outbound_state.total_chunks = total_chunks;
+    persist_outbound_state(profile, &outbound_state)?;
+
+    if outbound_state.next_chunk_index == 0 {
+        let offer = FileOfferPayload {
+            name: file_name.clone(),
+            size: total_size,
+            hash: hash.clone(),
+            total_chunks,
+        };
+        let offer_json = serde_json::to_string(&offer)?;
+        send_typed_message(
+            profile,
+            &onion,
+            contact_name,
+            "file_offer",
+            &offer_json,
+            Arc::clone(&tor_client),
+        )
+        .await?;
+    }
+
+    for chunk_index in outbound_state.next_chunk_index..total_chunks {
         let start = chunk_index * FILE_CHUNK_SIZE;
         let end = ((chunk_index + 1) * FILE_CHUNK_SIZE).min(total_size);
         let payload = FileChunkPayload {
@@ -350,6 +449,9 @@ pub(crate) async fn send_file(
                 chunk_index
             ));
         }
+
+        outbound_state.next_chunk_index = chunk_index + 1;
+        persist_outbound_state(profile, &outbound_state)?;
     }
 
     let timestamp_ms = std::time::SystemTime::now()
@@ -368,6 +470,7 @@ pub(crate) async fn send_file(
         crate::DeliveryStatus::Sent,
     )?;
 
+    clear_outbound_state(profile, &hash);
     drop(tor_client);
     Ok(())
 }
@@ -1711,6 +1814,9 @@ async fn serve(
     tor_client: Arc<TorClient<PreferredRuntime>>,
 ) -> Result<()> {
     let _key = load_signing_key(profile)?;
+    if let Err(e) = load_incoming_states(profile) {
+        warn!(error=%e, "failed to load persisted incoming file state");
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_port = listener.local_addr()?.port();
 
@@ -1814,6 +1920,9 @@ async fn serve(
                                                         chunks: vec![None; offer.total_chunks],
                                                     },
                                                 );
+                                                if let Err(e) = persist_incoming_states(&profile) {
+                                                    warn!(error=%e, "failed to persist incoming file offer state");
+                                                }
                                                 format!(
                                                     "[file offer] {} ({} bytes, {} chunks)",
                                                     offer.name, offer.size, offer.total_chunks
@@ -1871,6 +1980,9 @@ async fn serve(
                                                 completed_data = Some(assembled);
                                                 map.remove(&key);
                                             }
+                                        }
+                                        if let Err(e) = persist_incoming_states(&profile) {
+                                            warn!(error=%e, "failed to persist incoming chunk state");
                                         }
 
                                         let ack = FileAckPayload {
