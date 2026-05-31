@@ -2799,6 +2799,73 @@ fn outbound_transfer_resume_uses_persisted_next_chunk_index() {
 }
 
 #[test]
+fn inbound_transfer_state_survives_restart_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+
+    {
+        let mut map = incoming_files_map().lock().unwrap();
+        map.clear();
+        map.insert(
+            "alicepub:hash123".to_string(),
+            IncomingFileState {
+                total_chunks: 3,
+                chunks: vec![Some(vec![1, 2, 3]), None, Some(vec![9])],
+            },
+        );
+    }
+    persist_incoming_states(profile).unwrap();
+
+    // Simulate process restart by dropping in-memory state.
+    {
+        let mut map = incoming_files_map().lock().unwrap();
+        map.clear();
+    }
+
+    load_incoming_states(profile).unwrap();
+
+    let map = incoming_files_map().lock().unwrap();
+    let st = map.get("alicepub:hash123").expect("restored state missing");
+    assert_eq!(st.total_chunks, 3);
+    assert_eq!(st.chunks[0].as_deref(), Some(&[1, 2, 3][..]));
+    assert!(st.chunks[1].is_none());
+    assert_eq!(st.chunks[2].as_deref(), Some(&[9][..]));
+}
+
+#[test]
+fn outbound_transfer_checkpoint_survives_restart_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    let hash = "resume-after-restart";
+
+    let st = OutboundTransferState {
+        contact_name: "alice".to_string(),
+        onion: "aliceexampleonionxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion".to_string(),
+        file_path: "/tmp/resume.bin".to_string(),
+        file_name: "resume.bin".to_string(),
+        hash: hash.to_string(),
+        total_size: 200_000,
+        total_chunks: 7,
+        next_chunk_index: 5,
+    };
+    persist_outbound_state(profile, &st).unwrap();
+
+    // Simulate restart by reloading from DB-only state.
+    let loaded = load_outbound_state(profile, hash)
+        .unwrap()
+        .expect("missing state");
+    assert_eq!(loaded.next_chunk_index, 5);
+    assert_eq!(loaded.total_chunks, 7);
+    assert_eq!(loaded.file_path, "/tmp/resume.bin");
+
+    let target = outbound_transfer_target(profile, hash).unwrap();
+    assert_eq!(
+        target,
+        Some(("alice".to_string(), "/tmp/resume.bin".to_string()))
+    );
+}
+
+#[test]
 fn parse_inbound_line_rejects_garbage() {
     assert!(handler::parse_inbound_line("not json").unwrap().is_none());
     assert!(handler::parse_inbound_line("").unwrap().is_none());
@@ -2858,9 +2925,6 @@ fn tor_transport_envelope_round_trip() {
 fn tor_transport_try_recv_returns_envelope_from_channel() {
     // Create a TorTransport, inject an envelope via the inbound channel,
     // and verify try_recv returns it.
-    use arti_client::TorClient;
-    use tor_rtcompat::PreferredRuntime;
-
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // We can't easily create a real TorClient without a running Tor,
