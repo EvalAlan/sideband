@@ -334,6 +334,56 @@ fn clear_outbound_state(profile: &Path, hash: &str) {
     let _ = fs::remove_file(path);
 }
 
+pub(crate) fn list_transfers(profile: &Path) -> Result<Vec<String>> {
+    let mut rows = Vec::new();
+
+    let transfers_dir = profile.join("transfers");
+    if transfers_dir.exists() {
+        for entry in fs::read_dir(&transfers_dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with("outbound_") && name.ends_with(".json") {
+                let data = fs::read(&p)?;
+                if let Ok(st) = serde_json::from_slice::<OutboundTransferState>(&data) {
+                    rows.push(format!(
+                        "outbound {} -> {} chunk {}/{} file={}",
+                        st.hash,
+                        st.contact_name,
+                        st.next_chunk_index,
+                        st.total_chunks,
+                        st.file_name
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Ok(map) = incoming_files_map().lock() {
+        for (k, st) in map.iter() {
+            let have = st.chunks.iter().filter(|c| c.is_some()).count();
+            rows.push(format!(
+                "incoming {} chunks {}/{}",
+                k, have, st.total_chunks
+            ));
+        }
+    }
+
+    rows.sort();
+    Ok(rows)
+}
+
+pub(crate) fn cancel_outbound_transfer(profile: &Path, hash: &str) -> Result<bool> {
+    let p = outbound_state_path(profile, hash);
+    if p.exists() {
+        fs::remove_file(p)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Send a file to a contact. Sends `file_offer` then all `file_chunk` messages.
 pub(crate) async fn send_file(
     profile: &Path,

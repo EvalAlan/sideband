@@ -162,7 +162,7 @@ impl App {
                 }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send message\n/file <contact> <path> — send file\n/history [contact] — show log\n/contacts — list contacts with keys\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send message\n/file <contact> <path> — send file\n/transfers [cancel <hash>] — list/cancel transfers\n/history [contact] — show log\n/contacts — list contacts with keys\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
                         "help",
                     );
                     return false;
@@ -348,6 +348,31 @@ impl App {
                             "info",
                         ),
                         Err(e) => self.push_sys(&format!("ratchet init failed: {}", e), "error"),
+                    }
+                    return false;
+                }
+                Some("transfers") => {
+                    if parts.len() >= 3 && parts[1] == "cancel" {
+                        let hash = parts[2].trim();
+                        match crate::cancel_outbound_transfer(&self.profile, hash) {
+                            Ok(true) => {
+                                self.push_sys(&format!("transfer {} cancelled", hash), "info")
+                            }
+                            Ok(false) => {
+                                self.push_sys(&format!("transfer {} not found", hash), "error")
+                            }
+                            Err(e) => {
+                                self.push_sys(&format!("transfer cancel failed: {}", e), "error")
+                            }
+                        }
+                        return false;
+                    }
+                    match crate::list_transfers(&self.profile) {
+                        Ok(rows) if rows.is_empty() => self.push_sys("transfers:\n(none)", "info"),
+                        Ok(rows) => {
+                            self.push_sys(&format!("transfers:\n{}", rows.join("\n")), "info")
+                        }
+                        Err(e) => self.push_sys(&format!("transfers failed: {}", e), "error"),
                     }
                     return false;
                 }
