@@ -205,6 +205,7 @@ pub(crate) struct ChatMessage {
 // ---------------------------------------------------------------------------
 
 const FILE_CHUNK_SIZE: usize = 8 * 1024; // 8 KB chunks (smaller HS payload for better reliability)
+const FILE_INLINE_MAX_SIZE: usize = 96 * 1024; // auto-inline small/medium files; no mode switching for users
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct FileOfferPayload {
@@ -504,7 +505,7 @@ pub(crate) async fn send_file(
 
     // Fast path for tiny files: send as one inline payload over a single message.
     // This avoids chunk/ack round-trips that are fragile over hidden-service circuits.
-    if total_size <= FILE_CHUNK_SIZE {
+    if total_size <= FILE_INLINE_MAX_SIZE {
         let inline = FileInlinePayload {
             name: file_name.clone(),
             size: total_size,
