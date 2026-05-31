@@ -1,0 +1,3 @@
+rust_input: ../src/app_api.rs
+dart_output: lib/bridge/bridge_generated.dart
+c_output: ios/Runner/bridge_generated.h
