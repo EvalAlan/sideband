@@ -162,7 +162,7 @@ impl App {
                 }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send message\n/file <contact> <path> — send file\n/transfers [cancel <hash>] — list/cancel transfers\n/history [contact] — show log\n/contacts — list contacts with keys\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send message\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/contacts — list contacts with keys\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
                         "help",
                     );
                     return false;
@@ -363,6 +363,22 @@ impl App {
                             }
                             Err(e) => {
                                 self.push_sys(&format!("transfer cancel failed: {}", e), "error")
+                            }
+                        }
+                        return false;
+                    }
+                    if parts.len() >= 3 && parts[1] == "resume" {
+                        let hash = parts[2].trim();
+                        match crate::outbound_transfer_target(&self.profile, hash) {
+                            Ok(Some((contact, file_path))) => {
+                                self.push_sys(&format!("resuming transfer {}", hash), "info");
+                                self.do_send_file(&contact, &file_path);
+                            }
+                            Ok(None) => {
+                                self.push_sys(&format!("transfer {} not found", hash), "error")
+                            }
+                            Err(e) => {
+                                self.push_sys(&format!("transfer resume failed: {}", e), "error")
                             }
                         }
                         return false;

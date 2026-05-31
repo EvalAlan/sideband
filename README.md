@@ -188,6 +188,6 @@ Current state:
 - Arti bootstrapping on first run requires network access and may take 30-60s
 - No Bluetooth or Wi-Fi Direct transports
 - No mobile client
-- File transfer currently sends offers only; chunk reassembly is TODO
+- File transfer supports offer/chunk/ack, restart-safe progress, and TUI transfer management
 - No delivery receipts beyond sent/failed
 - No out-of-order message handling (no skip buffer in Double Ratchet)

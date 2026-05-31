@@ -329,6 +329,16 @@ fn load_outbound_state(profile: &Path, hash: &str) -> Result<Option<OutboundTran
     Ok(Some(st))
 }
 
+pub(crate) fn outbound_transfer_target(
+    profile: &Path,
+    hash: &str,
+) -> Result<Option<(String, String)>> {
+    let Some(st) = load_outbound_state(profile, hash)? else {
+        return Ok(None);
+    };
+    Ok(Some((st.contact_name, st.file_path)))
+}
+
 fn clear_outbound_state(profile: &Path, hash: &str) {
     let path = outbound_state_path(profile, hash);
     let _ = fs::remove_file(path);
@@ -2077,7 +2087,13 @@ async fn serve(
                                             }
                                             let mut body = format!("[file received failed hash: {}]", chunk.name);
                                             if actual_hash == chunk.hash {
-                                                let out_path = downloads_dir.join(&chunk.name);
+                                                let safe_name = std::path::Path::new(&chunk.name)
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .filter(|n| !n.is_empty())
+                                                    .unwrap_or("download.bin")
+                                                    .to_string();
+                                                let out_path = downloads_dir.join(&safe_name);
                                                 match fs::write(&out_path, &data) {
                                                     Ok(_) => {
                                                         body = format!("[file received: {}]", out_path.display());
