@@ -513,7 +513,7 @@ impl App {
             .unwrap_or(0);
         self.messages.push(DisplayMessage {
             direction: "out".into(),
-            contact: self.profile_name.clone(),
+            contact: contact.to_string(),
             body: message.to_string(),
             _timestamp_ms: ts,
             status: "sending".into(),
@@ -532,7 +532,7 @@ impl App {
             .unwrap_or(0);
         self.messages.push(DisplayMessage {
             direction: "out".into(),
-            contact: self.profile_name.clone(),
+            contact: contact.to_string(),
             body: format!("[sending file: {}]", file_path),
             _timestamp_ms: ts,
             status: "sending".into(),

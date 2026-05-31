@@ -587,7 +587,7 @@ pub(crate) async fn send_file(
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     continue;
                 }
-                return Err(anyhow!("file_chunk send error: {e}"));
+                return Err(anyhow!("{e}"));
             }
 
             if wait_for_file_ack(&hash, chunk_index, std::time::Duration::from_secs(20)).await {
