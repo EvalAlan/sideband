@@ -1729,7 +1729,7 @@ fn ratchet_decrypt(
         return Err(anyhow!("ratchet header too short"));
     }
     let their_dh_pub_bytes: [u8; 32] = header_bytes[..32].try_into().unwrap();
-    let _msg_n = u32::from_be_bytes(header_bytes[32..36].try_into().unwrap());
+    let msg_n = u32::from_be_bytes(header_bytes[32..36].try_into().unwrap());
     let _prev_n = u32::from_be_bytes(header_bytes[36..40].try_into().unwrap());
 
     let their_dh_pub = X25519PublicKey::from(their_dh_pub_bytes);
@@ -1781,11 +1781,34 @@ fn ratchet_decrypt(
         .ok_or_else(|| anyhow!("ratchet not initialized for receiving"))?;
     let ck_bytes = B64.decode(recv_ck.as_bytes())?;
 
-    // Advance the receive chain to the right message number.
-    // For simplicity, we advance one step per call (no skip buffer yet).
-    let (next_ck, mk) = hkdf_chain_key(&ck_bytes)?;
-    state.recv_ck_b64 = Some(B64.encode(&next_ck));
-    state.recv_n += 1;
+    // Advance receive chain to the message number announced in header.
+    // This handles dropped messages in-order by deriving and discarding missed keys.
+    // (Still no out-of-order/duplicate key cache.)
+    if msg_n < state.recv_n {
+        return Err(anyhow!(
+            "ratchet message index went backwards: msg_n={} recv_n={}",
+            msg_n,
+            state.recv_n
+        ));
+    }
+
+    let mut ck_cursor = ck_bytes;
+    let mut mk = None;
+    let steps = msg_n
+        .checked_sub(state.recv_n)
+        .ok_or_else(|| anyhow!("invalid ratchet counters"))?
+        + 1;
+
+    for _ in 0..steps {
+        let (next_ck, derived_mk) = hkdf_chain_key(&ck_cursor)?;
+        ck_cursor = next_ck;
+        mk = Some(derived_mk);
+    }
+
+    state.recv_ck_b64 = Some(B64.encode(&ck_cursor));
+    state.recv_n = msg_n + 1;
+
+    let mk = mk.ok_or_else(|| anyhow!("ratchet message key derivation failed"))?;
 
     // Decrypt.
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&mk));
