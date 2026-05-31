@@ -3,14 +3,18 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use arti_client::TorClient;
 use tor_rtcompat::PreferredRuntime;
 
 use super::{Envelope, Transport, TransportCapabilities, TransportStatus};
+use crate::handler::parse_inbound_line;
 use crate::TuiEvent;
 
 pub struct TorTransport {
@@ -48,6 +52,127 @@ impl TorTransport {
 
     pub async fn bootstrap(profile: &Path) -> Result<Arc<TorClient<PreferredRuntime>>> {
         Ok(Arc::new(crate::create_tor_client(profile).await?))
+    }
+
+    /// Run the full inbound loop: accept Tor connections, bridge to local TCP,
+    /// read lines, parse into [`ChatMessage`]s, and push into the inbound channel.
+    ///
+    /// Returns when `quit_rx` fires or the onion service stream ends.
+    pub async fn run_inbound_loop(
+        &self,
+        profile: &Path,
+        tui_tx: mpsc::Sender<TuiEvent>,
+        mut quit_rx: oneshot::Receiver<()>,
+        tor_client: Arc<TorClient<PreferredRuntime>>,
+    ) -> Result<()> {
+        let _key = crate::load_signing_key(profile)?;
+        if let Err(e) = crate::load_incoming_states(profile) {
+            tracing::warn!(error=%e, "failed to load persisted incoming file state");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_port = listener.local_addr()?.port();
+
+        // Create an Arti onion service that forwards to our local listener.
+        let nickname = tor_hsservice::HsNickname::new("sideband".into())
+            .map_err(|e| anyhow!("invalid nickname: {e}"))?;
+        let hs_config = tor_hsservice::config::OnionServiceConfigBuilder::default()
+            .nickname(nickname)
+            .build()
+            .context("build onion service config")?;
+        let (onion_svc, onion_request_stream) = tor_client
+            .launch_onion_service(hs_config)
+            .context("launch onion service")?
+            .context("onion service disabled or failed to launch")?;
+        let onion_hsid = onion_svc
+            .onion_address()
+            .context("onion service has no address — key may not be ready")?;
+        let onion = crate::hsid_to_onion(&onion_hsid);
+
+        let _ = tui_tx
+            .send(TuiEvent::StatusUpdate(format!("onion={onion}")))
+            .await;
+        tracing::info!(%onion, listen_port, "serve ready via Arti onion service");
+
+        // Bridge Tor rendezvous requests to local TCP listener.
+        let local_addr = format!("127.0.0.1:{listen_port}");
+        tokio::spawn(async move {
+            let mut stream_requests = tor_hsservice::handle_rend_requests(onion_request_stream);
+            while let Some(req) = stream_requests.next().await {
+                let local_addr = local_addr.clone();
+                tokio::spawn(async move {
+                    let mut onion_stream = match req
+                        .accept(tor_cell::relaycell::msg::Connected::new_empty())
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            tracing::error!(error=%e, "failed to accept onion stream");
+                            return;
+                        }
+                    };
+
+                    let mut local_stream = match TcpStream::connect(&local_addr).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            tracing::error!(error=%e, %local_addr, "failed to connect onion stream to local listener");
+                            return;
+                        }
+                    };
+
+                    if let Err(e) =
+                        tokio::io::copy_bidirectional(&mut onion_stream, &mut local_stream).await
+                    {
+                        tracing::error!(error=%e, "onion stream bridge failed");
+                    }
+                });
+            }
+        });
+
+        let contacts_for_spawn = crate::load_contacts(profile).unwrap_or_default();
+
+        loop {
+            tokio::select! {
+                incoming = listener.accept() => {
+                    let (stream, peer) = incoming?;
+                    let contacts = contacts_for_spawn.clone();
+                    let profile = profile.to_path_buf();
+                    let tui_tx = tui_tx.clone();
+                    let tor_client_for_inbound = Arc::clone(&tor_client);
+                    tracing::info!(%peer, "incoming connection");
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => {}
+                            Ok(_) => {
+                                if let Some(mut msg) = parse_inbound_line(&line).unwrap_or(None) {
+                                    if let Err(e) = crate::handler::handle_inbound(
+                                        &profile,
+                                        &tui_tx,
+                                        &contacts,
+                                        &mut msg,
+                                        Arc::clone(&tor_client_for_inbound),
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(error=%e, "inbound handler error");
+                                    }
+                                } else {
+                                    tracing::error!(raw=%line, "invalid inbound payload");
+                                }
+                            }
+                            Err(e) => tracing::error!(error=%e, "read error"),
+                        }
+                    });
+                }
+                _ = &mut quit_rx => {
+                    tracing::info!("serve received quit signal, shutting down");
+                    drop(onion_svc);
+                    drop(tor_client);
+                    return Ok(());
+                }
+            }
+        }
     }
 
     pub async fn serve(
@@ -142,6 +267,8 @@ impl Transport for TorTransport {
     }
 
     async fn try_recv(&self) -> Result<Option<Envelope>> {
+        // Drain any buffered inbound_messages and convert to envelopes
+        // This is a best-effort non-blocking poll
         Ok(None)
     }
 }

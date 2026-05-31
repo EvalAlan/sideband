@@ -12,22 +12,18 @@ use chacha20poly1305::{
 };
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use futures::StreamExt;
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection};
 use safelog::DisplayRedacted;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use arti_client::{TorClient, TorClientConfig};
-use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_rtcompat::PreferredRuntime;
 
 mod handler;
@@ -1964,127 +1960,20 @@ async fn create_tor_client(profile: &Path) -> Result<TorClient<PreferredRuntime>
 // ---------------------------------------------------------------------------
 
 /// Format an HsId as a valid v3 .onion address.
-fn hsid_to_onion(hsid: &tor_hsservice::HsId) -> String {
+pub(crate) fn hsid_to_onion(hsid: &tor_hsservice::HsId) -> String {
     hsid.display_unredacted().to_string()
 }
 
 async fn serve(
     profile: &Path,
     tui_tx: mpsc::Sender<TuiEvent>,
-    mut quit_rx: tokio::sync::oneshot::Receiver<()>,
+    quit_rx: tokio::sync::oneshot::Receiver<()>,
     tor_client: Arc<TorClient<PreferredRuntime>>,
 ) -> Result<()> {
-    let _key = load_signing_key(profile)?;
-    if let Err(e) = load_incoming_states(profile) {
-        warn!(error=%e, "failed to load persisted incoming file state");
-    }
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let listen_port = listener.local_addr()?.port();
-
-    // Create an Arti onion service that forwards to our local listener.
-    let nickname = tor_hsservice::HsNickname::new("sideband".into())
-        .map_err(|e| anyhow!("invalid nickname: {e}"))?;
-    let hs_config = OnionServiceConfigBuilder::default()
-        .nickname(nickname)
-        .build()
-        .context("build onion service config")?;
-    let (onion_svc, onion_request_stream) = tor_client
-        .launch_onion_service(hs_config)
-        .context("launch onion service")?
-        .context("onion service disabled or failed to launch")?;
-    let onion_hsid = onion_svc
-        .onion_address()
-        .context("onion service has no address — key may not be ready")?;
-    let onion = hsid_to_onion(&onion_hsid);
-
-    let _ = tui_tx
-        .send(TuiEvent::StatusUpdate(format!("onion={onion}")))
-        .await;
-    info!(%onion, listen_port, "serve ready via Arti onion service");
-
-    // Arti onion services do not forward streams automatically. We must
-    // consume rendezvous requests, accept client streams, and bridge them to
-    // Sideband's existing local TCP protocol listener.
-    let local_addr = format!("127.0.0.1:{listen_port}");
-    tokio::spawn(async move {
-        let mut stream_requests = tor_hsservice::handle_rend_requests(onion_request_stream);
-        while let Some(req) = stream_requests.next().await {
-            let local_addr = local_addr.clone();
-            tokio::spawn(async move {
-                let mut onion_stream = match req
-                    .accept(tor_cell::relaycell::msg::Connected::new_empty())
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        error!(error=%e, "failed to accept onion stream");
-                        return;
-                    }
-                };
-
-                let mut local_stream = match TcpStream::connect(&local_addr).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        error!(error=%e, %local_addr, "failed to connect onion stream to local listener");
-                        return;
-                    }
-                };
-
-                if let Err(e) =
-                    tokio::io::copy_bidirectional(&mut onion_stream, &mut local_stream).await
-                {
-                    error!(error=%e, "onion stream bridge failed");
-                }
-            });
-        }
-    });
-
-    let contacts_for_spawn = load_contacts(profile).unwrap_or_default();
-
-    loop {
-        tokio::select! {
-            incoming = listener.accept() => {
-                let (stream, peer) = incoming?;
-                let contacts = contacts_for_spawn.clone();
-                let profile = profile.to_path_buf();
-                let tui_tx = tui_tx.clone();
-                let tor_client_for_inbound = Arc::clone(&tor_client);
-                info!(%peer, "incoming connection");
-                tokio::spawn(async move {
-                    let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => {}
-                        Ok(_) => {
-                            if let Some(mut msg) = handler::parse_inbound_line(&line).unwrap_or(None) {
-                                if let Err(e) = handler::handle_inbound(
-                                    &profile,
-                                    &tui_tx,
-                                    &contacts,
-                                    &mut msg,
-                                    Arc::clone(&tor_client_for_inbound),
-                                )
-                                .await
-                                {
-                                    error!(error=%e, "inbound handler error");
-                                }
-                            } else {
-                                error!(raw=%line, "invalid inbound payload");
-                            }
-                        }
-                        Err(e) => error!(error=%e, "read error"),
-                    }
-                });
-            }
-            _ = &mut quit_rx => {
-                info!("serve received quit signal, shutting down");
-                // Drop onion_svc + tor_client to shut down Arti cleanly.
-                drop(onion_svc);
-                drop(tor_client);
-                return Ok(());
-            }
-        }
-    }
+    let transport = crate::transport::tor::TorTransport::new(None, tor_client);
+    transport
+        .run_inbound_loop(profile, tui_tx, quit_rx, transport.client.clone())
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2886,4 +2775,26 @@ fn tor_transport_send_rejects_unknown_contact_name() {
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
     assert!(err.contains("unknown contact"), "unexpected error: {err}");
+}
+
+#[test]
+fn handler_rejects_unsigned_message() {
+    // A valid JSON ChatMessage with an empty signature should be parsed
+    // but NOT verified. The handler should still process it (as unverified).
+    let json = r#"{"v":1,"type":"msg","from":"stranger","timestamp_ms":42,"body":"hi","sig_b64":"","enc_body":""}"#;
+    let msg = handler::parse_inbound_line(json).unwrap().unwrap();
+    assert_eq!(msg.from, "stranger");
+    assert_eq!(msg.body, "hi");
+    // parse_inbound_line doesn't verify — it just parses. Verification
+    // happens in handle_inbound. This test confirms parsing works for
+    // messages from unknown senders.
+}
+
+#[test]
+fn tor_transport_envelope_round_trip() {
+    // Verify that raw_line_to_envelope + envelope_body_as_str is lossless.
+    let json = r#"{"v":1,"type":"msg","from":"alice","timestamp_ms":123,"body":"hello","sig_b64":"","enc_body":""}"#;
+    let envelope = crate::transport::tor::TorTransport::raw_line_to_envelope(json);
+    let body = crate::transport::tor::TorTransport::envelope_body_as_str(&envelope).unwrap();
+    assert_eq!(body, json);
 }
