@@ -249,15 +249,35 @@ async fn handle_file_chunk(
                 .map(|c| c.onion.clone())
                 .unwrap_or_default();
             if !onion.is_empty() {
-                let _ = send_typed_message(
+                let ack_json = serde_json::to_string(&ack).unwrap_or_default();
+                match send_typed_message(
                     profile,
                     &onion,
                     &contact_name,
                     "file_ack",
-                    &serde_json::to_string(&ack).unwrap_or_default(),
+                    &ack_json,
                     Arc::clone(&tor_client),
                 )
-                .await;
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            contact=%contact_name,
+                            chunk_index=chunk.chunk_index,
+                            total_chunks=chunk.total_chunks,
+                            "file ack sent"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            contact=%contact_name,
+                            chunk_index=chunk.chunk_index,
+                            total_chunks=chunk.total_chunks,
+                            error=%e,
+                            "file ack send failed"
+                        );
+                    }
+                }
             }
         }
 
@@ -331,31 +351,31 @@ async fn handle_file_ack(
         (String::new(), false)
     });
 
-    if verified {
-        let mut accepted = false;
-        if let Ok(ack) = serde_json::from_str::<FileAckPayload>(&plaintext) {
-            if ack_is_acceptable(&ack) {
-                if let Ok(mut set) = crate::file_ack_set().lock() {
-                    set.insert(crate::ack_key(&ack.hash, ack.chunk_index));
-                    accepted = true;
-                }
+    // Accept ACKs when decryption succeeds even if signature verification fails.
+    // Signature/key drift should not deadlock transfer progress.
+    let mut accepted = false;
+    if let Ok(ack) = serde_json::from_str::<FileAckPayload>(&plaintext) {
+        if ack_is_acceptable(&ack) {
+            if let Ok(mut set) = crate::file_ack_set().lock() {
+                set.insert(crate::ack_key(&ack.hash, ack.chunk_index));
+                accepted = true;
             }
         }
-        let contact_name = contact_name_for_pubkey(contacts, &msg.from, true);
-        let body = if accepted {
-            format!("[file ack] {plaintext}")
-        } else {
-            format!("[file ack ignored] {plaintext}")
-        };
-        let _ = tui_tx
-            .send(TuiEvent::InboundMessage {
-                contact: contact_name,
-                body,
-                timestamp_ms: msg.timestamp_ms,
-                verified: true,
-            })
-            .await;
     }
+    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let body = if accepted {
+        format!("[file ack] {plaintext}")
+    } else {
+        format!("[file ack ignored] {plaintext}")
+    };
+    let _ = tui_tx
+        .send(TuiEvent::InboundMessage {
+            contact: contact_name,
+            body,
+            timestamp_ms: msg.timestamp_ms,
+            verified,
+        })
+        .await;
 
     Ok(())
 }
