@@ -571,7 +571,7 @@ pub(crate) async fn send_file(
         let mut delivered = false;
         let max_attempts = 3;
         for attempt in 1..=max_attempts {
-            send_typed_message(
+            let send_result = send_typed_message(
                 profile,
                 &onion,
                 contact_name,
@@ -579,7 +579,16 @@ pub(crate) async fn send_file(
                 &chunk_json,
                 Arc::clone(&tor_client),
             )
-            .await?;
+            .await;
+
+            if let Err(e) = send_result {
+                warn!(chunk_index, attempt, error=%e, "file chunk send failed");
+                if attempt < max_attempts {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                return Err(anyhow!("file_chunk send error: {e}"));
+            }
 
             if wait_for_file_ack(&hash, chunk_index, std::time::Duration::from_secs(20)).await {
                 delivered = true;

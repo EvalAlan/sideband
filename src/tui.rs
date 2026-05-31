@@ -125,7 +125,7 @@ impl App {
 
         if raw.starts_with('/') {
             self.input.clear();
-            let parts: Vec<&str> = raw[1..].splitn(4, ' ').collect();
+            let parts: Vec<&str> = raw[1..].split_whitespace().collect();
             match parts.first().copied() {
                 Some("quit") => {
                     self.send_quit();
@@ -151,7 +151,11 @@ impl App {
                         return false;
                     }
                     let contact = parts[1].to_string();
-                    let file_path = parts[2].to_string();
+                    let file_path = parts[2..].join(" ");
+                    if file_path.trim().is_empty() {
+                        self.push_sys("usage: /file <contact> <filepath>", "error");
+                        return false;
+                    }
                     self.do_send_file(&contact, &file_path);
                     return false;
                 }
