@@ -20,13 +20,20 @@ use crate::TuiEvent;
 pub struct TorTransport {
     local_onion: Option<String>,
     pub client: Arc<TorClient<PreferredRuntime>>,
+    /// Inbound envelope channel.  The receive half is held by `try_recv`.
+    inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
+    /// Sender kept alive so the channel stays open while run_inbound_loop runs.
+    inbound_tx: mpsc::Sender<Envelope>,
 }
 
 impl TorTransport {
     pub fn new(local_onion: Option<String>, client: Arc<TorClient<PreferredRuntime>>) -> Self {
+        let (inbound_tx, inbound_rx) = mpsc::channel(256);
         Self {
             local_onion,
             client,
+            inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
+            inbound_tx,
         }
     }
 
@@ -129,6 +136,7 @@ impl TorTransport {
         });
 
         let contacts_for_spawn = crate::load_contacts(profile).unwrap_or_default();
+        let inbound_tx = self.inbound_tx.clone();
 
         loop {
             tokio::select! {
@@ -137,6 +145,7 @@ impl TorTransport {
                     let contacts = contacts_for_spawn.clone();
                     let profile = profile.to_path_buf();
                     let tui_tx = tui_tx.clone();
+                    let inbound_tx = inbound_tx.clone();
                     let tor_client_for_inbound = Arc::clone(&tor_client);
                     tracing::info!(%peer, "incoming connection");
                     tokio::spawn(async move {
@@ -157,6 +166,9 @@ impl TorTransport {
                                     {
                                         tracing::error!(error=%e, "inbound handler error");
                                     }
+                                    // Push the raw envelope into the channel for try_recv consumers.
+                                    let env = Self::raw_line_to_envelope(&line);
+                                    let _ = inbound_tx.send(env).await;
                                 } else {
                                     tracing::error!(raw=%line, "invalid inbound payload");
                                 }
@@ -267,8 +279,15 @@ impl Transport for TorTransport {
     }
 
     async fn try_recv(&self) -> Result<Option<Envelope>> {
-        // Drain any buffered inbound_messages and convert to envelopes
-        // This is a best-effort non-blocking poll
-        Ok(None)
+        // Non-blocking poll of the inbound channel.
+        let mut rx = self.inbound_rx.lock().await;
+        match rx.try_recv() {
+            Ok(env) => Ok(Some(env)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                // Channel closed — inbound loop has terminated.
+                Ok(None)
+            }
+        }
     }
 }
