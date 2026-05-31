@@ -581,8 +581,9 @@ async fn main() -> Result<()> {
             ensure_profile(&profile)?;
             let (tx, _rx) = mpsc::channel::<TuiEvent>(64);
             let (_quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
-            let tor_client = create_tor_client(&profile).await?;
-            serve(&profile, tx, quit_rx, Arc::new(tor_client)).await
+            let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
+            let tor = transport::tor::TorTransport::new(None, tor_client);
+            tor.serve(&profile, tx, quit_rx).await
         }
         CommandKind::Send {
             profile,
@@ -592,8 +593,9 @@ async fn main() -> Result<()> {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
             let onion = resolve_to(&profile, &to)?;
-            let tor_client = Arc::new(create_tor_client(&profile).await?);
-            send(&profile, &onion, &message, &to, None, tor_client).await
+            let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
+            let tor = transport::tor::TorTransport::new(None, tor_client);
+            tor.send_message(&profile, &onion, &message, &to).await
         }
         CommandKind::Contact { action } => match action {
             ContactAction::Add {

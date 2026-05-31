@@ -178,6 +178,11 @@ Initial transport abstraction has been introduced in `src/transport/`:
 
 This is scaffolding only; runtime behavior is unchanged until Tor send/recv paths are fully wired through the trait.
 
+Current state:
+- CLI `serve` and `send` now route through `TorTransport`
+- TUI bootstrap/serve/send/file-offer paths route through `TorTransport`
+- Core `Transport` trait exists but generic envelope send/recv is still stubbed for Tor
+
 ## Known limitations
 
 - Arti bootstrapping on first run requires network access and may take 30-60s

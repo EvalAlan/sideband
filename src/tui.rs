@@ -642,12 +642,12 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
     let profile_for_bootstrap = profile.to_path_buf();
     let tui_tx_for_bootstrap = tui_tx.clone();
     tokio::spawn(async move {
-        match crate::create_tor_client(&profile_for_bootstrap).await {
+        match crate::transport::tor::TorTransport::bootstrap(&profile_for_bootstrap).await {
             Ok(client) => {
                 let _ = tui_tx_for_bootstrap
                     .send(TuiEvent::StatusUpdate("Tor ready".to_string()))
                     .await;
-                let _ = tor_ready_tx.send(Arc::new(client));
+                let _ = tor_ready_tx.send(client);
             }
             Err(e) => {
                 let _ = tui_tx_for_bootstrap
@@ -687,7 +687,8 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
     let tor_for_spawn = Arc::clone(&tor_client);
     let tui_tx_clone = tui_tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::serve(&profile_buf, tui_tx_clone, quit_rx, tor_for_spawn).await {
+        let tor = crate::transport::tor::TorTransport::new(None, tor_for_spawn);
+        if let Err(e) = tor.serve(&profile_buf, tui_tx_clone, quit_rx).await {
             let _ = tui_tx_for_serve
                 .send(TuiEvent::StatusUpdate(format!("serve error: {e}")))
                 .await;
@@ -727,7 +728,8 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                match crate::send(&profile, &onion, &message, &contact, None, tor).await {
+                let tor = crate::transport::tor::TorTransport::new(None, tor);
+                match tor.send_message(&profile, &onion, &message, &contact).await {
                     Ok(()) => {
                         let _ = tui_tx
                             .send(TuiEvent::OutboundMessage {
@@ -767,7 +769,8 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
             tokio::spawn(async move {
                 let contact = cmd.contact.clone();
                 let file_path = cmd.file_path.clone();
-                match crate::send_file(&profile, &contact, &file_path, None, tor).await {
+                let tor = crate::transport::tor::TorTransport::new(None, tor);
+                match tor.send_file_offer(&profile, &contact, &file_path).await {
                     Ok(()) => {
                         let ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
