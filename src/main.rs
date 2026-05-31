@@ -270,63 +270,130 @@ fn ack_key(hash: &str, chunk_index: usize) -> String {
     format!("{hash}:{chunk_index}")
 }
 
-fn incoming_state_path(profile: &Path) -> std::path::PathBuf {
-    profile.join("transfers").join("incoming_state.json")
-}
-
-fn outbound_state_path(profile: &Path, hash: &str) -> std::path::PathBuf {
-    profile
-        .join("transfers")
-        .join(format!("outbound_{hash}.json"))
-}
-
 fn persist_incoming_states(profile: &Path) -> Result<()> {
-    let path = incoming_state_path(profile);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let snapshot = {
         let map = incoming_files_map()
             .lock()
             .map_err(|_| anyhow!("incoming file map lock poisoned"))?;
         map.clone()
     };
-    fs::write(path, serde_json::to_vec_pretty(&snapshot)?)?;
+
+    let mut conn = init_db(profile)?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM inbound_transfer_chunks", [])?;
+    tx.execute("DELETE FROM inbound_transfers", [])?;
+
+    for (transfer_key, state) in snapshot {
+        tx.execute(
+            "INSERT INTO inbound_transfers (transfer_key, total_chunks, updated_at)
+             VALUES (?1, ?2, datetime('now'))",
+            params![transfer_key, state.total_chunks as i64],
+        )?;
+        for (idx, maybe_chunk) in state.chunks.iter().enumerate() {
+            let blob: Option<&[u8]> = maybe_chunk.as_deref();
+            tx.execute(
+                "INSERT INTO inbound_transfer_chunks (transfer_key, chunk_index, chunk_data)
+                 VALUES (?1, ?2, ?3)",
+                params![transfer_key, idx as i64, blob],
+            )?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
 fn load_incoming_states(profile: &Path) -> Result<()> {
-    let path = incoming_state_path(profile);
-    if !path.exists() {
-        return Ok(());
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT t.transfer_key, t.total_chunks, c.chunk_index, c.chunk_data
+         FROM inbound_transfers t
+         LEFT JOIN inbound_transfer_chunks c ON c.transfer_key = t.transfer_key
+         ORDER BY t.transfer_key, c.chunk_index",
+    )?;
+
+    let mut map: std::collections::HashMap<String, IncomingFileState> =
+        std::collections::HashMap::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)? as usize,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<Vec<u8>>>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (transfer_key, total_chunks, idx_opt, blob_opt) = row?;
+        let entry = map
+            .entry(transfer_key)
+            .or_insert_with(|| IncomingFileState {
+                total_chunks,
+                chunks: vec![None; total_chunks],
+            });
+        if let Some(idx_i64) = idx_opt {
+            let idx = idx_i64 as usize;
+            if idx < entry.chunks.len() {
+                entry.chunks[idx] = blob_opt;
+            }
+        }
     }
-    let data = fs::read(&path)?;
-    let parsed: std::collections::HashMap<String, IncomingFileState> =
-        serde_json::from_slice(&data)?;
-    let mut map = incoming_files_map()
+
+    let mut lock = incoming_files_map()
         .lock()
         .map_err(|_| anyhow!("incoming file map lock poisoned"))?;
-    *map = parsed;
+    *lock = map;
     Ok(())
 }
 
 fn persist_outbound_state(profile: &Path, state: &OutboundTransferState) -> Result<()> {
-    let path = outbound_state_path(profile, &state.hash);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO outbound_transfers
+         (hash, contact_name, onion, file_name, file_path, total_size, total_chunks, next_chunk_index, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
+         ON CONFLICT(hash) DO UPDATE SET
+             contact_name=excluded.contact_name,
+             onion=excluded.onion,
+             file_name=excluded.file_name,
+             file_path=excluded.file_path,
+             total_size=excluded.total_size,
+             total_chunks=excluded.total_chunks,
+             next_chunk_index=excluded.next_chunk_index,
+             updated_at=datetime('now')",
+        params![
+            state.hash,
+            state.contact_name,
+            state.onion,
+            state.file_name,
+            state.file_path,
+            state.total_size as i64,
+            state.total_chunks as i64,
+            state.next_chunk_index as i64
+        ],
+    )?;
     Ok(())
 }
 
 fn load_outbound_state(profile: &Path, hash: &str) -> Result<Option<OutboundTransferState>> {
-    let path = outbound_state_path(profile, hash);
-    if !path.exists() {
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT contact_name, onion, file_name, file_path, hash, total_size, total_chunks, next_chunk_index
+         FROM outbound_transfers WHERE hash = ?1",
+    )?;
+    let mut rows = stmt.query(params![hash])?;
+    let Some(r) = rows.next()? else {
         return Ok(None);
-    }
-    let data = fs::read(path)?;
-    let st: OutboundTransferState = serde_json::from_slice(&data)?;
-    Ok(Some(st))
+    };
+    Ok(Some(OutboundTransferState {
+        contact_name: r.get(0)?,
+        onion: r.get(1)?,
+        file_name: r.get(2)?,
+        file_path: r.get(3)?,
+        hash: r.get(4)?,
+        total_size: r.get::<_, i64>(5)? as usize,
+        total_chunks: r.get::<_, i64>(6)? as usize,
+        next_chunk_index: r.get::<_, i64>(7)? as usize,
+    }))
 }
 
 pub(crate) fn outbound_transfer_target(
@@ -340,35 +407,37 @@ pub(crate) fn outbound_transfer_target(
 }
 
 fn clear_outbound_state(profile: &Path, hash: &str) {
-    let path = outbound_state_path(profile, hash);
-    let _ = fs::remove_file(path);
+    if let Ok(conn) = init_db(profile) {
+        let _ = conn.execute(
+            "DELETE FROM outbound_transfers WHERE hash = ?1",
+            params![hash],
+        );
+    }
 }
 
 pub(crate) fn list_transfers(profile: &Path) -> Result<Vec<String>> {
     let mut rows = Vec::new();
+    let conn = init_db(profile)?;
 
-    let transfers_dir = profile.join("transfers");
-    if transfers_dir.exists() {
-        for entry in fs::read_dir(&transfers_dir)? {
-            let entry = entry?;
-            let p = entry.path();
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.starts_with("outbound_") && name.ends_with(".json") {
-                let data = fs::read(&p)?;
-                if let Ok(st) = serde_json::from_slice::<OutboundTransferState>(&data) {
-                    rows.push(format!(
-                        "outbound {} -> {} chunk {}/{} file={}",
-                        st.hash,
-                        st.contact_name,
-                        st.next_chunk_index,
-                        st.total_chunks,
-                        st.file_name
-                    ));
-                }
-            }
-        }
+    let mut out_stmt = conn.prepare(
+        "SELECT hash, contact_name, file_name, next_chunk_index, total_chunks
+         FROM outbound_transfers ORDER BY updated_at DESC",
+    )?;
+    let out_rows = out_stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)? as usize,
+            r.get::<_, i64>(4)? as usize,
+        ))
+    })?;
+    for row in out_rows {
+        let (hash, contact_name, file_name, next_chunk_index, total_chunks) = row?;
+        rows.push(format!(
+            "outbound {} -> {} chunk {}/{} file={}",
+            hash, contact_name, next_chunk_index, total_chunks, file_name
+        ));
     }
 
     if let Ok(map) = incoming_files_map().lock() {
@@ -386,12 +455,12 @@ pub(crate) fn list_transfers(profile: &Path) -> Result<Vec<String>> {
 }
 
 pub(crate) fn cancel_outbound_transfer(profile: &Path, hash: &str) -> Result<bool> {
-    let p = outbound_state_path(profile, hash);
-    if p.exists() {
-        fs::remove_file(p)?;
-        return Ok(true);
-    }
-    Ok(false)
+    let conn = init_db(profile)?;
+    let affected = conn.execute(
+        "DELETE FROM outbound_transfers WHERE hash = ?1",
+        params![hash],
+    )?;
+    Ok(affected > 0)
 }
 
 /// Send a file to a contact. Sends `file_offer` then all `file_chunk` messages.
@@ -696,7 +765,38 @@ fn init_db(profile: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_messages_contact
             ON messages(contact);
         CREATE INDEX IF NOT EXISTS idx_messages_ts
-            ON messages(timestamp_ms);",
+            ON messages(timestamp_ms);
+
+        CREATE TABLE IF NOT EXISTS outbound_transfers (
+            hash            TEXT PRIMARY KEY,
+            contact_name    TEXT NOT NULL,
+            onion           TEXT NOT NULL,
+            file_name       TEXT NOT NULL,
+            file_path       TEXT NOT NULL,
+            total_size      INTEGER NOT NULL,
+            total_chunks    INTEGER NOT NULL,
+            next_chunk_index INTEGER NOT NULL,
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS inbound_transfers (
+            transfer_key    TEXT PRIMARY KEY,
+            total_chunks    INTEGER NOT NULL,
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS inbound_transfer_chunks (
+            transfer_key    TEXT NOT NULL,
+            chunk_index     INTEGER NOT NULL,
+            chunk_data      BLOB,
+            PRIMARY KEY (transfer_key, chunk_index),
+            FOREIGN KEY (transfer_key) REFERENCES inbound_transfers(transfer_key) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_outbound_transfers_updated
+            ON outbound_transfers(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_inbound_transfers_updated
+            ON inbound_transfers(updated_at);",
     )?;
     Ok(conn)
 }
