@@ -208,8 +208,47 @@ struct ChatMessage {
 
 const FILE_CHUNK_SIZE: usize = 32 * 1024; // 32 KB chunks
 
-/// Send a file to a contact. Chunks the file and sends each chunk as a file_chunk message.
-/// First sends a file_offer, then waits for file_ack before sending chunks.
+#[derive(Debug, Serialize, Deserialize)]
+struct FileOfferPayload {
+    name: String,
+    size: usize,
+    hash: String,
+    total_chunks: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileChunkPayload {
+    name: String,
+    hash: String,
+    chunk_index: usize,
+    total_chunks: usize,
+    data_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileAckPayload {
+    hash: String,
+    chunk_index: usize,
+    total_chunks: usize,
+    status: String,
+}
+
+#[derive(Debug, Clone)]
+struct IncomingFileState {
+    total_chunks: usize,
+    chunks: Vec<Option<Vec<u8>>>,
+}
+
+static INCOMING_FILES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, IncomingFileState>>,
+> = std::sync::OnceLock::new();
+
+fn incoming_files_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, IncomingFileState>> {
+    INCOMING_FILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Send a file to a contact. Sends `file_offer` then all `file_chunk` messages.
 pub(crate) async fn send_file(
     profile: &Path,
     contact_name: &str,
@@ -238,83 +277,136 @@ pub(crate) async fn send_file(
         h.update(&content);
         format!("{:x}", h.finalize())
     };
-    let total_chunks = (total_size + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
+    let total_chunks = total_size.div_ceil(FILE_CHUNK_SIZE);
 
-    // Resolve contact.
     let onion = crate::resolve_to(profile, contact_name)?;
 
-    // Build and send file_offer message.
-    let offer_payload = serde_json::json!({
-        "type": "file_offer",
-        "name": file_name,
-        "size": total_size,
-        "hash": hash,
-        "total_chunks": total_chunks,
-    });
-    let offer_json = offer_payload.to_string();
+    let offer = FileOfferPayload {
+        name: file_name.clone(),
+        size: total_size,
+        hash: hash.clone(),
+        total_chunks,
+    };
+    let offer_json = serde_json::to_string(&offer)?;
+    send_typed_message(
+        profile,
+        &onion,
+        contact_name,
+        "file_offer",
+        &offer_json,
+        Arc::clone(&tor_client),
+    )
+    .await?;
 
-    // Send the offer using the same encrypted channel.
-    let key = crate::load_signing_key(profile)?;
-    let our_ed25519_pub =
-        base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+    for chunk_index in 0..total_chunks {
+        let start = chunk_index * FILE_CHUNK_SIZE;
+        let end = ((chunk_index + 1) * FILE_CHUNK_SIZE).min(total_size);
+        let payload = FileChunkPayload {
+            name: file_name.clone(),
+            hash: hash.clone(),
+            chunk_index,
+            total_chunks,
+            data_b64: B64.encode(&content[start..end]),
+        };
+        let chunk_json = serde_json::to_string(&payload)?;
+        send_typed_message(
+            profile,
+            &onion,
+            contact_name,
+            "file_chunk",
+            &chunk_json,
+            Arc::clone(&tor_client),
+        )
+        .await?;
+    }
+
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
+    crate::store_message(
+        profile,
+        "out",
+        contact_name,
+        &onion,
+        &format!(
+            "[file sent: {} ({} bytes, {} chunks)]",
+            file_name, total_size, total_chunks
+        ),
+        timestamp_ms,
+        crate::DeliveryStatus::Sent,
+    )?;
+
+    drop(tor_client);
+    Ok(())
+}
+
+async fn send_typed_message(
+    profile: &Path,
+    to_onion: &str,
+    contact_name: &str,
+    message_type: &str,
+    plaintext: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    let key = load_signing_key(profile)?;
+    let our_ed25519_pub = B64.encode(key.verifying_key().to_bytes());
+    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
 
     let ratchet_path = RatchetState::path(profile, std::path::Path::new(contact_name));
+    let use_ratchet = ratchet_path.exists();
 
-    let offer_msg = if ratchet_path.exists() {
-        let mut state_bytes = std::fs::read(&ratchet_path)?;
-        let mut state: RatchetState = bincode::deserialize(&mut state_bytes)?;
+    let msg = if use_ratchet {
+        let mut state_bytes = fs::read(&ratchet_path)?;
+        let mut state: RatchetState =
+            bincode::deserialize(&mut state_bytes).context("deserialize ratchet state")?;
         let (header_b64, nonce_hex, ct_hex) =
-            ratchet_encrypt(&mut state, offer_json.as_bytes(), &our_ed25519_pub)?;
+            ratchet_encrypt(&mut state, plaintext.as_bytes(), &our_ed25519_pub)?;
         state.save(profile, contact_name)?;
         let mut sign_msg = ChatMessage {
             v: 3,
-            r#type: "file_offer".into(),
+            r#type: message_type.into(),
             from: our_ed25519_pub.clone(),
             timestamp_ms,
-            body: String::new(),
+            body: plaintext.to_string(),
             sig_b64: String::new(),
             enc_body: String::new(),
             ratchet_header_b64: header_b64,
             ratchet_nonce_hex: nonce_hex,
             ratchet_ct_hex: ct_hex,
         };
-        crate::sign_message(&key, &mut sign_msg)?;
+        sign_message(&key, &mut sign_msg)?;
+        sign_msg.body.clear();
         sign_msg
     } else {
         let mut msg = ChatMessage {
             v: 2,
-            r#type: "file_offer".into(),
+            r#type: message_type.into(),
             from: our_ed25519_pub.clone(),
             timestamp_ms,
-            body: String::new(),
+            body: plaintext.to_string(),
             sig_b64: String::new(),
             enc_body: String::new(),
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
         };
-        crate::sign_message(&key, &mut msg)?;
-        let our_x25519 = crate::load_x25519_secret(profile)?;
-        let their_x25519 = crate::resolve_x25519_pubkey(profile, contact_name)?;
-        let shared_key = crate::derive_shared_key(&our_x25519, &their_x25519)?;
-        msg.enc_body = crate::encrypt_body(&shared_key, &offer_json)?;
+        sign_message(&key, &mut msg)?;
+        let our_x25519 = load_x25519_secret(profile)?;
+        let their_x25519 = resolve_x25519_pubkey(profile, contact_name)?;
+        let shared_key = derive_shared_key(&our_x25519, &their_x25519)?;
+        msg.enc_body = encrypt_body(&shared_key, plaintext)?;
+        msg.body.clear();
         msg
     };
 
-    // Send offer via Arti Tor client.
-    let payload = format!("{}\n", serde_json::to_string(&offer_msg)?);
-
-    let connect_result = {
-        let onion = onion.clone();
+    let payload = format!("{}\n", serde_json::to_string(&msg)?);
+    let result = {
         let payload = payload.clone();
+        let to_addr = format!("{}:80", to_onion);
         let tc = Arc::clone(&tor_client);
         let connect_fut = async move {
-            let addr = format!("{}:80", onion);
             let mut stream = tc
-                .connect(addr.as_str())
+                .connect(to_addr.as_str())
                 .await
                 .map_err(|e| anyhow!("connect: {e}"))?;
             use tokio::io::AsyncWriteExt;
@@ -329,49 +421,14 @@ pub(crate) async fn send_file(
                 .map_err(|e| anyhow!("shutdown: {e}"))?;
             Ok::<_, anyhow::Error>(())
         };
-        tokio::time::timeout(std::time::Duration::from_secs(30), connect_fut).await
+        tokio::time::timeout(Duration::from_secs(60), connect_fut).await
     };
 
-    let send_ok = match connect_result {
-        Ok(Ok(())) => {
-            info!(
-                "file offer sent: {} ({} bytes, {} chunks)",
-                file_name, total_size, total_chunks
-            );
-            true
-        }
-        Ok(Err(e)) => {
-            error!("file offer send error: {e}");
-            false
-        }
-        Err(_) => {
-            error!("file offer send timed out");
-            false
-        }
-    };
-
-    // Store outbound file offer in DB.
-    crate::store_message(
-        profile,
-        "out",
-        contact_name,
-        &onion,
-        &format!("[file offer: {} ({} bytes)]", file_name, total_size),
-        timestamp_ms,
-        if send_ok {
-            crate::DeliveryStatus::Sent
-        } else {
-            crate::DeliveryStatus::Failed
-        },
-    )?;
-
-    // Drop tor_client to shut down Arti cleanly.
-    drop(tor_client);
-
-    // Note: In a full implementation, we'd wait for the file_ack and then send chunks.
-    // For now, we send the offer and the receiver can request chunks.
-    // The chunk sending would be triggered by a file_request message.
-    Ok(())
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(anyhow!("{message_type} send error: {e}")),
+        Err(_) => Err(anyhow!("{message_type} send timed out")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -667,6 +724,17 @@ pub(crate) fn resolve_to(profile: &Path, to: &str) -> Result<String> {
             "unknown contact '{to}'. Add with: sideband contact add --name {to} --onion <addr>.onion --pubkey <b64>"
         )),
     }
+}
+
+fn resolve_contact_name_by_pubkey(
+    contacts: &std::collections::HashMap<String, ContactFile>,
+    pubkey_b64: &str,
+) -> Result<String> {
+    contacts
+        .values()
+        .find(|c| c.pubkey_b64 == pubkey_b64)
+        .map(|c| c.name.clone())
+        .ok_or_else(|| anyhow!("unknown contact for pubkey"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,6 +1731,7 @@ async fn serve(
                 let contacts = contacts_for_spawn.clone();
                 let profile = profile.to_path_buf();
                 let tui_tx = tui_tx.clone();
+                let tor_client_for_inbound = Arc::clone(&tor_client);
                 info!(%peer, "incoming connection");
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream);
@@ -1671,7 +1740,6 @@ async fn serve(
                         Ok(0) => {}
                         Ok(_) => {
                             if let Ok(mut msg) = serde_json::from_str::<ChatMessage>(line.trim()) {
-                                // Handle file_offer messages specially.
                                 if msg.r#type == "file_offer" {
                                     let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts).unwrap_or_else(|e| {
                                         error!(error=%e, "decrypt/verify failed");
@@ -1684,10 +1752,25 @@ async fn serve(
                                         .unwrap_or_else(|| {
                                             if verified { "verified-peer".into() } else { msg.from.clone() }
                                         });
-                                    let body_for_display = if verified && !plaintext.is_empty() {
-                                        format!("[file offer] {}", plaintext)
-                                    } else if verified {
-                                        "[file offer received]".to_string()
+                                    let body_for_display = if verified {
+                                        match serde_json::from_str::<FileOfferPayload>(&plaintext) {
+                                            Ok(offer) => {
+                                                let key = format!("{}:{}", msg.from, offer.hash);
+                                                let mut map = incoming_files_map().lock().map_err(|_| anyhow!("incoming file map lock poisoned")).unwrap();
+                                                map.insert(
+                                                    key,
+                                                    IncomingFileState {
+                                                        total_chunks: offer.total_chunks,
+                                                        chunks: vec![None; offer.total_chunks],
+                                                    },
+                                                );
+                                                format!(
+                                                    "[file offer] {} ({} bytes, {} chunks)",
+                                                    offer.name, offer.size, offer.total_chunks
+                                                )
+                                            }
+                                            Err(_) => format!("[file offer] {}", plaintext),
+                                        }
                                     } else {
                                         "[file offer — UNVERIFIED]".to_string()
                                     };
@@ -1705,6 +1788,136 @@ async fn serve(
                                         verified,
                                     }).await;
                                     info!(recv=true, %msg.r#type, "file offer received");
+                                    return;
+                                }
+
+                                if msg.r#type == "file_chunk" {
+                                    let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts).unwrap_or_else(|e| {
+                                        error!(error=%e, "decrypt/verify failed");
+                                        (String::new(), false)
+                                    });
+                                    if !verified {
+                                        return;
+                                    }
+                                    if let Ok(chunk) = serde_json::from_str::<FileChunkPayload>(&plaintext) {
+                                        let key = format!("{}:{}", msg.from, chunk.hash);
+                                        let mut completed_data: Option<Vec<u8>> = None;
+                                        {
+                                            let mut map = incoming_files_map().lock().map_err(|_| anyhow!("incoming file map lock poisoned")).unwrap();
+                                            let state = map.entry(key.clone()).or_insert_with(|| IncomingFileState {
+                                                total_chunks: chunk.total_chunks,
+                                                chunks: vec![None; chunk.total_chunks],
+                                            });
+                                            if chunk.chunk_index < state.total_chunks {
+                                                if let Ok(bytes) = B64.decode(chunk.data_b64.as_bytes()) {
+                                                    state.chunks[chunk.chunk_index] = Some(bytes);
+                                                }
+                                            }
+                                            if state.chunks.iter().all(|c| c.is_some()) {
+                                                let mut assembled = Vec::new();
+                                                for c in &state.chunks {
+                                                    assembled.extend_from_slice(c.as_ref().unwrap());
+                                                }
+                                                completed_data = Some(assembled);
+                                                map.remove(&key);
+                                            }
+                                        }
+
+                                        let ack = FileAckPayload {
+                                            hash: chunk.hash.clone(),
+                                            chunk_index: chunk.chunk_index,
+                                            total_chunks: chunk.total_chunks,
+                                            status: "received".to_string(),
+                                        };
+                                        if let Ok(contact_name) = resolve_contact_name_by_pubkey(&contacts, &msg.from) {
+                                            let onion = contacts
+                                                .get(&contact_name)
+                                                .map(|c| c.onion.clone())
+                                                .unwrap_or_default();
+                                            if !onion.is_empty() {
+                                                let _ = send_typed_message(
+                                                    &profile,
+                                                    &onion,
+                                                    &contact_name,
+                                                    "file_ack",
+                                                    &serde_json::to_string(&ack).unwrap_or_default(),
+                                                    Arc::clone(&tor_client_for_inbound),
+                                                )
+                                                .await;
+                                            }
+                                        }
+
+                                        if let Some(data) = completed_data {
+                                            let actual_hash = {
+                                                use sha2::Digest;
+                                                let mut h = sha2::Sha256::new();
+                                                h.update(&data);
+                                                format!("{:x}", h.finalize())
+                                            };
+                                            let contact_name = contacts
+                                                .values()
+                                                .find(|c| c.pubkey_b64 == msg.from)
+                                                .map(|c| c.name.clone())
+                                                .unwrap_or_else(|| msg.from.clone());
+                                            let downloads_dir = profile.join("downloads");
+                                            if let Err(e) = fs::create_dir_all(&downloads_dir) {
+                                                error!(error=%e, "failed to create downloads dir");
+                                            }
+                                            let mut body = format!("[file received failed hash: {}]", chunk.name);
+                                            if actual_hash == chunk.hash {
+                                                let out_path = downloads_dir.join(&chunk.name);
+                                                match fs::write(&out_path, &data) {
+                                                    Ok(_) => {
+                                                        body = format!("[file received: {}]", out_path.display());
+                                                    }
+                                                    Err(e) => {
+                                                        body = format!("[file write failed: {}]", e);
+                                                    }
+                                                }
+                                            }
+                                            let _ = store_message(
+                                                &profile,
+                                                "in",
+                                                &contact_name,
+                                                "",
+                                                &body,
+                                                msg.timestamp_ms,
+                                                DeliveryStatus::Delivered,
+                                            );
+                                            let _ = tui_tx
+                                                .send(TuiEvent::InboundMessage {
+                                                    contact: contact_name,
+                                                    body,
+                                                    timestamp_ms: msg.timestamp_ms,
+                                                    verified: true,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                if msg.r#type == "file_ack" {
+                                    let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts).unwrap_or_else(|e| {
+                                        error!(error=%e, "decrypt/verify failed");
+                                        (String::new(), false)
+                                    });
+                                    if verified {
+                                        let contact_name = contacts
+                                            .values()
+                                            .find(|c| c.pubkey_b64 == msg.from)
+                                            .map(|c| c.name.clone())
+                                            .unwrap_or_else(|| msg.from.clone());
+                                        let body = format!("[file ack] {}", plaintext);
+                                        let _ = tui_tx
+                                            .send(TuiEvent::InboundMessage {
+                                                contact: contact_name,
+                                                body,
+                                                timestamp_ms: msg.timestamp_ms,
+                                                verified: true,
+                                            })
+                                            .await;
+                                    }
                                     return;
                                 }
 
