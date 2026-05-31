@@ -1110,9 +1110,14 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
                 String::new()
             };
 
+            let display_contact = if m.direction == "out" {
+                app.profile_name.as_str()
+            } else {
+                m.contact.as_str()
+            };
             let mut spans = vec![
                 Span::styled(
-                    format!("{ts_str}{dir_label} {:>12} ", m.contact),
+                    format!("{ts_str}{dir_label} {:>12} ", display_contact),
                     Style::default().fg(dir_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(&m.body),
