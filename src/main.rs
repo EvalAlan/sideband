@@ -30,6 +30,7 @@ use arti_client::{TorClient, TorClientConfig};
 use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_rtcompat::PreferredRuntime;
 
+mod transport;
 mod tui;
 
 // ---------------------------------------------------------------------------

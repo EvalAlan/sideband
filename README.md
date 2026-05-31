@@ -162,6 +162,22 @@ Keys:
   arti_state/            # Arti Tor client state
 ```
 
+## Planned transport architecture
+
+Sideband is moving to a **protocol core + transport adapters** model.
+
+- Core protocol: identity, signing, encryption, ratchet, storage, framing
+- Transport adapters: Tor, Meshtastic, MeshCore, future backends
+
+Initial transport abstraction has been introduced in `src/transport/`:
+
+- `Transport` trait
+- `Envelope` with `msg_id`, `seq/total`, `ttl`, `hop_count`, `transport_hint`, `ack_for`
+- `TransportCapabilities` and `TransportStatus`
+- `TorTransport` adapter stub
+
+This is scaffolding only; runtime behavior is unchanged until Tor send/recv paths are fully wired through the trait.
+
 ## Known limitations
 
 - Arti bootstrapping on first run requires network access and may take 30-60s
