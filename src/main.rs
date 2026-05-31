@@ -242,10 +242,20 @@ struct IncomingFileState {
 static INCOMING_FILES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, IncomingFileState>>,
 > = std::sync::OnceLock::new();
+static FILE_ACKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
 
 fn incoming_files_map(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, IncomingFileState>> {
     INCOMING_FILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn file_ack_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    FILE_ACKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn ack_key(hash: &str, chunk_index: usize) -> String {
+    format!("{hash}:{chunk_index}")
 }
 
 /// Send a file to a contact. Sends `file_offer` then all `file_chunk` messages.
@@ -309,15 +319,37 @@ pub(crate) async fn send_file(
             data_b64: B64.encode(&content[start..end]),
         };
         let chunk_json = serde_json::to_string(&payload)?;
-        send_typed_message(
-            profile,
-            &onion,
-            contact_name,
-            "file_chunk",
-            &chunk_json,
-            Arc::clone(&tor_client),
-        )
-        .await?;
+
+        let mut delivered = false;
+        let max_attempts = 3;
+        for attempt in 1..=max_attempts {
+            send_typed_message(
+                profile,
+                &onion,
+                contact_name,
+                "file_chunk",
+                &chunk_json,
+                Arc::clone(&tor_client),
+            )
+            .await?;
+
+            if wait_for_file_ack(&hash, chunk_index, std::time::Duration::from_secs(20)).await {
+                delivered = true;
+                break;
+            }
+
+            if attempt < max_attempts {
+                warn!(chunk_index, attempt, "file chunk ack timeout; retrying");
+            }
+        }
+
+        if !delivered {
+            return Err(anyhow!(
+                "file transfer failed waiting for ack hash={} chunk={}",
+                hash,
+                chunk_index
+            ));
+        }
     }
 
     let timestamp_ms = std::time::SystemTime::now()
@@ -338,6 +370,24 @@ pub(crate) async fn send_file(
 
     drop(tor_client);
     Ok(())
+}
+
+async fn wait_for_file_ack(hash: &str, chunk_index: usize, timeout: Duration) -> bool {
+    let key = ack_key(hash, chunk_index);
+    let start = std::time::Instant::now();
+    loop {
+        {
+            if let Ok(mut set) = file_ack_set().lock() {
+                if set.remove(&key) {
+                    return true;
+                }
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 async fn send_typed_message(
@@ -1898,11 +1948,17 @@ async fn serve(
                                 }
 
                                 if msg.r#type == "file_ack" {
-                                    let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts).unwrap_or_else(|e| {
-                                        error!(error=%e, "decrypt/verify failed");
-                                        (String::new(), false)
-                                    });
+                                    let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts)
+                                        .unwrap_or_else(|e| {
+                                            error!(error=%e, "decrypt/verify failed");
+                                            (String::new(), false)
+                                        });
                                     if verified {
+                                        if let Ok(ack) = serde_json::from_str::<FileAckPayload>(&plaintext) {
+                                            if let Ok(mut set) = file_ack_set().lock() {
+                                                set.insert(ack_key(&ack.hash, ack.chunk_index));
+                                            }
+                                        }
                                         let contact_name = contacts
                                             .values()
                                             .find(|c| c.pubkey_b64 == msg.from)
