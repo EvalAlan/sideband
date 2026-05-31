@@ -122,11 +122,19 @@ impl Transport for TorTransport {
         let body = std::str::from_utf8(&envelope.body)
             .map_err(|_| anyhow!("tor envelope body must be utf-8 encoded chat payload"))?;
         let profile = Path::new(&envelope.from);
+
+        let contacts = crate::load_contacts(profile)?;
+        let contact_name = contacts
+            .values()
+            .find(|c| c.onion == envelope.to)
+            .map(|c| c.name.clone())
+            .ok_or_else(|| anyhow!("unknown contact for onion '{}'", envelope.to))?;
+
         crate::send(
             profile,
             &envelope.to,
             body,
-            &envelope.to,
+            &contact_name,
             None,
             self.client.clone(),
         )
