@@ -1,42 +1,34 @@
 # Sideband GUI (Flutter)
 
-Current state: scaffold only.
+Desktop/mobile GUI scaffold is now runnable.
 
-## What works now
-- Flutter app shell under `gui/`
-- Rust API boundary scaffold exists in `src/app_api.rs`
-
-## What does NOT work yet
-- No generated FRB bindings
-- No Rust `cdylib` target yet
-- No desktop/mobile runner folders yet (`flutter create .` not run)
-
-## Next commands (once Flutter is installed)
+## Start GUI (Linux desktop)
 
 ```bash
-cd gui
-flutter create .
-flutter pub get
+cd /home/rocky/repos/sideband/gui
+../.tools/flutter/bin/flutter run -d linux
 ```
 
-Install FRB codegen (one-time):
+If you already have Flutter in PATH:
 
 ```bash
-cargo install flutter_rust_bridge_codegen
-```
-
-Generate bridge:
-
-```bash
-cd gui
-flutter_rust_bridge_codegen generate --config flutter_rust_bridge.yaml
-```
-
-Then run desktop (Linux):
-
-```bash
+cd /home/rocky/repos/sideband/gui
 flutter run -d linux
 ```
 
-## Critical refactor pending
-`src/app_api.rs` is in a binary crate right now. For FRB, Sideband needs a proper Rust library target (`[lib] crate-type = ["cdylib", "staticlib", "rlib"]`) with the API exported from `src/lib.rs`.
+## Current state
+
+- Flutter app shell runs.
+- Rust API boundary exists in `../src/app_api.rs`.
+- FRB config exists in `flutter_rust_bridge.yaml`.
+
+What is still missing:
+
+- Generated FRB bindings
+- Rust `lib.rs` + `cdylib` export for FRB
+- Wiring UI to real Rust backend calls
+
+## Notes
+
+- Running from a headless shell without a display will fail with GTK `cannot open display`.
+- Android requires Android SDK/Studio setup first.
