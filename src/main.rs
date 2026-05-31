@@ -2900,3 +2900,286 @@ fn tor_transport_try_recv_returns_envelope_from_channel() {
         // in run_inbound_loop and try_recv pops from inbound_rx.
     });
 }
+
+// ---------------------------------------------------------------------------
+// Integration tests — full pipeline without Tor
+// ---------------------------------------------------------------------------
+
+/// Helper: set up two profiles with contacts pointing at each other.
+fn setup_alice_bob() -> (tempfile::TempDir, tempfile::TempDir) {
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    init_profile_with_name(alice_dir.path(), "alice").unwrap();
+    init_profile_with_name(bob_dir.path(), "bob").unwrap();
+
+    let alice_key = load_signing_key(alice_dir.path()).unwrap();
+    let bob_key = load_signing_key(bob_dir.path()).unwrap();
+    let alice_ed = B64.encode(alice_key.verifying_key().to_bytes());
+    let bob_ed = B64.encode(bob_key.verifying_key().to_bytes());
+    let alice_x = load_x25519_public(alice_dir.path()).unwrap();
+    let bob_x = load_x25519_public(bob_dir.path()).unwrap();
+    let alice_x_b64 = B64.encode(alice_x.as_bytes());
+    let bob_x_b64 = B64.encode(bob_x.as_bytes());
+
+    // Use dummy onion addresses (valid v3 format for parsing).
+    let alice_onion = "psrntpu56hilbftscupr6f4ujxb6kjn6n2qy4366sen4lqkqpspjezid.onion";
+    let bob_onion = "rog4qluztvbzq5sr2didprterk23tyo4q6e6775lkesx3jdqlm3jq5yd.onion";
+
+    contact_add(alice_dir.path(), "bob", bob_onion, &bob_ed, &bob_x_b64).unwrap();
+    contact_add(
+        bob_dir.path(),
+        "alice",
+        alice_onion,
+        &alice_ed,
+        &alice_x_b64,
+    )
+    .unwrap();
+
+    (alice_dir, bob_dir)
+}
+
+/// Build a v2 (static X25519) signed+encrypted ChatMessage on the wire.
+fn build_v2_wire(alice_dir: &std::path::Path, bob_dir: &std::path::Path, message: &str) -> String {
+    let alice_key = load_signing_key(alice_dir).unwrap();
+    let alice_ed = B64.encode(alice_key.verifying_key().to_bytes());
+
+    // Derive shared key from Alice's secret + Bob's public.
+    let bob_x_pub = load_x25519_public(bob_dir).unwrap();
+    let alice_secret = load_x25519_secret(alice_dir).unwrap();
+    let shared = derive_shared_key(&alice_secret, &bob_x_pub).unwrap();
+    let enc_body = encrypt_body(&shared, message).unwrap();
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    let mut msg = ChatMessage {
+        v: 2,
+        r#type: "chat_message".into(),
+        from: alice_ed,
+        timestamp_ms,
+        body: message.to_string(),
+        sig_b64: String::new(),
+        enc_body,
+        ratchet_header_b64: String::new(),
+        ratchet_nonce_hex: String::new(),
+        ratchet_ct_hex: String::new(),
+    };
+    sign_message(&alice_key, &mut msg).unwrap();
+    // Sign-then-encrypt: signature covers plaintext body, then body is cleared for wire.
+    msg.body.clear();
+
+    serde_json::to_string(&msg).unwrap()
+}
+
+#[test]
+fn v2_message_e2e_stores_in_sqlite() {
+    // Full v2 pipeline: encrypt -> wire -> parse -> decrypt -> verify -> store -> query
+    let (alice_dir, bob_dir) = setup_alice_bob();
+
+    // Alice encrypts a message for Bob.
+    let wire = build_v2_wire(alice_dir.path(), bob_dir.path(), "hello from alice v2");
+
+    // Bob receives the raw wire payload.
+    let mut msg = handler::parse_inbound_line(&wire).unwrap().unwrap();
+    assert_eq!(msg.v, 2);
+    assert_eq!(msg.r#type, "chat_message");
+
+    // Decrypt and verify.
+    let bob_contacts = load_contacts(bob_dir.path()).unwrap();
+    let (plaintext, verified) =
+        decrypt_and_verify(&mut msg, bob_dir.path(), &bob_contacts).unwrap();
+    assert!(verified, "message should be verified");
+    assert_eq!(plaintext, "hello from alice v2");
+
+    // Store in SQLite.
+    store_message(
+        bob_dir.path(),
+        "in",
+        "alice",
+        "",
+        &plaintext,
+        msg.timestamp_ms,
+        if verified {
+            DeliveryStatus::Delivered
+        } else {
+            DeliveryStatus::Failed
+        },
+    )
+    .unwrap();
+
+    // Query Bob's history to confirm the message was stored.
+    let rows = load_history(bob_dir.path(), Some("alice"), 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.direction, "in");
+    assert_eq!(row.contact, "alice");
+    assert_eq!(row.body, "hello from alice v2");
+    assert_eq!(row.status, DeliveryStatus::Delivered.as_i64());
+}
+
+#[test]
+fn v3_ratchet_message_e2e_stores_in_sqlite() {
+    // Full v3 pipeline: ratchet init -> encrypt -> wire -> parse -> decrypt -> store
+    let (alice_dir, bob_dir) = setup_alice_bob();
+
+    let alice_key = load_signing_key(alice_dir.path()).unwrap();
+    let bob_x = load_x25519_public(bob_dir.path()).unwrap();
+    let alice_ed = B64.encode(alice_key.verifying_key().to_bytes());
+
+    // Initialize the Double Ratchet (Alice side).
+    init_ratchet_alice(alice_dir.path(), "bob", &bob_x).unwrap();
+
+    // Alice encrypts with the ratchet.
+    let ratchet_path = RatchetState::path(alice_dir.path(), std::path::Path::new("bob"));
+    let mut state: RatchetState =
+        bincode::deserialize(&std::fs::read(&ratchet_path).unwrap()).unwrap();
+    let plaintext = "ratchet hello v3";
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let (header_b64, nonce_hex, ct_hex) =
+        ratchet_encrypt(&mut state, plaintext.as_bytes(), &alice_ed).unwrap();
+    state.save(alice_dir.path(), "bob").unwrap();
+
+    // Build the wire format (same shape the transport would send).
+    let mut msg = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: alice_ed.clone(),
+        timestamp_ms,
+        body: plaintext.into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: header_b64,
+        ratchet_nonce_hex: nonce_hex,
+        ratchet_ct_hex: ct_hex,
+    };
+    sign_message(&alice_key, &mut msg).unwrap();
+    msg.body.clear();
+
+    let wire = serde_json::to_string(&msg).unwrap();
+
+    // Bob receives the raw wire payload.
+    let mut inbound = handler::parse_inbound_line(&wire).unwrap().unwrap();
+    assert_eq!(inbound.v, 3);
+
+    // Bob decrypts and verifies.
+    let bob_contacts = load_contacts(bob_dir.path()).unwrap();
+    let (decrypted, verified) =
+        decrypt_and_verify(&mut inbound, bob_dir.path(), &bob_contacts).unwrap();
+    assert!(verified, "v3 message should be verified");
+    assert_eq!(decrypted, plaintext);
+
+    // Bob's ratchet state should now exist.
+    assert!(
+        RatchetState::path(bob_dir.path(), std::path::Path::new("alice")).exists(),
+        "Bob's ratchet state should be auto-initialized"
+    );
+
+    // Store in SQLite.
+    store_message(
+        bob_dir.path(),
+        "in",
+        "alice",
+        "",
+        &decrypted,
+        inbound.timestamp_ms,
+        if verified {
+            DeliveryStatus::Delivered
+        } else {
+            DeliveryStatus::Failed
+        },
+    )
+    .unwrap();
+
+    // Verify SQLite storage.
+    let rows = load_history(bob_dir.path(), Some("alice"), 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].body, "ratchet hello v3");
+    assert_eq!(rows[0].status, DeliveryStatus::Delivered.as_i64());
+}
+
+#[test]
+fn v2_message_from_unknown_sender_fails_decrypt() {
+    // A v2 message from someone NOT in our contact list cannot be decrypted
+    // because the receiver needs the sender's X25519 public key (stored in
+    // the contact entry) to derive the shared secret.
+    let (_alice_dir, bob_dir) = setup_alice_bob();
+
+    // Create a third profile (Eve) that Bob doesn't have as a contact.
+    let eve_dir = tempfile::tempdir().unwrap();
+    init_profile_with_name(eve_dir.path(), "eve").unwrap();
+
+    // Eve encrypts for Bob using Bob's public key.
+    let eve_key = load_signing_key(eve_dir.path()).unwrap();
+    let eve_ed = B64.encode(eve_key.verifying_key().to_bytes());
+    let bob_x_pub = load_x25519_public(bob_dir.path()).unwrap();
+    let eve_secret = load_x25519_secret(eve_dir.path()).unwrap();
+    let shared = derive_shared_key(&eve_secret, &bob_x_pub).unwrap();
+    let enc_body = encrypt_body(&shared, "from eve").unwrap();
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let mut msg = ChatMessage {
+        v: 2,
+        r#type: "chat_message".into(),
+        from: eve_ed,
+        timestamp_ms,
+        body: "from eve".into(),
+        sig_b64: String::new(),
+        enc_body,
+        ratchet_header_b64: String::new(),
+        ratchet_nonce_hex: String::new(),
+        ratchet_ct_hex: String::new(),
+    };
+    sign_message(&eve_key, &mut msg).unwrap();
+    msg.body.clear();
+    let wire = serde_json::to_string(&msg).unwrap();
+
+    // Bob parses it.
+    let mut inbound = handler::parse_inbound_line(&wire).unwrap().unwrap();
+
+    // Bob tries to decrypt — should fail because Eve is not in contacts.
+    let bob_contacts = load_contacts(bob_dir.path()).unwrap();
+    let result = decrypt_and_verify(&mut inbound, bob_dir.path(), &bob_contacts);
+    assert!(
+        result.is_err(),
+        "unknown sender should fail decrypt_and_verify"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("unknown sender pubkey"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn v2_message_from_unknown_sender_decrypts_with_raw_key() {
+    // Even though Eve is not in Bob's contacts, we can still decrypt the
+    // message if we manually derive the shared key using Bob's secret +
+    // Eve's public key. This tests the raw crypto works without the
+    // contact database lookup layer.
+    let (_alice_dir, bob_dir) = setup_alice_bob();
+
+    let eve_dir = tempfile::tempdir().unwrap();
+    init_profile_with_name(eve_dir.path(), "eve").unwrap();
+
+    let eve_secret = load_x25519_secret(eve_dir.path()).unwrap();
+    let eve_x_pub = X25519PublicKey::from(&eve_secret);
+    let bob_x_pub = load_x25519_public(bob_dir.path()).unwrap();
+    let bob_secret = load_x25519_secret(bob_dir.path()).unwrap();
+
+    // Eve encrypts: shared = eve_secret * bob_pub
+    let shared_eve = derive_shared_key(&eve_secret, &bob_x_pub).unwrap();
+    let enc_body = encrypt_body(&shared_eve, "secret from eve").unwrap();
+
+    // Bob decrypts: shared = bob_secret * eve_pub
+    let shared_bob = derive_shared_key(&bob_secret, &eve_x_pub).unwrap();
+    let plaintext = decrypt_body(&shared_bob, &enc_body).unwrap();
+    assert_eq!(plaintext, "secret from eve");
+}
