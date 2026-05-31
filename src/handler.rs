@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use crate::transport::tor::TorTransport;
 use crate::{
     decrypt_and_verify, resolve_contact_name_by_pubkey, send_typed_message, store_message,
-    ChatMessage, ContactsMap, DeliveryStatus, FileAckPayload, FileChunkPayload, FileOfferPayload,
-    IncomingFileState, TuiEvent,
+    ChatMessage, ContactsMap, DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload,
+    FileOfferPayload, IncomingFileState, TuiEvent,
 };
 
 /// Parse a raw inbound line into a [`ChatMessage`].
@@ -57,6 +57,11 @@ pub async fn handle_inbound(
 
     if msg.r#type == "file_chunk" {
         handle_file_chunk(profile, tui_tx, contacts, msg, tor_client).await?;
+        return Ok(());
+    }
+
+    if msg.r#type == "file_inline" {
+        handle_file_inline(profile, tui_tx, contacts, msg).await?;
         return Ok(());
     }
 
@@ -353,6 +358,69 @@ async fn handle_file_chunk(
                 })
                 .await;
         }
+    }
+
+    Ok(())
+}
+
+async fn handle_file_inline(
+    profile: &Path,
+    tui_tx: &mpsc::Sender<TuiEvent>,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let (plaintext, verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
+        tracing::error!(error=%e, "decrypt/verify failed");
+        (String::new(), false)
+    });
+
+    if let Ok(inline) = serde_json::from_str::<FileInlinePayload>(&plaintext) {
+        let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+        let downloads_dir = profile.join("downloads");
+        if let Err(e) = std::fs::create_dir_all(&downloads_dir) {
+            tracing::error!(error=%e, "failed to create downloads dir");
+        }
+
+        let mut body = format!("[file receive failed: {}]", inline.name);
+        if let Ok(data) = B64.decode(inline.data_b64.as_bytes()) {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(&data);
+            let actual_hash = format!("{:x}", h.finalize());
+            if actual_hash == inline.hash {
+                let safe_name = std::path::Path::new(&inline.name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or("download.bin")
+                    .to_string();
+                let out_path = downloads_dir.join(&safe_name);
+                match write_file_atomically(&out_path, &data) {
+                    Ok(_) => body = format!("[file received: {}]", out_path.display()),
+                    Err(e) => body = format!("[file write failed: {e}]"),
+                }
+            } else {
+                body = format!("[file hash mismatch: {}]", inline.name);
+            }
+        }
+
+        store_message(
+            profile,
+            "in",
+            &contact_name,
+            "",
+            &body,
+            msg.timestamp_ms,
+            DeliveryStatus::Delivered,
+        )?;
+        let _ = tui_tx
+            .send(TuiEvent::InboundMessage {
+                contact: contact_name,
+                body,
+                timestamp_ms: msg.timestamp_ms,
+                verified,
+            })
+            .await;
     }
 
     Ok(())

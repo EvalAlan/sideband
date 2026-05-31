@@ -231,6 +231,14 @@ pub(crate) struct FileAckPayload {
     status: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct FileInlinePayload {
+    name: String,
+    size: usize,
+    hash: String,
+    data_b64: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IncomingFileState {
     total_chunks: usize,
@@ -493,6 +501,63 @@ pub(crate) async fn send_file(
     let total_chunks = total_size.div_ceil(FILE_CHUNK_SIZE);
 
     let onion = crate::resolve_to(profile, contact_name)?;
+
+    // Fast path for tiny files: send as one inline payload over a single message.
+    // This avoids chunk/ack round-trips that are fragile over hidden-service circuits.
+    if total_size <= FILE_CHUNK_SIZE {
+        let inline = FileInlinePayload {
+            name: file_name.clone(),
+            size: total_size,
+            hash: hash.clone(),
+            data_b64: B64.encode(&content),
+        };
+        let inline_json = serde_json::to_string(&inline)?;
+
+        let mut sent = false;
+        for attempt in 1..=4 {
+            match send_typed_message(
+                profile,
+                &onion,
+                contact_name,
+                "file_inline",
+                &inline_json,
+                Arc::clone(&tor_client),
+            )
+            .await
+            {
+                Ok(()) => {
+                    sent = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(attempt, error=%e, "file_inline send failed");
+                    if attempt < 4 {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            }
+        }
+
+        if !sent {
+            return Err(anyhow!("file_inline send failed to {}", contact_name));
+        }
+
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        crate::store_message(
+            profile,
+            "out",
+            contact_name,
+            &onion,
+            &format!("[file sent: {} ({} bytes, inline)]", file_name, total_size),
+            timestamp_ms,
+            crate::DeliveryStatus::Sent,
+        )?;
+
+        drop(tor_client);
+        return Ok(());
+    }
 
     let mut outbound_state =
         load_outbound_state(profile, &hash)?.unwrap_or(OutboundTransferState {
