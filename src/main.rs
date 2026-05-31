@@ -2055,7 +2055,9 @@ async fn serve(
                     match reader.read_line(&mut line).await {
                         Ok(0) => {}
                         Ok(_) => {
-                            if let Ok(mut msg) = serde_json::from_str::<ChatMessage>(line.trim()) {
+                            let envelope = crate::transport::tor::TorTransport::raw_line_to_envelope(line.trim());
+                            if let Ok(raw_msg) = crate::transport::tor::TorTransport::envelope_body_as_str(&envelope) {
+                            if let Ok(mut msg) = serde_json::from_str::<ChatMessage>(raw_msg) {
                                 if msg.r#type == "file_offer" {
                                     let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts).unwrap_or_else(|e| {
                                         error!(error=%e, "decrypt/verify failed");
@@ -2301,6 +2303,9 @@ async fn serve(
                                 }
                             } else {
                                 error!(raw=%line, "invalid inbound payload");
+                            }
+                            } else {
+                                error!(raw=%line, "invalid inbound envelope body");
                             }
                         }
                         Err(e) => error!(error=%e, "read error"),

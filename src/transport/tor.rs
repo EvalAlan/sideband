@@ -26,6 +26,26 @@ impl TorTransport {
         }
     }
 
+    pub fn raw_line_to_envelope(raw_line: &str) -> Envelope {
+        Envelope {
+            msg_id: format!("tor-in-{}", chrono::Utc::now().timestamp_millis()),
+            from: String::new(),
+            to: String::new(),
+            body: raw_line.as_bytes().to_vec(),
+            seq: 0,
+            total: 1,
+            ttl: 1,
+            hop_count: 0,
+            transport_hint: Some("tor".to_string()),
+            ack_for: None,
+        }
+    }
+
+    pub fn envelope_body_as_str(envelope: &Envelope) -> Result<&str> {
+        std::str::from_utf8(&envelope.body)
+            .map_err(|_| anyhow!("tor envelope body must be valid utf-8"))
+    }
+
     pub async fn bootstrap(profile: &Path) -> Result<Arc<TorClient<PreferredRuntime>>> {
         Ok(Arc::new(crate::create_tor_client(profile).await?))
     }
@@ -44,17 +64,21 @@ impl TorTransport {
         profile: &Path,
         onion: &str,
         body: &str,
-        contact_name: &str,
+        _contact_name: &str,
     ) -> Result<()> {
-        crate::send(
-            profile,
-            onion,
-            body,
-            contact_name,
-            None,
-            self.client.clone(),
-        )
-        .await
+        let env = Envelope {
+            msg_id: format!("tor-out-{}", chrono::Utc::now().timestamp_millis()),
+            from: profile.to_string_lossy().to_string(),
+            to: onion.to_string(),
+            body: body.as_bytes().to_vec(),
+            seq: 0,
+            total: 1,
+            ttl: 1,
+            hop_count: 0,
+            transport_hint: Some("tor".to_string()),
+            ack_for: None,
+        };
+        self.send(&env).await
     }
 
     pub async fn send_file_offer(
