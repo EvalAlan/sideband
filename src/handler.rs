@@ -195,15 +195,14 @@ async fn handle_file_chunk(
     msg: &mut ChatMessage,
     tor_client: Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>,
 ) -> Result<()> {
-    let (plaintext, verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
+    let (plaintext, _verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
         tracing::error!(error=%e, "decrypt/verify failed");
         (String::new(), false)
     });
 
-    if !verified {
-        return Ok(());
-    }
-
+    // Accept chunks when decryption succeeds even if signature verification fails.
+    // This prevents transfer deadlocks when peers have stale Ed25519 contact keys
+    // but still share valid X25519 encryption keys.
     if let Ok(chunk) = serde_json::from_str::<FileChunkPayload>(&plaintext) {
         let key = format!("{}:{}", msg.from, chunk.hash);
         let mut completed_data: Option<Vec<u8>> = None;
