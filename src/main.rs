@@ -25,6 +25,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use arti_client::{TorClient, TorClientConfig};
 use tor_rtcompat::PreferredRuntime;
 
+mod app_api;
 mod handler;
 mod transport;
 mod tui;
@@ -978,7 +979,7 @@ pub(crate) fn store_message(
 }
 
 #[allow(dead_code)]
-struct HistoryRow {
+pub(crate) struct HistoryRow {
     id: i64,
     direction: String,
     contact: String,
@@ -989,7 +990,7 @@ struct HistoryRow {
     created_at: String,
 }
 
-fn load_history(
+pub(crate) fn load_history(
     profile: &Path,
     contact_filter: Option<&str>,
     limit: usize,
@@ -1278,7 +1279,7 @@ fn init_profile(profile: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_profile(profile: &Path) -> Result<()> {
+pub(crate) fn ensure_profile(profile: &Path) -> Result<()> {
     let identity_path = identity_path(profile);
     if identity_path.exists() {
         return Ok(());
@@ -1335,7 +1336,7 @@ fn run_wizard(profile: &Path) -> Result<()> {
     init_profile_with_name(profile, &name)
 }
 
-fn init_profile_with_name(profile: &Path, display_name: &str) -> Result<()> {
+pub(crate) fn init_profile_with_name(profile: &Path, display_name: &str) -> Result<()> {
     fs::create_dir_all(profile).context("create profile dir")?;
 
     let signing = SigningKey::generate(&mut OsRng);
@@ -1404,7 +1405,7 @@ fn save_contacts(profile: &Path, contacts: &ContactsMap) -> Result<()> {
     Ok(())
 }
 
-fn contact_add(
+pub(crate) fn contact_add(
     profile: &Path,
     name: &str,
     onion: &str,
