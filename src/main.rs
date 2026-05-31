@@ -554,6 +554,10 @@ pub(crate) async fn send_file(
                 contact_name
             ));
         }
+
+        // Give the receiver a short window to persist offer state before the first chunk.
+        // Without this, first chunk can race with offer handling on slower HS paths.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
     }
 
     for chunk_index in outbound_state.next_chunk_index..total_chunks {
@@ -758,6 +762,11 @@ async fn send_typed_message(
     };
 
     let payload = format!("{}\n", serde_json::to_string(&msg)?);
+    let connect_timeout = if message_type == "file_chunk" {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(60)
+    };
     let result = {
         let payload = payload.clone();
         let to_addr = format!("{}:80", to_onion);
@@ -779,7 +788,7 @@ async fn send_typed_message(
                 .map_err(|e| anyhow!("shutdown: {e}"))?;
             Ok::<_, anyhow::Error>(())
         };
-        tokio::time::timeout(Duration::from_secs(60), connect_fut).await
+        tokio::time::timeout(connect_timeout, connect_fut).await
     };
 
     match result {
