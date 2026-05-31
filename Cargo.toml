@@ -17,6 +17,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures = "0.3"
 hkdf = "0.12"
 hex = "0.4"
+async-trait = "0.1"
 rand = "0.8"
 ratatui = "0.29"
 rusqlite = { version = "0.39", features = ["bundled"] }

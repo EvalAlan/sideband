@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,16 +33,17 @@ pub struct TransportStatus {
     pub detail: String,
 }
 
+#[async_trait]
 pub trait Transport: Send + Sync {
     fn name(&self) -> &'static str;
     fn local_addr(&self) -> Option<String>;
     fn capabilities(&self) -> TransportCapabilities;
     fn status(&self) -> TransportStatus;
 
-    fn send(&self, envelope: &Envelope) -> Result<()>;
+    async fn send(&self, envelope: &Envelope) -> Result<()>;
 
     /// Non-blocking poll. Returns Ok(None) when no frame is available right now.
-    fn try_recv(&self) -> Result<Option<Envelope>>;
+    async fn try_recv(&self) -> Result<Option<Envelope>>;
 }
 
 pub mod tor;

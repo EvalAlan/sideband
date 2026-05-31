@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 use arti_client::TorClient;
@@ -66,6 +67,7 @@ impl TorTransport {
     }
 }
 
+#[async_trait]
 impl Transport for TorTransport {
     fn name(&self) -> &'static str {
         "tor"
@@ -92,13 +94,22 @@ impl Transport for TorTransport {
         }
     }
 
-    fn send(&self, _envelope: &Envelope) -> Result<()> {
-        Err(anyhow!(
-            "generic envelope send not wired for tor yet; use send_message/send_file_offer"
-        ))
+    async fn send(&self, envelope: &Envelope) -> Result<()> {
+        let body = std::str::from_utf8(&envelope.body)
+            .map_err(|_| anyhow!("tor envelope body must be utf-8 encoded chat payload"))?;
+        let profile = Path::new(&envelope.from);
+        crate::send(
+            profile,
+            &envelope.to,
+            body,
+            &envelope.to,
+            None,
+            self.client.clone(),
+        )
+        .await
     }
 
-    fn try_recv(&self) -> Result<Option<Envelope>> {
+    async fn try_recv(&self) -> Result<Option<Envelope>> {
         Ok(None)
     }
 }
