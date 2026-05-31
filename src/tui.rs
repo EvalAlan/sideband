@@ -1080,8 +1080,27 @@ fn chat_scroll_position(
 }
 
 fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app
+    let selected = if app.contacts.is_empty() || app.contacts[0] == "(no contacts)" {
+        None
+    } else {
+        Some(app.contacts[app.selected_contact].as_str())
+    };
+
+    let visible: Vec<&DisplayMessage> = app
         .messages
+        .iter()
+        .filter(|m| {
+            if m.direction != "in" && m.direction != "out" {
+                return true; // keep system/status lines visible
+            }
+            match selected {
+                Some(name) => m.contact == name,
+                None => true,
+            }
+        })
+        .collect();
+
+    let items: Vec<ListItem> = visible
         .iter()
         .map(|m| {
             let dir_color = match m.direction.as_str() {
@@ -1206,7 +1225,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(" | "),
         Span::styled("Tab", Style::default().fg(Color::Cyan)),
-        Span::raw(":next "),
+        Span::raw(":contact "),
         Span::styled("PgUp/PgDn", Style::default().fg(Color::Cyan)),
         Span::raw(":scroll "),
         Span::styled("/help", Style::default().fg(Color::Cyan)),
