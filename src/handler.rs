@@ -61,7 +61,7 @@ pub async fn handle_inbound(
     }
 
     if msg.r#type == "file_ack" {
-        handle_file_ack(tui_tx, contacts, msg).await?;
+        handle_file_ack(profile, tui_tx, contacts, msg).await?;
         return Ok(());
     }
 
@@ -322,18 +322,15 @@ fn ack_is_acceptable(ack: &FileAckPayload) -> bool {
 }
 
 async fn handle_file_ack(
+    profile: &Path,
     tui_tx: &mpsc::Sender<TuiEvent>,
     contacts: &ContactsMap,
     msg: &mut ChatMessage,
 ) -> Result<()> {
-    // file_ack doesn't need profile for decryption key lookup; we just need
-    // the sender's pubkey. Pass an empty-profile hint — decrypt_and_verify
-    // uses msg.from to find the contact.
-    let (plaintext, verified) =
-        decrypt_and_verify(msg, Path::new("."), contacts).unwrap_or_else(|e| {
-            tracing::error!(error=%e, "decrypt/verify failed");
-            (String::new(), false)
-        });
+    let (plaintext, verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
+        tracing::error!(error=%e, "decrypt/verify failed");
+        (String::new(), false)
+    });
 
     if verified {
         let mut accepted = false;

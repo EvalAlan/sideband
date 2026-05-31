@@ -655,7 +655,9 @@ async fn send_typed_message(
     let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
 
     let ratchet_path = RatchetState::path(profile, std::path::Path::new(contact_name));
-    let use_ratchet = ratchet_path.exists();
+    // Keep file-transfer control/data packets on static v2 crypto for now.
+    // Ratchet state drift can otherwise deadlock transfers (offer/chunk/ack).
+    let use_ratchet = message_type == "msg" && ratchet_path.exists();
 
     let msg = if use_ratchet {
         let mut state_bytes = fs::read(&ratchet_path)?;
