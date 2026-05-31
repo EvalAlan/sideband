@@ -523,15 +523,37 @@ pub(crate) async fn send_file(
             total_chunks,
         };
         let offer_json = serde_json::to_string(&offer)?;
-        send_typed_message(
-            profile,
-            &onion,
-            contact_name,
-            "file_offer",
-            &offer_json,
-            Arc::clone(&tor_client),
-        )
-        .await?;
+
+        let mut offer_sent = false;
+        for attempt in 1..=3 {
+            match send_typed_message(
+                profile,
+                &onion,
+                contact_name,
+                "file_offer",
+                &offer_json,
+                Arc::clone(&tor_client),
+            )
+            .await
+            {
+                Ok(()) => {
+                    offer_sent = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(attempt, error=%e, "file offer send failed");
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            }
+        }
+        if !offer_sent {
+            return Err(anyhow!(
+                "file transfer failed sending offer to {}",
+                contact_name
+            ));
+        }
     }
 
     for chunk_index in outbound_state.next_chunk_index..total_chunks {
