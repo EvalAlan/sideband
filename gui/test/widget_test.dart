@@ -1,11 +1,12 @@
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sideband_gui/main.dart';
 
 void main() {
-  testWidgets('app boots and shows WIP title', (WidgetTester tester) async {
+  testWidgets('app boots and shows primary shell', (WidgetTester tester) async {
     await tester.pumpWidget(const SidebandApp());
 
-    expect(find.text('Sideband GUI (WIP)'), findsOneWidget);
-    expect(find.text('Backend bridge not wired yet.'), findsOneWidget);
+    expect(find.text('Sideband'), findsOneWidget);
+    expect(find.byIcon(Icons.refresh), findsOneWidget);
   });
 }

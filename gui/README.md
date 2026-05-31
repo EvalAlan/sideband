@@ -1,34 +1,62 @@
 # Sideband GUI (Flutter)
 
-Desktop/mobile GUI scaffold is now runnable.
+This is now a working desktop chat client shell backed by the Sideband CLI.
 
-## Start GUI (Linux desktop)
+## What works
+
+- Loads contacts from `sideband contact list`
+- Loads per-contact history from `sideband history --contact <name>`
+- Sends messages via `sideband send --to <name> --message <text>`
+- Auto-refreshes history every 4 seconds
+- Manual refresh button for contacts + history
+- Shows message timestamp/status/id metadata
+
+## Runtime requirements
+
+- A built Sideband binary (`../target/debug/sideband`) **or** `sideband` in `PATH`
+- Existing Sideband profile + contacts (create via CLI)
+- Linux desktop session for `flutter run -d linux` (not headless SSH shell)
+
+Optional override:
+
+```bash
+export SIDEBAND_BIN=/absolute/path/to/sideband
+```
+
+## Run (Linux)
 
 ```bash
 cd /home/rocky/repos/sideband/gui
+../.tools/flutter/bin/flutter pub get
 ../.tools/flutter/bin/flutter run -d linux
 ```
 
-If you already have Flutter in PATH:
+If Flutter is in `PATH`:
 
 ```bash
 cd /home/rocky/repos/sideband/gui
+flutter pub get
 flutter run -d linux
 ```
 
-## Current state
+## Build prerequisites (Linux)
 
-- Flutter app shell runs.
-- Rust API boundary exists in `../src/app_api.rs`.
-- FRB config exists in `flutter_rust_bridge.yaml`.
+Arch/CachyOS:
 
-What is still missing:
+```bash
+sudo pacman -S --needed base-devel cmake ninja clang gtk3 pkgconf
+```
 
-- Generated FRB bindings
-- Rust `lib.rs` + `cdylib` export for FRB
-- Wiring UI to real Rust backend calls
+Debian/Ubuntu:
 
-## Notes
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake ninja-build clang libgtk-3-dev pkg-config
+```
 
-- Running from a headless shell without a display will fail with GTK `cannot open display`.
-- Android requires Android SDK/Studio setup first.
+## Still missing
+
+- Native Rust bridge (flutter_rust_bridge) instead of shelling out to CLI
+- File transfer workflow in GUI
+- Ratchet/session indicators in chat header
+- Contact add/edit flows in GUI
