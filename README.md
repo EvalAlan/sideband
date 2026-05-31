@@ -12,7 +12,7 @@ Experimental privacy-first, serverless chat over Tor onion services.
 - Double Ratchet forward secrecy
 - SQLite message history
 - Ratatui TUI with contacts sidebar, message scroll, timestamps
-- File transfer offers with encrypted metadata
+- File transfer with offer/chunk/ack, hash verification, and restart-safe resume
 
 ## Build
 
@@ -38,7 +38,7 @@ cargo test
 cargo fmt --check
 ```
 
-All 22 tests should pass. Tor is not required for `cargo test` — tests use temporary profiles without network.
+All 23 tests should pass. Tor is not required for `cargo test` — tests use temporary profiles without network.
 
 ## Quick start
 

@@ -2950,3 +2950,37 @@ fn inbound_v3_recovers_from_simultaneous_manual_ratchet_init() {
     assert_eq!(decrypted, plaintext);
     assert!(verified);
 }
+
+#[test]
+fn outbound_transfer_resume_uses_persisted_next_chunk_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    let hash = "abcd1234resume";
+
+    let st = OutboundTransferState {
+        contact_name: "alice".to_string(),
+        onion: "aliceexampleonionxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion".to_string(),
+        file_path: "/tmp/demo.bin".to_string(),
+        file_name: "demo.bin".to_string(),
+        hash: hash.to_string(),
+        total_size: 100_000,
+        total_chunks: 4,
+        next_chunk_index: 2,
+    };
+
+    persist_outbound_state(profile, &st).unwrap();
+
+    let listed = list_transfers(profile).unwrap();
+    assert!(listed
+        .iter()
+        .any(|r| r.contains("outbound abcd1234resume -> alice chunk 2/4 file=demo.bin")));
+
+    let target = outbound_transfer_target(profile, hash).unwrap();
+    assert_eq!(
+        target,
+        Some(("alice".to_string(), "/tmp/demo.bin".to_string()))
+    );
+
+    assert!(cancel_outbound_transfer(profile, hash).unwrap());
+    assert!(outbound_transfer_target(profile, hash).unwrap().is_none());
+}
