@@ -119,26 +119,27 @@ class SidebandCli {
       r'^\[(\d+)\]\s+(in|out)\s+(\S+)\s+(.+?)\s{2,}(.+)\s+ts=(\d+)$',
     );
 
-    return raw
-        .split('\n')
-        .where((line) => line.trim().isNotEmpty)
-        .map((line) {
-          final m = pattern.firstMatch(line.trim());
-          if (m == null) {
-            throw FormatException('Unrecognized history line: $line');
-          }
-          return ChatMessage(
-            id: int.parse(m.group(1)!),
-            direction: m.group(2)!,
-            status: m.group(3)!,
-            contact: m.group(4)!.trim(),
-            text: m.group(5)!,
-            timestampMs: int.parse(m.group(6)!),
-          );
-        })
-        .toList()
-        .reversed
-        .toList();
+    final parsed = <ChatMessage>[];
+    for (final line
+        in raw.split('\n').where((line) => line.trim().isNotEmpty)) {
+      final m = pattern.firstMatch(line.trim());
+      if (m == null) {
+        // Don't drop the entire timeline because one row format changed.
+        continue;
+      }
+      parsed.add(
+        ChatMessage(
+          id: int.parse(m.group(1)!),
+          direction: m.group(2)!,
+          status: m.group(3)!,
+          contact: m.group(4)!.trim(),
+          text: m.group(5)!,
+          timestampMs: int.parse(m.group(6)!),
+        ),
+      );
+    }
+
+    return parsed.reversed.toList();
   }
 
   Future<void> sendMessage(
@@ -344,7 +345,8 @@ class _ChatScreenState extends State<ChatScreen> {
       children: [
         ListTile(
           title: Text(selected.name),
-          subtitle: Text(selected.onion),
+          subtitle: Text('${selected.onion}\nprofile: ~/.sideband'),
+          isThreeLine: true,
         ),
         const Divider(height: 1),
         if (_error != null)
