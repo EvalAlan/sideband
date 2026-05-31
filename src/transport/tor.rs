@@ -61,23 +61,18 @@ impl TorTransport {
         Ok(Arc::new(crate::create_tor_client(profile).await?))
     }
 
-    /// Run the full inbound loop: accept Tor connections, bridge to local TCP,
-    /// read lines, parse into [`ChatMessage`]s, and push into the inbound channel.
+    /// Run the inbound IO loop: accept Tor connections, bridge to local TCP,
+    /// read lines, and push parsed [`Envelope`]s into the inbound channel.
+    ///
+    /// This is pure transport IO — no protocol dispatch.  The consumer calls
+    /// [`Transport::try_recv`] to pull envelopes and handles them.
     ///
     /// Returns when `quit_rx` fires or the onion service stream ends.
-    pub async fn run_inbound_loop(
-        &self,
-        profile: &Path,
-        tui_tx: mpsc::Sender<TuiEvent>,
-        mut quit_rx: oneshot::Receiver<()>,
-        tor_client: Arc<TorClient<PreferredRuntime>>,
-    ) -> Result<()> {
-        let _key = crate::load_signing_key(profile)?;
-        if let Err(e) = crate::load_incoming_states(profile) {
-            tracing::warn!(error=%e, "failed to load persisted incoming file state");
-        }
+    pub async fn run_inbound_loop(&self, mut quit_rx: oneshot::Receiver<()>) -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let listen_port = listener.local_addr()?.port();
+
+        let tor_client = Arc::clone(&self.client);
 
         // Create an Arti onion service that forwards to our local listener.
         let nickname = tor_hsservice::HsNickname::new("sideband".into())
@@ -90,15 +85,11 @@ impl TorTransport {
             .launch_onion_service(hs_config)
             .context("launch onion service")?
             .context("onion service disabled or failed to launch")?;
-        let onion_hsid = onion_svc
+        let _onion_hsid = onion_svc
             .onion_address()
             .context("onion service has no address — key may not be ready")?;
-        let onion = crate::hsid_to_onion(&onion_hsid);
 
-        let _ = tui_tx
-            .send(TuiEvent::StatusUpdate(format!("onion={onion}")))
-            .await;
-        tracing::info!(%onion, listen_port, "serve ready via Arti onion service");
+        tracing::info!(listen_port, "inbound io loop ready via Arti onion service");
 
         // Bridge Tor rendezvous requests to local TCP listener.
         let local_addr = format!("127.0.0.1:{listen_port}");
@@ -135,18 +126,13 @@ impl TorTransport {
             }
         });
 
-        let contacts_for_spawn = crate::load_contacts(profile).unwrap_or_default();
         let inbound_tx = self.inbound_tx.clone();
 
         loop {
             tokio::select! {
                 incoming = listener.accept() => {
                     let (stream, peer) = incoming?;
-                    let contacts = contacts_for_spawn.clone();
-                    let profile = profile.to_path_buf();
-                    let tui_tx = tui_tx.clone();
                     let inbound_tx = inbound_tx.clone();
-                    let tor_client_for_inbound = Arc::clone(&tor_client);
                     tracing::info!(%peer, "incoming connection");
                     tokio::spawn(async move {
                         let mut reader = BufReader::new(stream);
@@ -154,19 +140,8 @@ impl TorTransport {
                         match reader.read_line(&mut line).await {
                             Ok(0) => {}
                             Ok(_) => {
-                                if let Some(mut msg) = parse_inbound_line(&line).unwrap_or(None) {
-                                    if let Err(e) = crate::handler::handle_inbound(
-                                        &profile,
-                                        &tui_tx,
-                                        &contacts,
-                                        &mut msg,
-                                        Arc::clone(&tor_client_for_inbound),
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!(error=%e, "inbound handler error");
-                                    }
-                                    // Push the raw envelope into the channel for try_recv consumers.
+                                if let Some(_msg) = parse_inbound_line(&line).unwrap_or(None) {
+                                    // Push the raw envelope into the try_recv channel.
                                     let env = Self::raw_line_to_envelope(&line);
                                     let _ = inbound_tx.send(env).await;
                                 } else {
@@ -178,9 +153,8 @@ impl TorTransport {
                     });
                 }
                 _ = &mut quit_rx => {
-                    tracing::info!("serve received quit signal, shutting down");
+                    tracing::info!("inbound io loop received quit signal, shutting down");
                     drop(onion_svc);
-                    drop(tor_client);
                     return Ok(());
                 }
             }

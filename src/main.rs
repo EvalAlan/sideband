@@ -15,7 +15,6 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection};
-use safelog::DisplayRedacted;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::mpsc;
@@ -29,6 +28,8 @@ use tor_rtcompat::PreferredRuntime;
 mod handler;
 mod transport;
 mod tui;
+
+use crate::transport::Transport;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -1959,21 +1960,75 @@ async fn create_tor_client(profile: &Path) -> Result<TorClient<PreferredRuntime>
 // Serve
 // ---------------------------------------------------------------------------
 
-/// Format an HsId as a valid v3 .onion address.
-pub(crate) fn hsid_to_onion(hsid: &tor_hsservice::HsId) -> String {
-    hsid.display_unredacted().to_string()
-}
-
 async fn serve(
     profile: &Path,
     tui_tx: mpsc::Sender<TuiEvent>,
     quit_rx: tokio::sync::oneshot::Receiver<()>,
     tor_client: Arc<TorClient<PreferredRuntime>>,
 ) -> Result<()> {
-    let transport = crate::transport::tor::TorTransport::new(None, tor_client);
-    transport
-        .run_inbound_loop(profile, tui_tx, quit_rx, transport.client.clone())
-        .await
+    let _key = crate::load_signing_key(profile)?;
+    if let Err(e) = crate::load_incoming_states(profile) {
+        tracing::warn!(error=%e, "failed to load persisted incoming file state");
+    }
+    let contacts = crate::load_contacts(profile).unwrap_or_default();
+    let transport = Arc::new(crate::transport::tor::TorTransport::new(
+        None,
+        tor_client.clone(),
+    ));
+
+    // Spawn the inbound IO loop (pure transport: accepts connections, parses
+    // lines, pushes Envelopes into the channel).
+    let io_transport = Arc::clone(&transport);
+    let io_handle = tokio::spawn(async move { io_transport.run_inbound_loop(quit_rx).await });
+
+    // Main dispatch loop: pull envelopes from the channel and handle them.
+    // This is the only place that calls handle_inbound — transport is agnostic.
+    loop {
+        match (*transport).try_recv().await {
+            Ok(Some(envelope)) => {
+                let body =
+                    match crate::transport::tor::TorTransport::envelope_body_as_str(&envelope) {
+                        Ok(b) => b.to_owned(),
+                        Err(e) => {
+                            tracing::error!(error=%e, "envelope body is not valid utf-8");
+                            continue;
+                        }
+                    };
+                if let Some(mut msg) = handler::parse_inbound_line(&body).unwrap_or(None) {
+                    if let Err(e) = handler::handle_inbound(
+                        profile,
+                        &tui_tx,
+                        &contacts,
+                        &mut msg,
+                        tor_client.clone(),
+                    )
+                    .await
+                    {
+                        tracing::error!(error=%e, "inbound handler error");
+                    }
+                } else {
+                    tracing::error!(raw=%body, "invalid inbound payload");
+                }
+            }
+            Ok(None) => {
+                // No envelopes right now; yield briefly to avoid hot-looping.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                tracing::error!(error=%e, "try_recv error from transport channel");
+                break;
+            }
+        }
+
+        // If the IO loop has finished, we're done.
+        if io_handle.is_finished() {
+            break;
+        }
+    }
+
+    // Propagate any panic/error from the IO loop.
+    io_handle.await??;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
