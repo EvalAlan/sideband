@@ -204,7 +204,7 @@ pub(crate) struct ChatMessage {
 // File transfer
 // ---------------------------------------------------------------------------
 
-const FILE_CHUNK_SIZE: usize = 32 * 1024; // 32 KB chunks
+const FILE_CHUNK_SIZE: usize = 8 * 1024; // 8 KB chunks (smaller HS payload for better reliability)
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct FileOfferPayload {
@@ -569,8 +569,18 @@ pub(crate) async fn send_file(
         let chunk_json = serde_json::to_string(&payload)?;
 
         let mut delivered = false;
-        let max_attempts = 3;
+        let max_attempts = 4;
+        let payload_bytes = chunk_json.len();
         for attempt in 1..=max_attempts {
+            tracing::info!(
+                chunk_index,
+                total_chunks,
+                attempt,
+                max_attempts,
+                payload_bytes,
+                "sending file chunk"
+            );
+
             let send_result = send_typed_message(
                 profile,
                 &onion,
@@ -582,12 +592,41 @@ pub(crate) async fn send_file(
             .await;
 
             if let Err(e) = send_result {
-                warn!(chunk_index, attempt, error=%e, "file chunk send failed");
+                warn!(chunk_index, attempt, payload_bytes, error=%e, "file chunk send failed");
                 if attempt < max_attempts {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let jitter_ms = 250
+                        + ((SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0)
+                            + chunk_index as u64 * 97
+                            + attempt as u64 * 131)
+                            % 900);
+                    let backoff_secs = attempt as u64 * 2;
+                    tokio::time::sleep(
+                        Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms),
+                    )
+                    .await;
                     continue;
                 }
-                return Err(anyhow!("{e}"));
+                if e.to_string().contains("timed out") {
+                    return Err(anyhow!(
+                        "chunk_connect_timeout chunk={}/{} payload={}B attempts={} cause={}",
+                        chunk_index + 1,
+                        total_chunks,
+                        payload_bytes,
+                        max_attempts,
+                        e
+                    ));
+                }
+                return Err(anyhow!(
+                    "chunk_send_failed chunk={}/{} payload={}B attempts={} cause={}",
+                    chunk_index + 1,
+                    total_chunks,
+                    payload_bytes,
+                    max_attempts,
+                    e
+                ));
             }
 
             if wait_for_file_ack(&hash, chunk_index, std::time::Duration::from_secs(20)).await {
@@ -596,15 +635,21 @@ pub(crate) async fn send_file(
             }
 
             if attempt < max_attempts {
-                warn!(chunk_index, attempt, "file chunk ack timeout; retrying");
+                warn!(
+                    chunk_index,
+                    attempt, payload_bytes, "file chunk ack timeout; retrying"
+                );
             }
         }
 
         if !delivered {
             return Err(anyhow!(
-                "file transfer failed waiting for ack hash={} chunk={}",
+                "file transfer ack_timeout hash={} chunk={}/{} payload={}B attempts={}",
                 hash,
-                chunk_index
+                chunk_index + 1,
+                total_chunks,
+                payload_bytes,
+                max_attempts
             ));
         }
 
