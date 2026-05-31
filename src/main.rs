@@ -30,6 +30,7 @@ use arti_client::{TorClient, TorClientConfig};
 use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_rtcompat::PreferredRuntime;
 
+mod handler;
 mod transport;
 mod tui;
 
@@ -175,14 +176,14 @@ struct ContactFile {
 }
 
 /// On-disk format: name -> ContactFile
-type ContactsMap = HashMap<String, ContactFile>;
+pub(crate) type ContactsMap = HashMap<String, ContactFile>;
 
 /// Chat message format (v1 = signed plaintext, v2 = signed + encrypted, v3 = double ratchet).
 /// In v2 the `body` field empty on wire, `enc_body` holds ChaCha20-Poly1305 ciphertext.
 /// In v3 `body` and `enc_body` are empty; ratchet_header_b64, ratchet_nonce_hex,
 /// and ratchet_ct_hex carry the Double Ratchet payload.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct ChatMessage {
+pub(crate) struct ChatMessage {
     v: u32,
     r#type: String,
     from: String,
@@ -209,7 +210,7 @@ struct ChatMessage {
 const FILE_CHUNK_SIZE: usize = 32 * 1024; // 32 KB chunks
 
 #[derive(Debug, Serialize, Deserialize)]
-struct FileOfferPayload {
+pub(crate) struct FileOfferPayload {
     name: String,
     size: usize,
     hash: String,
@@ -217,7 +218,7 @@ struct FileOfferPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct FileChunkPayload {
+pub(crate) struct FileChunkPayload {
     name: String,
     hash: String,
     chunk_index: usize,
@@ -226,7 +227,7 @@ struct FileChunkPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct FileAckPayload {
+pub(crate) struct FileAckPayload {
     hash: String,
     chunk_index: usize,
     total_chunks: usize,
@@ -234,7 +235,7 @@ struct FileAckPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct IncomingFileState {
+pub(crate) struct IncomingFileState {
     total_chunks: usize,
     chunks: Vec<Option<Vec<u8>>>,
 }
@@ -257,20 +258,20 @@ static INCOMING_FILES: std::sync::OnceLock<
 static FILE_ACKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
-fn incoming_files_map(
+pub(crate) fn incoming_files_map(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, IncomingFileState>> {
     INCOMING_FILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn file_ack_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+pub(crate) fn file_ack_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     FILE_ACKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
-fn ack_key(hash: &str, chunk_index: usize) -> String {
+pub(crate) fn ack_key(hash: &str, chunk_index: usize) -> String {
     format!("{hash}:{chunk_index}")
 }
 
-fn persist_incoming_states(profile: &Path) -> Result<()> {
+pub(crate) fn persist_incoming_states(profile: &Path) -> Result<()> {
     let snapshot = {
         let map = incoming_files_map()
             .lock()
@@ -345,7 +346,7 @@ fn load_incoming_states(profile: &Path) -> Result<()> {
     Ok(())
 }
 
-fn persist_outbound_state(profile: &Path, state: &OutboundTransferState) -> Result<()> {
+pub(crate) fn persist_outbound_state(profile: &Path, state: &OutboundTransferState) -> Result<()> {
     let conn = init_db(profile)?;
     conn.execute(
         "INSERT INTO outbound_transfers
@@ -801,7 +802,7 @@ fn init_db(profile: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn store_message(
+pub(crate) fn store_message(
     profile: &Path,
     direction: &str,
     contact: &str,
@@ -1039,7 +1040,7 @@ pub(crate) fn resolve_to(profile: &Path, to: &str) -> Result<String> {
     }
 }
 
-fn resolve_contact_name_by_pubkey(
+pub(crate) fn resolve_contact_name_by_pubkey(
     contacts: &std::collections::HashMap<String, ContactFile>,
     pubkey_b64: &str,
 ) -> Result<String> {
@@ -1799,7 +1800,7 @@ fn resolve_x25519_pubkey(profile: &Path, contact_name: &str) -> Result<X25519Pub
 
 /// Decrypt a v2 inbound message and verify the Ed25519 signature.
 /// v1 messages (no enc_body) pass through with plaintext verification.
-fn decrypt_and_verify(
+pub(crate) fn decrypt_and_verify(
     msg: &mut ChatMessage,
     our_profile: &Path,
     contacts: &ContactsMap,
@@ -2055,257 +2056,20 @@ async fn serve(
                     match reader.read_line(&mut line).await {
                         Ok(0) => {}
                         Ok(_) => {
-                            let envelope = crate::transport::tor::TorTransport::raw_line_to_envelope(line.trim());
-                            if let Ok(raw_msg) = crate::transport::tor::TorTransport::envelope_body_as_str(&envelope) {
-                            if let Ok(mut msg) = serde_json::from_str::<ChatMessage>(raw_msg) {
-                                if msg.r#type == "file_offer" {
-                                    let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts).unwrap_or_else(|e| {
-                                        error!(error=%e, "decrypt/verify failed");
-                                        (String::new(), false)
-                                    });
-                                    let contact_name = contacts
-                                        .values()
-                                        .find(|c| c.pubkey_b64 == msg.from)
-                                        .map(|c| c.name.clone())
-                                        .unwrap_or_else(|| {
-                                            if verified { "verified-peer".into() } else { msg.from.clone() }
-                                        });
-                                    let body_for_display = if verified {
-                                        match serde_json::from_str::<FileOfferPayload>(&plaintext) {
-                                            Ok(offer) => {
-                                                let key = format!("{}:{}", msg.from, offer.hash);
-                                                let mut map = incoming_files_map().lock().map_err(|_| anyhow!("incoming file map lock poisoned")).unwrap();
-                                                map.insert(
-                                                    key,
-                                                    IncomingFileState {
-                                                        total_chunks: offer.total_chunks,
-                                                        chunks: vec![None; offer.total_chunks],
-                                                    },
-                                                );
-                                                if let Err(e) = persist_incoming_states(&profile) {
-                                                    warn!(error=%e, "failed to persist incoming file offer state");
-                                                }
-                                                format!(
-                                                    "[file offer] {} ({} bytes, {} chunks)",
-                                                    offer.name, offer.size, offer.total_chunks
-                                                )
-                                            }
-                                            Err(_) => format!("[file offer] {}", plaintext),
-                                        }
-                                    } else {
-                                        "[file offer — UNVERIFIED]".to_string()
-                                    };
-                                    if let Err(e) = store_message(
-                                        &profile, "in", &contact_name, "",
-                                        &body_for_display, msg.timestamp_ms,
-                                        if verified { DeliveryStatus::Delivered } else { DeliveryStatus::Failed },
-                                    ) {
-                                        error!(error=%e, "failed to store file offer");
-                                    }
-                                    let _ = tui_tx.send(TuiEvent::InboundMessage {
-                                        contact: contact_name,
-                                        body: body_for_display,
-                                        timestamp_ms: msg.timestamp_ms,
-                                        verified,
-                                    }).await;
-                                    info!(recv=true, %msg.r#type, "file offer received");
-                                    return;
-                                }
-
-                                if msg.r#type == "file_chunk" {
-                                    let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts).unwrap_or_else(|e| {
-                                        error!(error=%e, "decrypt/verify failed");
-                                        (String::new(), false)
-                                    });
-                                    if !verified {
-                                        return;
-                                    }
-                                    if let Ok(chunk) = serde_json::from_str::<FileChunkPayload>(&plaintext) {
-                                        let key = format!("{}:{}", msg.from, chunk.hash);
-                                        let mut completed_data: Option<Vec<u8>> = None;
-                                        {
-                                            let mut map = incoming_files_map().lock().map_err(|_| anyhow!("incoming file map lock poisoned")).unwrap();
-                                            let state = map.entry(key.clone()).or_insert_with(|| IncomingFileState {
-                                                total_chunks: chunk.total_chunks,
-                                                chunks: vec![None; chunk.total_chunks],
-                                            });
-                                            if chunk.chunk_index < state.total_chunks {
-                                                if let Ok(bytes) = B64.decode(chunk.data_b64.as_bytes()) {
-                                                    state.chunks[chunk.chunk_index] = Some(bytes);
-                                                }
-                                            }
-                                            if state.chunks.iter().all(|c| c.is_some()) {
-                                                let mut assembled = Vec::new();
-                                                for c in &state.chunks {
-                                                    assembled.extend_from_slice(c.as_ref().unwrap());
-                                                }
-                                                completed_data = Some(assembled);
-                                                map.remove(&key);
-                                            }
-                                        }
-                                        if let Err(e) = persist_incoming_states(&profile) {
-                                            warn!(error=%e, "failed to persist incoming chunk state");
-                                        }
-
-                                        let ack = FileAckPayload {
-                                            hash: chunk.hash.clone(),
-                                            chunk_index: chunk.chunk_index,
-                                            total_chunks: chunk.total_chunks,
-                                            status: "received".to_string(),
-                                        };
-                                        if let Ok(contact_name) = resolve_contact_name_by_pubkey(&contacts, &msg.from) {
-                                            let onion = contacts
-                                                .get(&contact_name)
-                                                .map(|c| c.onion.clone())
-                                                .unwrap_or_default();
-                                            if !onion.is_empty() {
-                                                let _ = send_typed_message(
-                                                    &profile,
-                                                    &onion,
-                                                    &contact_name,
-                                                    "file_ack",
-                                                    &serde_json::to_string(&ack).unwrap_or_default(),
-                                                    Arc::clone(&tor_client_for_inbound),
-                                                )
-                                                .await;
-                                            }
-                                        }
-
-                                        if let Some(data) = completed_data {
-                                            let actual_hash = {
-                                                use sha2::Digest;
-                                                let mut h = sha2::Sha256::new();
-                                                h.update(&data);
-                                                format!("{:x}", h.finalize())
-                                            };
-                                            let contact_name = contacts
-                                                .values()
-                                                .find(|c| c.pubkey_b64 == msg.from)
-                                                .map(|c| c.name.clone())
-                                                .unwrap_or_else(|| msg.from.clone());
-                                            let downloads_dir = profile.join("downloads");
-                                            if let Err(e) = fs::create_dir_all(&downloads_dir) {
-                                                error!(error=%e, "failed to create downloads dir");
-                                            }
-                                            let mut body = format!("[file received failed hash: {}]", chunk.name);
-                                            if actual_hash == chunk.hash {
-                                                let safe_name = std::path::Path::new(&chunk.name)
-                                                    .file_name()
-                                                    .and_then(|n| n.to_str())
-                                                    .filter(|n| !n.is_empty())
-                                                    .unwrap_or("download.bin")
-                                                    .to_string();
-                                                let out_path = downloads_dir.join(&safe_name);
-                                                match fs::write(&out_path, &data) {
-                                                    Ok(_) => {
-                                                        body = format!("[file received: {}]", out_path.display());
-                                                    }
-                                                    Err(e) => {
-                                                        body = format!("[file write failed: {}]", e);
-                                                    }
-                                                }
-                                            }
-                                            let _ = store_message(
-                                                &profile,
-                                                "in",
-                                                &contact_name,
-                                                "",
-                                                &body,
-                                                msg.timestamp_ms,
-                                                DeliveryStatus::Delivered,
-                                            );
-                                            let _ = tui_tx
-                                                .send(TuiEvent::InboundMessage {
-                                                    contact: contact_name,
-                                                    body,
-                                                    timestamp_ms: msg.timestamp_ms,
-                                                    verified: true,
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                    return;
-                                }
-
-                                if msg.r#type == "file_ack" {
-                                    let (plaintext, verified) = decrypt_and_verify(&mut msg, &profile, &contacts)
-                                        .unwrap_or_else(|e| {
-                                            error!(error=%e, "decrypt/verify failed");
-                                            (String::new(), false)
-                                        });
-                                    if verified {
-                                        if let Ok(ack) = serde_json::from_str::<FileAckPayload>(&plaintext) {
-                                            if let Ok(mut set) = file_ack_set().lock() {
-                                                set.insert(ack_key(&ack.hash, ack.chunk_index));
-                                            }
-                                        }
-                                        let contact_name = contacts
-                                            .values()
-                                            .find(|c| c.pubkey_b64 == msg.from)
-                                            .map(|c| c.name.clone())
-                                            .unwrap_or_else(|| msg.from.clone());
-                                        let body = format!("[file ack] {}", plaintext);
-                                        let _ = tui_tx
-                                            .send(TuiEvent::InboundMessage {
-                                                contact: contact_name,
-                                                body,
-                                                timestamp_ms: msg.timestamp_ms,
-                                                verified: true,
-                                            })
-                                            .await;
-                                    }
-                                    return;
-                                }
-
-                                let decrypt_result = decrypt_and_verify(&mut msg, &profile, &contacts);
-                                let decrypt_error = decrypt_result.as_ref().err().map(|e| e.to_string());
-                                let (plaintext, verified) = decrypt_result.unwrap_or_else(|e| {
-                                    error!(error=%e, "decrypt/verify failed");
-                                    (String::new(), false)
-                                });
-                                let body_for_display = if plaintext.is_empty() {
-                                    match decrypt_error {
-                                        Some(e) => format!("[decryption failed: {e}]"),
-                                        None => "[decryption failed]".to_string(),
-                                    }
-                                } else {
-                                    plaintext.clone()
-                                };
-
-                                let contact_name = contacts
-                                    .values()
-                                    .find(|c| c.pubkey_b64 == msg.from)
-                                    .map(|c| c.name.clone())
-                                    .unwrap_or_else(|| {
-                                        if verified { "verified-peer".into() } else { msg.from.clone()
-                                        }
-                                    });
-
-                                if let Err(e) = store_message(
-                                    &profile, "in", &contact_name, "",
-                                    &plaintext, msg.timestamp_ms,
-                                    if verified { DeliveryStatus::Delivered } else { DeliveryStatus::Failed },
-                                ) {
-                                    error!(error=%e, "failed to store inbound message");
-                                }
-
-                                let _ = tui_tx.send(TuiEvent::InboundMessage {
-                                    contact: contact_name.clone(),
-                                    body: body_for_display,
-                                    timestamp_ms: msg.timestamp_ms,
-                                    verified,
-                                }).await;
-
-                                if verified {
-                                    info!(recv=true, v=%msg.v, "message received and verified");
-                                } else {
-                                    warn!(from=%msg.from, "signature verification FAILED");
+                            if let Some(mut msg) = handler::parse_inbound_line(&line).unwrap_or(None) {
+                                if let Err(e) = handler::handle_inbound(
+                                    &profile,
+                                    &tui_tx,
+                                    &contacts,
+                                    &mut msg,
+                                    Arc::clone(&tor_client_for_inbound),
+                                )
+                                .await
+                                {
+                                    error!(error=%e, "inbound handler error");
                                 }
                             } else {
                                 error!(raw=%line, "invalid inbound payload");
-                            }
-                            } else {
-                                error!(raw=%line, "invalid inbound envelope body");
                             }
                         }
                         Err(e) => error!(error=%e, "read error"),
@@ -3088,4 +2852,38 @@ fn outbound_transfer_resume_uses_persisted_next_chunk_index() {
 
     assert!(cancel_outbound_transfer(profile, hash).unwrap());
     assert!(outbound_transfer_target(profile, hash).unwrap().is_none());
+}
+
+#[test]
+fn parse_inbound_line_rejects_garbage() {
+    assert!(handler::parse_inbound_line("not json").unwrap().is_none());
+    assert!(handler::parse_inbound_line("").unwrap().is_none());
+}
+
+#[test]
+fn parse_inbound_line_parses_valid_chat_message() {
+    let json = r#"{"v":1,"type":"msg","from":"alice","timestamp_ms":123,"body":"hello","sig_b64":"","enc_body":""}"#;
+    match handler::parse_inbound_line(json) {
+        Ok(Some(msg)) => {
+            assert_eq!(msg.v, 1);
+            assert_eq!(msg.r#type, "msg");
+            assert_eq!(msg.from, "alice");
+            assert_eq!(msg.body, "hello");
+        }
+        Ok(None) => panic!("parse_inbound_line returned None for valid JSON"),
+        Err(e) => panic!("parse_inbound_line returned error: {e}"),
+    }
+}
+
+#[test]
+fn tor_transport_send_rejects_unknown_contact_name() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::init_profile(dir.path()).unwrap();
+
+    // resolve_to with a non-onion name that is not in the contact list should
+    // fail with "unknown contact".
+    let result = crate::resolve_to(dir.path(), "nonexistent_contact");
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("unknown contact"), "unexpected error: {err}");
 }
