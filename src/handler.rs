@@ -243,7 +243,25 @@ async fn handle_file_chunk(
             total_chunks: chunk.total_chunks,
             status: "received".to_string(),
         };
-        if let Ok(contact_name) = resolve_contact_name_by_pubkey(contacts, &msg.from) {
+        let ack_contact = resolve_contact_name_by_pubkey(contacts, &msg.from)
+            .ok()
+            .or_else(|| {
+                if contacts.len() == 1 {
+                    let only = contacts.keys().next().cloned();
+                    if let Some(ref name) = only {
+                        tracing::warn!(
+                            contact=%name,
+                            from=%msg.from,
+                            "falling back to only configured contact for file ACK"
+                        );
+                    }
+                    only
+                } else {
+                    None
+                }
+            });
+
+        if let Some(contact_name) = ack_contact {
             let onion = contacts
                 .get(&contact_name)
                 .map(|c| c.onion.clone())
@@ -278,7 +296,11 @@ async fn handle_file_chunk(
                         );
                     }
                 }
+            } else {
+                tracing::error!(contact=%contact_name, "file ack skipped: contact onion missing");
             }
+        } else {
+            tracing::error!(from=%msg.from, contacts=%contacts.len(), "file ack skipped: no contact match for sender pubkey");
         }
 
         // If completed, verify hash and write file.
