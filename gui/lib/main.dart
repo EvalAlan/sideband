@@ -331,37 +331,49 @@ class _ChatScreenState extends State<_ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
-      return Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(
-                width: 28,
-                height: 28,
-                child:
-                    CircularProgressIndicator(strokeWidth: 2.5, color: _teal),
-              ),
-              const SizedBox(height: 16),
-              Text('Connecting…',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: _textDim)),
-            ],
-          ),
-        ),
-      );
-    }
-
     return Scaffold(
-      body: Row(
-        children: [
-          SizedBox(width: 260, child: _sidebar()),
-          Container(width: 1, color: _border),
-          Expanded(child: _sel == null ? _empty() : _chat()),
-        ],
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          // GTK can hand Flutter a 1x1 surface before the first real frame.
+          // Rendering the full layout there just trips Flex overflow asserts.
+          if (constraints.maxWidth < 80 || constraints.maxHeight < 80) {
+            return const ColoredBox(color: _bg);
+          }
+
+          if (_loading) {
+            return Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2.5, color: _teal),
+                  ),
+                  const SizedBox(height: 16),
+                  Text('Connecting…',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodyMedium
+                          ?.copyWith(color: _textDim)),
+                ],
+              ),
+            );
+          }
+
+          if (constraints.maxWidth < 720) {
+            return _sel == null ? _sidebar() : _chat();
+          }
+
+          return Row(
+            children: [
+              SizedBox(width: 260, child: _sidebar()),
+              Container(width: 1, color: _border),
+              Expanded(child: _sel == null ? _empty() : _chat()),
+            ],
+          );
+        },
       ),
     );
   }
