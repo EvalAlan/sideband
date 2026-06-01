@@ -24,8 +24,8 @@ fi
 export GTK_THEME="${GTK_THEME:-Adwaita:dark}"
 echo "[sideband] Flutter: $FLUTTER" | tee "$LOG"
 echo "[sideband] GTK_THEME=$GTK_THEME" | tee -a "$LOG"
-echo "[sideband] DISPLAY=$DISPLAY" | tee -a "$LOG"
-echo "[sideband] GDK_BACKEND=$GDK_BACKEND" | tee -a "$LOG"
+echo "[sideband] DISPLAY=${DISPLAY:-}" | tee -a "$LOG"
+echo "[sideband] GDK_BACKEND=${GDK_BACKEND:-}" | tee -a "$LOG"
 
 cd "$SCRIPT_DIR"
 
