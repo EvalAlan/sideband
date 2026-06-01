@@ -174,6 +174,7 @@ class _Cli {
   }
 
   final String _bin = _defaultBin();
+  String get bin => _bin;
   final String profile =
       Platform.environment['SIDEBAND_PROFILE'] ?? '~/.sideband';
 
@@ -255,6 +256,9 @@ class _ChatScreenState extends State<_ChatScreen> {
   List<Contact> _contacts = [];
   List<ChatMsg> _msgs = [];
   Contact? _sel;
+  Process? _listener;
+  bool _listenerRunning = false;
+  String _listenerStatus = 'listener stopped';
   bool _loading = true;
   bool _sending = false;
   String? _error;
@@ -263,6 +267,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   @override
   void initState() {
     super.initState();
+    _startListener();
     _load();
     _poll = Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
   }
@@ -270,9 +275,71 @@ class _ChatScreenState extends State<_ChatScreen> {
   @override
   void dispose() {
     _poll.cancel();
+    _listener?.kill(ProcessSignal.sigterm);
     _input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  Future<void> _startListener() async {
+    if (_listener != null) return;
+    setState(() {
+      _listenerStatus = 'listener starting';
+      _listenerRunning = false;
+    });
+
+    try {
+      final p = await Process.start(
+        _cli.bin,
+        ['serve', '--profile', _cli.profile],
+        mode: ProcessStartMode.normal,
+      );
+      _listener = p;
+      if (mounted) {
+        setState(() {
+          _listenerRunning = true;
+          _listenerStatus = 'listener running';
+        });
+      }
+
+      p.stdout.transform(systemEncoding.decoder).listen((chunk) {
+        final msg = chunk.trim();
+        if (msg.isNotEmpty && mounted) {
+          setState(() => _listenerStatus = msg.split('\n').last.trim());
+        }
+      });
+      p.stderr.transform(systemEncoding.decoder).listen((chunk) {
+        final msg = chunk.trim();
+        if (msg.isNotEmpty && mounted) {
+          setState(() {
+            _listenerStatus = msg.split('\n').last.trim();
+            // Keep the full backend failure visible somewhere. Silent empty
+            // panes are how we got here.
+            if (msg.toLowerCase().contains('error') ||
+                msg.toLowerCase().contains('failed')) {
+              _error = msg;
+            }
+          });
+        }
+      });
+      p.exitCode.then((code) {
+        if (!mounted) return;
+        setState(() {
+          _listener = null;
+          _listenerRunning = false;
+          _listenerStatus = 'listener exited: $code';
+          if (code != 0) _error = 'sideband serve exited: $code';
+        });
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _listener = null;
+        _listenerRunning = false;
+        _listenerStatus = 'listener failed';
+        _error = '$e';
+      });
+    }
   }
 
   Future<void> _load() async {
@@ -495,18 +562,39 @@ class _ChatScreenState extends State<_ChatScreen> {
                 Container(
                   width: 7,
                   height: 7,
-                  decoration:
-                      const BoxDecoration(color: _teal, shape: BoxShape.circle),
+                  decoration: BoxDecoration(
+                      color: _listenerRunning ? _teal : _errorFg,
+                      shape: BoxShape.circle),
                 ),
                 const SizedBox(width: 6),
                 Expanded(
-                  child: Text(
-                    _cli.profile,
-                    style: const TextStyle(fontSize: 10, color: _textDim),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _listenerStatus,
+                        style: TextStyle(
+                            fontSize: 10,
+                            color: _listenerRunning ? _teal : _errorFg),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      Text(
+                        _cli.profile,
+                        style: const TextStyle(fontSize: 10, color: _textDim),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
                   ),
                 ),
+                if (!_listenerRunning)
+                  IconButton(
+                    icon: const Icon(Icons.power_settings_new, size: 16),
+                    tooltip: 'Start listener',
+                    onPressed: _startListener,
+                  ),
               ],
             ),
           ),
