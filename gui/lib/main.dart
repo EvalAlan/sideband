@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -128,6 +129,7 @@ class ChatMsg {
     required this.id,
     required this.direction,
     required this.status,
+    required this.contact,
     required this.text,
     required this.tsMs,
   });
@@ -135,6 +137,7 @@ class ChatMsg {
   final int id;
   final String direction;
   final String status;
+  final String contact;
   final String text;
   final int tsMs;
 
@@ -207,7 +210,7 @@ class _Cli {
   }
 
   Future<_History> history({String? contact, int limit = 80}) async {
-    final args = ['history', '--profile', profile, '--limit', '$limit'];
+    final args = ['history', '--profile', profile, '--limit', '$limit', '--json'];
     if (contact != null && contact.trim().isNotEmpty) {
       args.addAll(['--contact', contact.trim()]);
     }
@@ -215,23 +218,40 @@ class _Cli {
     if (raw.isEmpty) {
       return _History(msgs: const [], maxId: null, bin: _bin);
     }
-    final rx =
-        RegExp(r'^\[(\d+)\]\s+(in|out)\s+(\S+)\s+(.+?)\s{2,}(.+)\s+ts=(\d+)$');
+
+    final decoded = jsonDecode(raw);
+    if (decoded is! List) {
+      throw Exception('history JSON was not a list');
+    }
+
     final parsed = <ChatMsg>[];
-    for (final l in raw.split('\n')) {
-      final m = rx.firstMatch(l.trim());
-      if (m == null) continue;
+    for (final item in decoded) {
+      if (item is! Map) continue;
       parsed.add(ChatMsg(
-        id: int.parse(m.group(1)!),
-        direction: m.group(2)!,
-        status: m.group(3)!,
-        text: m.group(5)!,
-        tsMs: int.parse(m.group(6)!),
+        id: (item['id'] as num).toInt(),
+        direction: item['direction'] as String,
+        status: _statusLabel((item['status'] as num).toInt()),
+        contact: item['contact'] as String,
+        text: item['body'] as String,
+        tsMs: (item['timestamp_ms'] as num).toInt(),
       ));
     }
     parsed.sort((a, b) => b.id.compareTo(a.id));
     final maxId = parsed.isEmpty ? null : parsed.first.id;
     return _History(msgs: parsed, maxId: maxId, bin: _bin);
+  }
+
+  String _statusLabel(int status) {
+    switch (status) {
+      case 0:
+        return 'sent';
+      case 1:
+        return 'delivered';
+      case 2:
+        return 'failed';
+      default:
+        return '?';
+    }
   }
 
   Future<void> send({required String to, required String message}) async {
@@ -306,6 +326,11 @@ class _ChatScreenState extends State<_ChatScreen> {
         final msg = chunk.trim();
         if (msg.isNotEmpty && mounted) {
           setState(() => _listenerStatus = msg.split('\n').last.trim());
+          final lower = msg.toLowerCase();
+          if (lower.contains('message received') ||
+              lower.contains('incoming connection')) {
+            unawaited(_refresh());
+          }
         }
       });
       p.stderr.transform(systemEncoding.decoder).listen((chunk) {
@@ -320,6 +345,11 @@ class _ChatScreenState extends State<_ChatScreen> {
               _error = msg;
             }
           });
+          final lower = msg.toLowerCase();
+          if (lower.contains('message received') ||
+              lower.contains('incoming connection')) {
+            unawaited(_refresh());
+          }
         }
       });
       p.exitCode.then((code) {
@@ -356,7 +386,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         final idx = c.indexWhere((x) => x.name == s!.name);
         s = idx >= 0 ? c[idx] : (c.isNotEmpty ? c.first : null);
       }
-      final h = await _cli.history(contact: s?.name);
+      final h = await _historyVisibleFor(s?.name);
       setState(() {
         _contacts = c;
         _sel = s;
@@ -371,15 +401,30 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
   }
 
+  Future<_History> _historyVisibleFor(String? contact) async {
+    final filtered = await _cli.history(contact: contact);
+    if (filtered.msgs.isNotEmpty || contact == null || contact.trim().isEmpty) {
+      return filtered;
+    }
+
+    // If inbound was stored under a raw pubkey/verified-peer because the local
+    // contact record is stale, a strict contact filter hides the only evidence.
+    // Fall back to the global transcript instead of showing a lying empty pane.
+    return _cli.history();
+  }
+
   Future<void> _refresh() async {
     if (_sel == null) return;
     try {
-      final h = await _cli.history(contact: _sel!.name);
+      final h = await _historyVisibleFor(_sel!.name);
       setState(() {
         _msgs = h.msgs;
         _error = null;
       });
-    } catch (_) {}
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = '$e');
+    }
   }
 
   Future<void> _send() async {
@@ -398,6 +443,7 @@ class _ChatScreenState extends State<_ChatScreen> {
             id: -now.millisecondsSinceEpoch,
             direction: 'out',
             status: 'sending',
+            contact: c.name,
             text: t,
             tsMs: now.millisecondsSinceEpoch),
         ..._msgs,

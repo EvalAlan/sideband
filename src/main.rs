@@ -116,6 +116,9 @@ enum CommandKind {
         /// Max rows (default 50)
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Emit machine-readable JSON instead of aligned text.
+        #[arg(long)]
+        json: bool,
     },
     Ratchet {
         #[command(flatten)]
@@ -982,6 +985,7 @@ pub(crate) fn store_message(
 }
 
 #[allow(dead_code)]
+#[derive(Serialize)]
 pub(crate) struct HistoryRow {
     id: i64,
     direction: String,
@@ -1153,10 +1157,11 @@ async fn main() -> Result<()> {
             profile,
             contact,
             limit,
+            json,
         } => {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
-            history(&profile, contact.as_deref(), limit)
+            history(&profile, contact.as_deref(), limit, json)
         }
         CommandKind::Ratchet { profile, contact } => {
             let profile = profile.path()?;
@@ -2381,8 +2386,12 @@ pub(crate) async fn send(
 // History
 // ---------------------------------------------------------------------------
 
-fn history(profile: &Path, contact: Option<&str>, limit: usize) -> Result<()> {
+fn history(profile: &Path, contact: Option<&str>, limit: usize, json: bool) -> Result<()> {
     let rows = load_history(profile, contact, limit)?;
+    if json {
+        println!("{}", serde_json::to_string(&rows)?);
+        return Ok(());
+    }
     if rows.is_empty() {
         println!("(no messages)");
         return Ok(());
