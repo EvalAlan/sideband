@@ -89,7 +89,7 @@ pub async fn send_message(profile_path: &str, to: &str, body: &str) -> Result<()
     let profile = expand_profile(profile_path);
     let onion = crate::resolve_to(&profile, to)?;
     let tor_client = TorTransport::bootstrap(&profile).await?;
-    crate::send(&profile, &onion, body, to, None, tor_client).await
+    crate::send(&profile, &onion, body, to, None, tor_client, false).await
 }
 
 pub async fn send_file(profile_path: &str, to: &str, file_path: &str) -> Result<()> {

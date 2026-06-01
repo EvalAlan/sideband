@@ -248,6 +248,7 @@ impl Transport for TorTransport {
             &contact_name,
             None,
             self.client.clone(),
+            false,
         )
         .await
     }

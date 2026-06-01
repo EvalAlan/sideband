@@ -99,6 +99,9 @@ enum CommandKind {
         to: String,
         #[arg(long)]
         message: String,
+        /// Force static X25519 encryption instead of Double Ratchet.
+        #[arg(long = "static")]
+        force_static: bool,
     },
     Contact {
         #[command(subcommand)]
@@ -1111,13 +1114,22 @@ async fn main() -> Result<()> {
             profile,
             to,
             message,
+            force_static,
         } => {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
             let onion = resolve_to(&profile, &to)?;
             let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
-            let tor = transport::tor::TorTransport::new(None, tor_client);
-            tor.send_message(&profile, &onion, &message, &to).await
+            send(
+                &profile,
+                &onion,
+                &message,
+                &to,
+                None,
+                tor_client,
+                force_static,
+            )
+            .await
         }
         CommandKind::Contact { action } => match action {
             ContactAction::Add {
@@ -2219,6 +2231,7 @@ pub(crate) async fn send(
     contact_hint: &str,
     _reuse_socks_port: Option<u16>,
     tor_client: Arc<TorClient<PreferredRuntime>>,
+    force_static: bool,
 ) -> Result<()> {
     if !to.ends_with(".onion") {
         return Err(anyhow!("resolved --to must be an onion address"));
@@ -2233,7 +2246,7 @@ pub(crate) async fn send(
 
     // Check if we have a ratchet state for this contact.
     let ratchet_path = RatchetState::path(profile, std::path::Path::new(contact_hint));
-    let use_ratchet = ratchet_path.exists();
+    let use_ratchet = ratchet_path.exists() && !force_static;
 
     let msg = if use_ratchet {
         // v3: Double Ratchet encrypt.

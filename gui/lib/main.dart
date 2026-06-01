@@ -235,7 +235,7 @@ class _Cli {
   }
 
   Future<void> send({required String to, required String message}) async {
-    await _run(['send', '--profile', profile, '--to', to, '--message', message]);
+    await _run(['send', '--profile', profile, '--to', to, '--message', message, '--static']);
   }
 }
 
