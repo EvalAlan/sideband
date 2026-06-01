@@ -156,21 +156,40 @@ class _History {
 
 class _Cli {
   _Cli();
-  final String _bin = Platform.environment['SIDEBAND_BIN'] ?? 'sideband';
+
+  static String _defaultBin() {
+    final env = Platform.environment['SIDEBAND_BIN'];
+    if (env != null && env.trim().isNotEmpty) return env;
+
+    const candidates = [
+      '../target/debug/sideband',
+      '../target/release/sideband',
+      '../../target/debug/sideband',
+      '../../target/release/sideband',
+    ];
+    for (final c in candidates) {
+      if (File(c).existsSync()) return c;
+    }
+    return 'sideband';
+  }
+
+  final String _bin = _defaultBin();
   final String profile =
       Platform.environment['SIDEBAND_PROFILE'] ?? '~/.sideband';
 
   Future<String> _run(List<String> args) async {
-    final r = await Process.run(_bin, ['--profile', profile, ...args]);
+    final r = await Process.run(_bin, args);
     if (r.exitCode != 0) {
       final err = (r.stderr as String).trim();
-      throw Exception(err.isEmpty ? 'exit ${r.exitCode}' : err);
+      final out = (r.stdout as String).trim();
+      final detail = err.isNotEmpty ? err : out;
+      throw Exception(detail.isEmpty ? '$_bin exited ${r.exitCode}' : detail);
     }
     return (r.stdout as String).trim();
   }
 
   Future<List<Contact>> contacts() async {
-    final raw = await _run(['contact', 'list']);
+    final raw = await _run(['contact', 'list', '--profile', profile]);
     if (raw.isEmpty) return [];
     return raw.split('\n').where((l) => l.isNotEmpty).map((line) {
       final parts = line.split('\t');
@@ -187,7 +206,7 @@ class _Cli {
   }
 
   Future<_History> history({String? contact, int limit = 80}) async {
-    final args = ['history', '--limit', '$limit'];
+    final args = ['history', '--profile', profile, '--limit', '$limit'];
     if (contact != null && contact.trim().isNotEmpty) {
       args.addAll(['--contact', contact.trim()]);
     }
@@ -215,7 +234,7 @@ class _Cli {
   }
 
   Future<void> send({required String to, required String message}) async {
-    await _run(['send', '--to', to, '--message', message]);
+    await _run(['send', '--profile', profile, '--to', to, '--message', message]);
   }
 }
 
@@ -411,19 +430,21 @@ class _ChatScreenState extends State<_ChatScreen> {
           ),
           // contacts
           Expanded(
-            child: _contacts.isEmpty
-                ? Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Text(
-                        'No contacts yet.\nsideband contact add …',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                            color: _textDim, fontSize: 12, height: 1.6),
-                      ),
-                    ),
-                  )
-                : ListView.builder(
+            child: _error != null && _contacts.isEmpty
+                ? _sidebarError()
+                : _contacts.isEmpty
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Text(
+                            'No contacts yet.\nsideband contact add …',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                color: _textDim, fontSize: 12, height: 1.6),
+                          ),
+                        ),
+                      )
+                    : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 6),
                     itemCount: _contacts.length,
                     itemBuilder: (_, i) {
@@ -495,6 +516,46 @@ class _ChatScreenState extends State<_ChatScreen> {
   }
 
   // ── empty state ──────────────────────────────────────────────────────────
+
+  Widget _sidebarError() {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: _errorBg,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: _errorFg.withAlpha(90)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.warning_amber_rounded, size: 16, color: _errorFg),
+                const SizedBox(width: 6),
+                Text('Backend error',
+                    style: TextStyle(
+                        color: _errorFg,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700)),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(_error!, style: TextStyle(color: _errorFg, fontSize: 11.5)),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: _load,
+              icon: const Icon(Icons.refresh, size: 14),
+              label: const Text('Retry'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   Widget _empty() {
     return Center(
