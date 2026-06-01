@@ -35,7 +35,17 @@ if "$FLUTTER" run -d linux "$@" 2>&1 | tee -a "$LOG"; then
 else
   echo "" | tee -a "$LOG"
   echo "[sideband] ── flutter run failed, trying direct binary ──" | tee -a "$LOG"
-  BIN="$(find "${SCRIPT_DIR}/build" -name sideband_gui -type f 2>/dev/null | head -1)"
+  BIN=""
+  for candidate in \
+    "${SCRIPT_DIR}/build/linux/x64/debug/bundle/sideband_gui" \
+    "${SCRIPT_DIR}/build/linux/arm64/debug/bundle/sideband_gui" \
+    "${SCRIPT_DIR}/build/linux/x64/release/bundle/sideband_gui" \
+    "${SCRIPT_DIR}/build/linux/arm64/release/bundle/sideband_gui"; do
+    if [[ -x "$candidate" ]]; then
+      BIN="$candidate"
+      break
+    fi
+  done
   if [[ -z "$BIN" ]]; then
     echo "[sideband] No built binary found. Run: $FLUTTER build linux" | tee -a "$LOG"
     exit 1
