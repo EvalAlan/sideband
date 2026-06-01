@@ -6,15 +6,26 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FLUTTER="${SCRIPT_DIR}/../.tools/flutter/bin/flutter"
 
 export GTK_THEME="${GTK_THEME:-Adwaita:dark}"
 
-if [ ! -x "$FLUTTER" ]; then
-  echo "Flutter SDK not found at $FLUTTER".
-  echo "If Flutter is on PATH, just run: flutter run -d linux"
+# Check multiple Flutter SDK locations
+for candidate in \
+  "${SCRIPT_DIR}/.tools/flutter/bin/flutter" \
+  "${SCRIPT_DIR}/../.tools/flutter/bin/flutter" \
+  "$(command -v flutter 2>/dev/null)"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    FLUTTER="$candidate"
+    break
+  fi
+done
+
+if [ -z "${FLUTTER:-}" ]; then
+  echo "Flutter SDK not found."
+  echo "Install it or add 'flutter' to PATH, then run: flutter run -d linux"
   exit 1
 fi
 
+echo "[sideband] Flutter: $FLUTTER"
 cd "$SCRIPT_DIR"
 "$FLUTTER" run -d linux "$@"

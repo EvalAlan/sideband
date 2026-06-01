@@ -20,7 +20,6 @@ static void my_application_activate(GApplication* application) {
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
 
-  // No GTK header bar — Flutter renders its own AppBar.
   gtk_window_set_title(window, "Sideband");
   gtk_window_set_default_size(window, 1280, 800);
 
@@ -35,6 +34,10 @@ static void my_application_activate(GApplication* application) {
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
+
+  // Show the window once Flutter has rendered its first frame.
+  g_signal_connect_swapped(view, "first-frame",
+                           G_CALLBACK(gtk_widget_show), window);
 }
 
 // Implements GApplication::local_command_line.
