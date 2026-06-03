@@ -22,12 +22,10 @@ if [[ -z "$FLUTTER" ]]; then
 fi
 
 export GTK_THEME="${GTK_THEME:-Adwaita:dark}"
+DEFAULT_SIDEBAND_BIN=0
 if [[ -z "${SIDEBAND_BIN:-}" ]]; then
   SIDEBAND_BIN="${SCRIPT_DIR}/../target/debug/sideband"
-  if [[ ! -x "$SIDEBAND_BIN" ]]; then
-    echo "[sideband] Building Rust backend..." | tee "$LOG"
-    cargo build --manifest-path "${SCRIPT_DIR}/../Cargo.toml" 2>&1 | tee -a "$LOG"
-  fi
+  DEFAULT_SIDEBAND_BIN=1
   export SIDEBAND_BIN
 fi
 export SIDEBAND_PROFILE="${SIDEBAND_PROFILE:-${HOME}/.sideband}"
@@ -38,6 +36,13 @@ echo "[sideband] Profile: $SIDEBAND_PROFILE" | tee -a "$LOG"
 echo "[sideband] GTK_THEME=$GTK_THEME" | tee -a "$LOG"
 echo "[sideband] DISPLAY=${DISPLAY:-}" | tee -a "$LOG"
 echo "[sideband] GDK_BACKEND=${GDK_BACKEND:-}" | tee -a "$LOG"
+
+if [[ "$DEFAULT_SIDEBAND_BIN" == "1" ]]; then
+  echo "[sideband] Building Rust backend..." | tee -a "$LOG"
+  cargo build --manifest-path "${SCRIPT_DIR}/../Cargo.toml" 2>&1 | tee -a "$LOG"
+else
+  echo "[sideband] Using external SIDEBAND_BIN; not rebuilding backend." | tee -a "$LOG"
+fi
 
 cd "$SCRIPT_DIR"
 
