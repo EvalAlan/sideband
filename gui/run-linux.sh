@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Sideband GUI launcher for Linux desktop
-# Forces consistent dark GTK theme so Flutter rendering isn't mangled
-# by host GTK theme/extension quirks.
+# Sideband GUI launcher for Linux desktop.
+# Builds with Flutter, then runs the native bundle directly so crashes are
+# captured in run-linux.log instead of being hidden behind `flutter run` noise.
 
 set -euo pipefail
 
@@ -31,6 +31,7 @@ if [[ -z "${SIDEBAND_BIN:-}" ]]; then
   export SIDEBAND_BIN
 fi
 export SIDEBAND_PROFILE="${SIDEBAND_PROFILE:-${HOME}/.sideband}"
+
 echo "[sideband] Flutter: $FLUTTER" | tee "$LOG"
 echo "[sideband] Backend: $SIDEBAND_BIN" | tee -a "$LOG"
 echo "[sideband] Profile: $SIDEBAND_PROFILE" | tee -a "$LOG"
@@ -40,27 +41,47 @@ echo "[sideband] GDK_BACKEND=${GDK_BACKEND:-}" | tee -a "$LOG"
 
 cd "$SCRIPT_DIR"
 
-# Try flutter run first; if it fails, fall back to direct binary exec with stderr capture
-if "$FLUTTER" run -d linux "$@" 2>&1 | tee -a "$LOG"; then
-  echo "[sideband] Exited cleanly." | tee -a "$LOG"
-else
-  echo "" | tee -a "$LOG"
-  echo "[sideband] ── flutter run failed, trying direct binary ──" | tee -a "$LOG"
-  BIN=""
+find_bundle() {
+  local candidate
   for candidate in \
     "${SCRIPT_DIR}/build/linux/x64/debug/bundle/sideband_gui" \
     "${SCRIPT_DIR}/build/linux/arm64/debug/bundle/sideband_gui" \
     "${SCRIPT_DIR}/build/linux/x64/release/bundle/sideband_gui" \
     "${SCRIPT_DIR}/build/linux/arm64/release/bundle/sideband_gui"; do
     if [[ -x "$candidate" ]]; then
-      BIN="$candidate"
-      break
+      printf '%s\n' "$candidate"
+      return 0
     fi
   done
-  if [[ -z "$BIN" ]]; then
-    echo "[sideband] No built binary found. Run: $FLUTTER build linux" | tee -a "$LOG"
-    exit 1
-  fi
-  echo "[sideband] Binary: $BIN" | tee -a "$LOG"
-  "$BIN" 2>&1 | tee -a "$LOG"
+  return 1
+}
+
+# Escape hatch for hot reload while actively hacking Flutter widgets.
+if [[ "${1:-}" == "--flutter-run" ]]; then
+  shift
+  echo "[sideband] Mode: flutter run" | tee -a "$LOG"
+  set +e
+  "$FLUTTER" run -d linux "$@" 2>&1 | tee -a "$LOG"
+  code=${PIPESTATUS[0]}
+  set -e
+  echo "[sideband] flutter run exited: $code" | tee -a "$LOG"
+  exit "$code"
 fi
+
+echo "[sideband] Building Linux GUI bundle..." | tee -a "$LOG"
+"$FLUTTER" build linux --debug 2>&1 | tee -a "$LOG"
+
+BIN="$(find_bundle || true)"
+if [[ -z "$BIN" ]]; then
+  echo "[sideband] No built binary found after flutter build linux." | tee -a "$LOG"
+  exit 1
+fi
+
+echo "[sideband] Binary: $BIN" | tee -a "$LOG"
+echo "[sideband] Launching native bundle directly." | tee -a "$LOG"
+set +e
+"$BIN" 2>&1 | tee -a "$LOG"
+code=${PIPESTATUS[0]}
+set -e
+echo "[sideband] Native bundle exited: $code" | tee -a "$LOG"
+exit "$code"
