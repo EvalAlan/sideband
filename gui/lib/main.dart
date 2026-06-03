@@ -324,6 +324,55 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
   }
 
+  String _expandedProfilePath() {
+    final p = _cli.profile;
+    return _expandProfileArg(p);
+  }
+
+  String _expandProfileArg(String p) {
+    if (p == '~') return Platform.environment['HOME'] ?? p;
+    if (p.startsWith('~/')) {
+      final home = Platform.environment['HOME'];
+      if (home != null && home.isNotEmpty) return '$home/${p.substring(2)}';
+    }
+    return p;
+  }
+
+  Future<int?> _findExistingListenerPid() async {
+    if (!Platform.isLinux) return null;
+
+    final profile = _expandedProfilePath();
+    final proc = Directory('/proc');
+    if (!await proc.exists()) return null;
+
+    await for (final entry in proc.list(followLinks: false)) {
+      final segments = entry.uri.pathSegments;
+      final name = segments.length >= 2 ? segments[segments.length - 2] : '';
+      final pid = int.tryParse(name);
+      if (pid == null) continue;
+
+      try {
+        final raw = await File('/proc/$pid/cmdline').readAsBytes();
+        if (raw.isEmpty) continue;
+        final args = utf8
+            .decode(raw)
+            .split('\u0000')
+            .where((s) => s.isNotEmpty)
+            .toList();
+        final profileArg = args.indexOf('--profile');
+        final sameProfile = profileArg >= 0 &&
+            profileArg + 1 < args.length &&
+            _expandProfileArg(args[profileArg + 1]) == profile;
+        final looksSideband =
+            args.any((a) => a.endsWith('/sideband') || a == 'sideband');
+        if (args.contains('serve') && sameProfile && looksSideband) return pid;
+      } catch (_) {
+        // Processes exit while /proc is being scanned. Expected.
+      }
+    }
+    return null;
+  }
+
   Future<void> _startListener() async {
     if (_listener != null) return;
     setState(() {
@@ -332,6 +381,19 @@ class _ChatScreenState extends State<_ChatScreen> {
     });
 
     try {
+      final existingPid = await _findExistingListenerPid();
+      if (existingPid != null) {
+        if (!mounted) return;
+        setState(() {
+          _listenerRunning = true;
+          _listenerStatus = 'listener already running (pid $existingPid)';
+          _error = null;
+        });
+        await _appendListenerLog(
+            'stdout', 'listener already running (pid $existingPid)');
+        return;
+      }
+
       final p = await Process.start(
         _cli.bin,
         ['serve', '--profile', _cli.profile],
