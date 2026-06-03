@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use arti_client::TorClient;
+use safelog::DisplayRedacted;
 use tor_rtcompat::PreferredRuntime;
 
 use super::{Envelope, Transport, TransportCapabilities, TransportStatus};
@@ -20,6 +21,7 @@ use crate::TuiEvent;
 pub struct TorTransport {
     local_onion: Option<String>,
     pub client: Arc<TorClient<PreferredRuntime>>,
+    status_tx: Option<mpsc::Sender<TuiEvent>>,
     /// Inbound envelope channel.  The receive half is held by `try_recv`.
     inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
     /// Sender kept alive so the channel stays open while run_inbound_loop runs.
@@ -28,10 +30,19 @@ pub struct TorTransport {
 
 impl TorTransport {
     pub fn new(local_onion: Option<String>, client: Arc<TorClient<PreferredRuntime>>) -> Self {
+        Self::new_with_status(local_onion, client, None)
+    }
+
+    pub fn new_with_status(
+        local_onion: Option<String>,
+        client: Arc<TorClient<PreferredRuntime>>,
+        status_tx: Option<mpsc::Sender<TuiEvent>>,
+    ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         Self {
             local_onion,
             client,
+            status_tx,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             inbound_tx,
         }
@@ -85,11 +96,17 @@ impl TorTransport {
             .launch_onion_service(hs_config)
             .context("launch onion service")?
             .context("onion service disabled or failed to launch")?;
-        let _onion_hsid = onion_svc
+        let onion_hsid = onion_svc
             .onion_address()
             .context("onion service has no address — key may not be ready")?;
+        let onion = onion_hsid.display_unredacted().to_string();
+        if let Some(status_tx) = &self.status_tx {
+            let _ = status_tx
+                .send(TuiEvent::StatusUpdate(format!("onion={onion}")))
+                .await;
+        }
 
-        tracing::info!(listen_port, "inbound io loop ready via Arti onion service");
+        tracing::info!(listen_port, onion=%onion, "inbound io loop ready via Arti onion service");
 
         // Bridge Tor rendezvous requests to local TCP listener.
         let local_addr = format!("127.0.0.1:{listen_port}");

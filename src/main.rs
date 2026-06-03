@@ -1111,7 +1111,16 @@ async fn main() -> Result<()> {
         CommandKind::Serve(args) => {
             let profile = args.path()?;
             ensure_profile(&profile)?;
-            let (tx, _rx) = mpsc::channel::<TuiEvent>(64);
+            let (tx, mut rx) = mpsc::channel::<TuiEvent>(64);
+            tokio::spawn(async move {
+                while let Some(evt) = rx.recv().await {
+                    match evt {
+                        TuiEvent::StatusUpdate(text) => println!("{text}"),
+                        TuiEvent::InboundMessage { .. } => println!("message received"),
+                        TuiEvent::OutboundMessage { .. } => {}
+                    }
+                }
+            });
             let (_quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
             let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
             let tor = transport::tor::TorTransport::new(None, tor_client);
@@ -2167,7 +2176,7 @@ fn verify_message(msg: &ChatMessage, contacts: &ContactsMap) -> Result<bool> {
 /// State is stored under `<profile>/arti_state`.
 async fn create_tor_client(profile: &Path) -> Result<TorClient<PreferredRuntime>> {
     let state_dir = profile.join("arti_state");
-    fs::create_dir_all(&state_dir)?;
+    fs::create_dir_all(&state_dir).context("create Arti state dir")?;
 
     let config = TorClientConfig::default();
     let tor_client = TorClient::create_bootstrapped(config)
@@ -2191,9 +2200,10 @@ async fn serve(
         tracing::warn!(error=%e, "failed to load persisted incoming file state");
     }
     let contacts = crate::load_contacts(profile).unwrap_or_default();
-    let transport = Arc::new(crate::transport::tor::TorTransport::new(
+    let transport = Arc::new(crate::transport::tor::TorTransport::new_with_status(
         None,
         tor_client.clone(),
+        Some(tui_tx.clone()),
     ));
 
     // Spawn the inbound IO loop (pure transport: accepts connections, parses

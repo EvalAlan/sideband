@@ -283,6 +283,8 @@ class _ChatScreenState extends State<_ChatScreen> {
   Process? _listener;
   bool _listenerRunning = false;
   String _listenerStatus = 'listener stopped';
+  String _listenerLogTail = '';
+  late final File _listenerLogFile;
   bool _loading = true;
   bool _sending = false;
   String? _error;
@@ -291,6 +293,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   @override
   void initState() {
     super.initState();
+    _listenerLogFile = File('${_cli.profile}/gui-listener.log');
     _startListener();
     _load();
     _poll = Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
@@ -303,6 +306,22 @@ class _ChatScreenState extends State<_ChatScreen> {
     _input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  Future<void> _appendListenerLog(String stream, String chunk) async {
+    final text = chunk.trim();
+    if (text.isEmpty) return;
+    final line = '[${DateTime.now().toIso8601String()}] $stream: $text\n';
+    _listenerLogTail = (_listenerLogTail + line);
+    if (_listenerLogTail.length > 4000) {
+      _listenerLogTail = _listenerLogTail.substring(_listenerLogTail.length - 4000);
+    }
+    try {
+      await _listenerLogFile.parent.create(recursive: true);
+      await _listenerLogFile.writeAsString(line, mode: FileMode.append, flush: true);
+    } catch (_) {
+      // The visible UI error matters more than failing to write diagnostics.
+    }
   }
 
   Future<void> _startListener() async {
@@ -321,15 +340,24 @@ class _ChatScreenState extends State<_ChatScreen> {
       _listener = p;
       if (mounted) {
         setState(() {
-          _listenerRunning = true;
-          _listenerStatus = 'listener running';
+          _listenerRunning = false;
+          _listenerStatus = 'listener bootstrapping';
         });
       }
 
       p.stdout.transform(systemEncoding.decoder).listen((chunk) {
+        unawaited(_appendListenerLog('stdout', chunk));
         final msg = chunk.trim();
         if (msg.isNotEmpty && mounted) {
-          setState(() => _listenerStatus = msg.split('\n').last.trim());
+          final last = msg.split('\n').last.trim();
+          setState(() {
+            _listenerStatus = last.startsWith('onion=')
+                ? 'listening ${last.substring('onion='.length)}'
+                : last;
+            if (last.startsWith('onion=')) {
+              _listenerRunning = true;
+            }
+          });
           final lower = msg.toLowerCase();
           if (lower.contains('message received') ||
               lower.contains('incoming connection')) {
@@ -338,6 +366,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         }
       });
       p.stderr.transform(systemEncoding.decoder).listen((chunk) {
+        unawaited(_appendListenerLog('stderr', chunk));
         final msg = chunk.trim();
         if (msg.isNotEmpty && mounted) {
           setState(() {
@@ -362,7 +391,12 @@ class _ChatScreenState extends State<_ChatScreen> {
           _listener = null;
           _listenerRunning = false;
           _listenerStatus = 'listener exited: $code';
-          if (code != 0) _error = 'sideband serve exited: $code';
+          if (code != 0) {
+            final tail = _listenerLogTail.trim();
+            _error = tail.isEmpty
+                ? 'sideband serve exited: $code'
+                : 'sideband serve exited: $code\n$tail';
+          }
         });
       });
     } catch (e) {
@@ -765,11 +799,16 @@ class _ChatScreenState extends State<_ChatScreen> {
               ],
             ),
           ),
-          Container(
-            width: 7,
-            height: 7,
-            decoration:
-                const BoxDecoration(color: _teal, shape: BoxShape.circle),
+          Tooltip(
+            message: _listenerStatus,
+            child: Container(
+              width: 7,
+              height: 7,
+              decoration: BoxDecoration(
+                color: _listenerRunning ? _teal : _errorFg,
+                shape: BoxShape.circle,
+              ),
+            ),
           ),
         ],
       ),
@@ -903,7 +942,10 @@ class _ChatScreenState extends State<_ChatScreen> {
     if (m.failed) {
       return const Icon(Icons.error_outline, size: 12, color: _errorFg);
     }
-    return Icon(Icons.done_all, size: 13, color: _teal.withAlpha(180));
+    if (m.status == 'delivered') {
+      return Icon(Icons.done_all, size: 13, color: _teal.withAlpha(180));
+    }
+    return Icon(Icons.done, size: 13, color: _teal.withAlpha(160));
   }
 
   // ── input ────────────────────────────────────────────────────────────────
