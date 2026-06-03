@@ -2230,7 +2230,6 @@ async fn serve(
     if let Err(e) = crate::load_incoming_states(profile) {
         tracing::warn!(error=%e, "failed to load persisted incoming file state");
     }
-    let contacts = crate::load_contacts(profile).unwrap_or_default();
     let transport = Arc::new(crate::transport::tor::TorTransport::new_with_status(
         None,
         tor_client.clone(),
@@ -2256,6 +2255,11 @@ async fn serve(
                         }
                     };
                 if let Some(mut msg) = handler::parse_inbound_line(&body).unwrap_or(None) {
+                    // Contacts can be added while the GUI listener is already
+                    // running. Sending uses a fresh one-shot process, so a
+                    // stale listener contact snapshot creates the dumbest bug:
+                    // outbound works, inbound cannot decrypt/attribute.
+                    let contacts = crate::load_contacts(profile).unwrap_or_default();
                     if let Err(e) = handler::handle_inbound(
                         profile,
                         &tui_tx,

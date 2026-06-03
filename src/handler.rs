@@ -78,14 +78,7 @@ pub async fn handle_inbound(
         (String::new(), false)
     });
 
-    let body_for_display = if plaintext.is_empty() {
-        match decrypt_error {
-            Some(e) => format!("[decryption failed: {e}]"),
-            None => "[decryption failed]".to_string(),
-        }
-    } else {
-        plaintext.clone()
-    };
+    let body_for_display = body_for_inbound_display(&plaintext, decrypt_error.as_deref());
 
     let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
 
@@ -94,7 +87,7 @@ pub async fn handle_inbound(
         "in",
         &contact_name,
         "",
-        &plaintext,
+        &body_for_display,
         msg.timestamp_ms,
         if verified {
             DeliveryStatus::Delivered
@@ -516,9 +509,20 @@ fn contact_name_for_pubkey(contacts: &ContactsMap, pubkey: &str, verified: bool)
         })
 }
 
+fn body_for_inbound_display(plaintext: &str, decrypt_error: Option<&str>) -> String {
+    if !plaintext.is_empty() {
+        return plaintext.to_string();
+    }
+
+    match decrypt_error {
+        Some(e) => format!("[decryption failed: {e}]"),
+        None => "[decryption failed]".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ack_is_acceptable, write_file_atomically};
+    use super::{ack_is_acceptable, body_for_inbound_display, write_file_atomically};
     use crate::FileAckPayload;
 
     #[test]
@@ -558,5 +562,14 @@ mod tests {
             status: "received".to_string(),
         };
         assert!(!ack_is_acceptable(&out_of_range));
+    }
+
+    #[test]
+    fn failed_inbound_decrypt_has_visible_history_body() {
+        assert_eq!(
+            body_for_inbound_display("", Some("unknown sender pubkey: abc")),
+            "[decryption failed: unknown sender pubkey: abc]"
+        );
+        assert_eq!(body_for_inbound_display("hello", None), "hello");
     }
 }

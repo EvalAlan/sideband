@@ -356,6 +356,7 @@ class _ChatScreenState extends State<_ChatScreen> {
                 : last;
             if (last.startsWith('onion=')) {
               _listenerRunning = true;
+              _error = null;
             }
           });
           final lower = msg.toLowerCase();
@@ -369,16 +370,19 @@ class _ChatScreenState extends State<_ChatScreen> {
         unawaited(_appendListenerLog('stderr', chunk));
         final msg = chunk.trim();
         if (msg.isNotEmpty && mounted) {
+          final lower = msg.toLowerCase();
           setState(() {
-            _listenerStatus = msg.split('\n').last.trim();
+            if (!_listenerRunning ||
+                lower.contains('error') ||
+                lower.contains('failed')) {
+              _listenerStatus = msg.split('\n').last.trim();
+            }
             // Keep the full backend failure visible somewhere. Silent empty
             // panes are how we got here.
-            if (msg.toLowerCase().contains('error') ||
-                msg.toLowerCase().contains('failed')) {
+            if (lower.contains('error') || lower.contains('failed')) {
               _error = msg;
             }
           });
-          final lower = msg.toLowerCase();
           if (lower.contains('message received') ||
               lower.contains('incoming connection')) {
             unawaited(_refresh());
