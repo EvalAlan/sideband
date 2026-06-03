@@ -22,6 +22,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
+use arti_client::config::CfgPath;
 use arti_client::{TorClient, TorClientConfig};
 use tor_rtcompat::PreferredRuntime;
 
@@ -2173,12 +2174,27 @@ fn verify_message(msg: &ChatMessage, contacts: &ContactsMap) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 /// Create a bootstrapped Arti Tor client.
-/// State is stored under `<profile>/arti_state`.
+/// State is stored under `<profile>/arti_state`; cache under `<profile>/arti_cache`.
 async fn create_tor_client(profile: &Path) -> Result<TorClient<PreferredRuntime>> {
     let state_dir = profile.join("arti_state");
+    let cache_dir = profile.join("arti_cache");
     fs::create_dir_all(&state_dir).context("create Arti state dir")?;
+    fs::create_dir_all(&cache_dir).context("create Arti cache dir")?;
 
-    let config = TorClientConfig::default();
+    let state_dir = state_dir
+        .canonicalize()
+        .context("canonicalize Arti state dir")?;
+    let cache_dir = cache_dir
+        .canonicalize()
+        .context("canonicalize Arti cache dir")?;
+
+    let mut builder = TorClientConfig::builder();
+    builder
+        .storage()
+        .state_dir(CfgPath::new(state_dir.to_string_lossy().into_owned()))
+        .cache_dir(CfgPath::new(cache_dir.to_string_lossy().into_owned()));
+    let config = builder.build().context("build Arti Tor client config")?;
+
     let tor_client = TorClient::create_bootstrapped(config)
         .await
         .context("failed to bootstrap Arti Tor client")?;

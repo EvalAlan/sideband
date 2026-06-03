@@ -145,7 +145,7 @@ class ChatMsg {
   bool get out => direction == 'out';
   bool get failed => status == 'failed';
   bool get sending => status == 'sending';
-  bool get delivered => status == 'delivered' || status == 'sent';
+  bool get delivered => status == 'delivered';
 }
 
 class _History {
