@@ -193,20 +193,24 @@ class _Cli {
   }
 
   Future<List<Contact>> contacts() async {
-    final raw = await _run(['contact', 'list', '--profile', profile]);
+    final raw = await _run(['contact', 'list', '--profile', profile, '--json']);
     if (raw.isEmpty) return [];
-    return raw.split('\n').where((l) => l.isNotEmpty).map((line) {
-      final parts = line.split('\t');
-      final name = parts.first.trim();
-      final onion = parts
-          .firstWhere((p) => p.trim().startsWith('onion='),
-              orElse: () => 'onion=')
-          .split('=')
-          .skip(1)
-          .join('=')
-          .trim();
-      return Contact(name: name, onion: onion);
-    }).toList();
+
+    final decoded = jsonDecode(raw);
+    if (decoded is! List) {
+      throw Exception('contact list JSON was not a list');
+    }
+
+    final parsed = <Contact>[];
+    for (final item in decoded) {
+      if (item is! Map) continue;
+      parsed.add(Contact(
+        name: item['name'] as String,
+        onion: item['onion'] as String,
+      ));
+    }
+    parsed.sort((a, b) => a.name.compareTo(b.name));
+    return parsed;
   }
 
   Future<_History> history({String? contact, int limit = 80}) async {

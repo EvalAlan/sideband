@@ -152,6 +152,9 @@ enum ContactAction {
     List {
         #[command(flatten)]
         profile: ProfileArg,
+        /// Emit machine-readable JSON instead of tab-separated text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1147,10 +1150,10 @@ async fn main() -> Result<()> {
                 ensure_profile(&profile)?;
                 contact_add(&profile, &name, &onion, &pubkey, &x25519_pubkey)
             }
-            ContactAction::List { profile } => {
+            ContactAction::List { profile, json } => {
                 let profile = profile.path()?;
                 ensure_profile(&profile)?;
-                contact_list(&profile)
+                contact_list(&profile, json)
             }
         },
         CommandKind::History {
@@ -1324,11 +1327,11 @@ fn run_wizard(profile: &Path) -> Result<()> {
 
     let default_name = default_display_name(profile);
 
-    println!("\n  === Sideband First-Time Setup ===\n");
-    println!("  Profile: {}", profile.display());
-    println!("  Default display name: {default_name}\n");
-    print!("  Enter your display name [{default_name}]: ");
-    io::stdout().flush()?;
+    eprintln!("\n  === Sideband First-Time Setup ===\n");
+    eprintln!("  Profile: {}", profile.display());
+    eprintln!("  Default display name: {default_name}\n");
+    eprint!("  Enter your display name [{default_name}]: ");
+    io::stderr().flush()?;
 
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -1347,7 +1350,7 @@ fn run_wizard(profile: &Path) -> Result<()> {
         anyhow::bail!("display name too long (max 64 chars)");
     }
 
-    println!("\n  Creating profile as '{name}'...\n");
+    eprintln!("\n  Creating profile as '{name}'...\n");
 
     // Create profile with the chosen name
     init_profile_with_name(profile, &name)
@@ -1473,8 +1476,31 @@ pub(crate) fn contact_delete(profile: &Path, name: &str) -> Result<bool> {
     }
 }
 
-fn contact_list(profile: &Path) -> Result<()> {
+fn contact_list(profile: &Path, json: bool) -> Result<()> {
     let contacts = load_contacts(profile)?;
+    if json {
+        #[derive(Serialize)]
+        struct ContactRow<'a> {
+            name: &'a str,
+            onion: &'a str,
+            pubkey_b64: &'a str,
+            x25519_pubkey_b64: Option<&'a str>,
+        }
+
+        let mut rows: Vec<_> = contacts
+            .values()
+            .map(|c| ContactRow {
+                name: &c.name,
+                onion: &c.onion,
+                pubkey_b64: &c.pubkey_b64,
+                x25519_pubkey_b64: c.x25519_pubkey_b64.as_deref(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.name.cmp(b.name));
+        println!("{}", serde_json::to_string(&rows)?);
+        return Ok(());
+    }
+
     if contacts.is_empty() {
         println!("(no contacts)");
         return Ok(());
@@ -2745,6 +2771,7 @@ fn init_tracing_stderr() {
         )
         .with_target(false)
         .compact()
+        .with_writer(std::io::stderr)
         .init();
 }
 
