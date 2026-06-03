@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2173,6 +2175,17 @@ fn verify_message(msg: &ChatMessage, contacts: &ContactsMap) -> Result<bool> {
 // Tor helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+fn secure_arti_dir(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_arti_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Create a bootstrapped Arti Tor client.
 /// State is stored under `<profile>/arti_state`; cache under `<profile>/arti_cache`.
 async fn create_tor_client(profile: &Path) -> Result<TorClient<PreferredRuntime>> {
@@ -2180,6 +2193,8 @@ async fn create_tor_client(profile: &Path) -> Result<TorClient<PreferredRuntime>
     let cache_dir = profile.join("arti_cache");
     fs::create_dir_all(&state_dir).context("create Arti state dir")?;
     fs::create_dir_all(&cache_dir).context("create Arti cache dir")?;
+    secure_arti_dir(&state_dir).context("secure Arti state dir")?;
+    secure_arti_dir(&cache_dir).context("secure Arti cache dir")?;
 
     let state_dir = state_dir
         .canonicalize()
