@@ -1079,6 +1079,47 @@ fn chat_scroll_position(
     max_scroll.saturating_sub(scroll_offset_from_bottom.min(max_scroll))
 }
 
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+
+    for raw_line in text.split('\n') {
+        let mut current = String::new();
+        for word in raw_line.split_whitespace() {
+            if word.chars().count() > width {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    chunk.push(ch);
+                    if chunk.chars().count() >= width {
+                        out.push(std::mem::take(&mut chunk));
+                    }
+                }
+                if !chunk.is_empty() {
+                    current = chunk;
+                }
+            } else if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.chars().count() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if current.is_empty() {
+            out.push(String::new());
+        } else {
+            out.push(current);
+        }
+    }
+
+    out
+}
+
 fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
     let selected = if app.contacts.is_empty() || app.contacts[0] == "(no contacts)" {
         None
@@ -1100,9 +1141,10 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
+    let inner_width = area.width.saturating_sub(2) as usize; // subtract borders
     let items: Vec<ListItem> = visible
         .iter()
-        .map(|m| {
+        .flat_map(|m| {
             let dir_color = match m.direction.as_str() {
                 "in" => Color::Green,
                 "out" => Color::Blue,
@@ -1134,20 +1176,41 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 m.contact.as_str()
             };
-            let mut spans = vec![
-                Span::styled(
-                    format!("{ts_str}{dir_label} {:>12} ", display_contact),
-                    Style::default().fg(dir_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(&m.body),
-            ];
-            if let Some((icon, color)) = status_icon {
-                spans.push(Span::styled(
-                    format!(" {}", icon),
-                    Style::default().fg(color),
-                ));
+            let prefix = format!("{ts_str}{dir_label} {:>12} ", display_contact);
+            let prefix_width = prefix.chars().count();
+            let body_width = inner_width.saturating_sub(prefix_width).max(8);
+            let mut chunks = wrap_text(&m.body, body_width);
+            if chunks.is_empty() {
+                chunks.push(String::new());
             }
-            ListItem::new(Line::from(spans))
+            let last = chunks.len().saturating_sub(1);
+
+            chunks
+                .into_iter()
+                .enumerate()
+                .map(|(idx, chunk)| {
+                    let mut spans = if idx == 0 {
+                        vec![
+                            Span::styled(
+                                prefix.clone(),
+                                Style::default().fg(dir_color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(chunk),
+                        ]
+                    } else {
+                        vec![Span::raw(" ".repeat(prefix_width)), Span::raw(chunk)]
+                    };
+                    if idx == last {
+                        if let Some((icon, color)) = status_icon {
+                            spans.push(Span::styled(
+                                format!(" {}", icon),
+                                Style::default().fg(color),
+                            ));
+                        }
+                    }
+                    ListItem::new(Line::from(spans))
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -1183,7 +1246,7 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::chat_scroll_position;
+    use super::{chat_scroll_position, wrap_text};
 
     #[test]
     fn chat_scroll_defaults_to_bottom() {
@@ -1199,6 +1262,27 @@ mod tests {
     fn chat_scroll_clamps_when_content_fits() {
         assert_eq!(chat_scroll_position(5, 20, 0), 0);
         assert_eq!(chat_scroll_position(5, 20, 10), 0);
+    }
+
+    #[test]
+    fn wrap_text_splits_long_unbroken_tokens() {
+        assert_eq!(
+            wrap_text("/add Sydney abcdefghij", 6),
+            vec![
+                "/add".to_string(),
+                "Sydney".to_string(),
+                "abcdef".to_string(),
+                "ghij".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_text_keeps_words_when_possible() {
+        assert_eq!(
+            wrap_text("Send this to your contact", 12),
+            vec!["Send this to".to_string(), "your contact".to_string()]
+        );
     }
 }
 
