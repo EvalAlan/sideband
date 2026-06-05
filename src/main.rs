@@ -2111,6 +2111,17 @@ pub(crate) fn decrypt_and_verify(
         ) {
             Ok(bytes) => bytes,
             Err(first_err) => {
+                // Backwards indexes are duplicates/old deliveries. Do not run
+                // the Alice/Alice recovery path for them: recovery can decrypt
+                // an old message from the static base and overwrite a perfectly
+                // good ratchet state, poisoning all later messages.
+                if first_err
+                    .to_string()
+                    .contains("message index went backwards")
+                {
+                    return Err(first_err);
+                }
+
                 // If both peers manually ran `/ratchet`, both sides created
                 // incompatible Alice-first states. Treat the inbound v3 as a
                 // fresh peer-initiated ratchet, try Bob initialization, and
@@ -3064,6 +3075,430 @@ fn first_v3_message_auto_initializes_receiver_ratchet() {
     assert_eq!(decrypted, plaintext);
     assert!(verified);
     assert!(RatchetState::path(bob_dir.path(), std::path::Path::new("alice")).exists());
+}
+
+#[test]
+fn receiver_can_send_first_reply_after_ratchet_restart() {
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    init_profile(alice_dir.path()).unwrap();
+    init_profile(bob_dir.path()).unwrap();
+
+    let alice_key = load_signing_key(alice_dir.path()).unwrap();
+    let bob_key = load_signing_key(bob_dir.path()).unwrap();
+    let alice_ed = B64.encode(alice_key.verifying_key().to_bytes());
+    let bob_ed = B64.encode(bob_key.verifying_key().to_bytes());
+    let alice_x = load_x25519_public(alice_dir.path()).unwrap();
+    let bob_x = load_x25519_public(bob_dir.path()).unwrap();
+    let alice_x_b64 = B64.encode(alice_x.as_bytes());
+    let bob_x_b64 = B64.encode(bob_x.as_bytes());
+
+    contact_add(
+        alice_dir.path(),
+        "bob",
+        "psrntpu56hilbftscupr6f4ujxb6kjn6n2qy4366sen4lqkqpspjezid.onion",
+        &bob_ed,
+        &bob_x_b64,
+    )
+    .unwrap();
+    contact_add(
+        bob_dir.path(),
+        "alice",
+        "rog4qluztvbzq5sr2didprterk23tyo4q6e6775lkesx3jdqlm3jq5yd.onion",
+        &alice_ed,
+        &alice_x_b64,
+    )
+    .unwrap();
+
+    init_ratchet_alice(alice_dir.path(), "bob", &bob_x).unwrap();
+
+    let alice_ratchet_path = RatchetState::path(alice_dir.path(), std::path::Path::new("bob"));
+    let mut alice_state: RatchetState =
+        bincode::deserialize(&fs::read(&alice_ratchet_path).unwrap()).unwrap();
+    let first_plaintext = "alice opens ratchet";
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let (header_b64, nonce_hex, ct_hex) =
+        ratchet_encrypt(&mut alice_state, first_plaintext.as_bytes(), &alice_ed).unwrap();
+    alice_state.save(alice_dir.path(), "bob").unwrap();
+
+    let mut first_msg = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: alice_ed.clone(),
+        timestamp_ms,
+        body: first_plaintext.into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: header_b64,
+        ratchet_nonce_hex: nonce_hex,
+        ratchet_ct_hex: ct_hex,
+    };
+    sign_message(&alice_key, &mut first_msg).unwrap();
+    first_msg.body.clear();
+
+    let bob_contacts = load_contacts(bob_dir.path()).unwrap();
+    let (decrypted, verified) =
+        decrypt_and_verify(&mut first_msg, bob_dir.path(), &bob_contacts).unwrap();
+    assert_eq!(decrypted, first_plaintext);
+    assert!(verified);
+
+    // Simulate Bob closing/reopening before he sends the first reply: load the
+    // persisted responder state from disk and encrypt from that, not memory.
+    let bob_ratchet_path = RatchetState::path(bob_dir.path(), std::path::Path::new("alice"));
+    let mut restarted_bob_state: RatchetState =
+        bincode::deserialize(&fs::read(&bob_ratchet_path).unwrap()).unwrap();
+    let reply_plaintext = "bob replies after restart";
+    let reply_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let (reply_header, reply_nonce, reply_ct) = ratchet_encrypt(
+        &mut restarted_bob_state,
+        reply_plaintext.as_bytes(),
+        &bob_ed,
+    )
+    .unwrap();
+    restarted_bob_state.save(bob_dir.path(), "alice").unwrap();
+
+    let mut reply_msg = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: bob_ed,
+        timestamp_ms: reply_ts,
+        body: reply_plaintext.into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: reply_header,
+        ratchet_nonce_hex: reply_nonce,
+        ratchet_ct_hex: reply_ct,
+    };
+    sign_message(&bob_key, &mut reply_msg).unwrap();
+    reply_msg.body.clear();
+
+    let alice_contacts = load_contacts(alice_dir.path()).unwrap();
+    let (reply_decrypted, reply_verified) =
+        decrypt_and_verify(&mut reply_msg, alice_dir.path(), &alice_contacts).unwrap();
+    assert_eq!(reply_decrypted, reply_plaintext);
+    assert!(reply_verified);
+
+    // Alice should also be able to answer after decrypting Bob's first reply;
+    // otherwise both UIs can show locally-sent rows while neither side can read
+    // the other after restart.
+    let alice_ratchet_path = RatchetState::path(alice_dir.path(), std::path::Path::new("bob"));
+    let mut restarted_alice_state: RatchetState =
+        bincode::deserialize(&fs::read(&alice_ratchet_path).unwrap()).unwrap();
+    let followup_plaintext = "alice answers bob";
+    let followup_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let (followup_header, followup_nonce, followup_ct) = ratchet_encrypt(
+        &mut restarted_alice_state,
+        followup_plaintext.as_bytes(),
+        &alice_ed,
+    )
+    .unwrap();
+    restarted_alice_state.save(alice_dir.path(), "bob").unwrap();
+
+    let mut followup_msg = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: alice_ed,
+        timestamp_ms: followup_ts,
+        body: followup_plaintext.into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: followup_header,
+        ratchet_nonce_hex: followup_nonce,
+        ratchet_ct_hex: followup_ct,
+    };
+    sign_message(&alice_key, &mut followup_msg).unwrap();
+    followup_msg.body.clear();
+
+    let bob_contacts = load_contacts(bob_dir.path()).unwrap();
+    let (followup_decrypted, followup_verified) =
+        decrypt_and_verify(&mut followup_msg, bob_dir.path(), &bob_contacts).unwrap();
+    assert_eq!(followup_decrypted, followup_plaintext);
+    assert!(followup_verified);
+}
+
+#[test]
+fn both_sides_can_send_after_restart_before_receiving_peer_message() {
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    init_profile(alice_dir.path()).unwrap();
+    init_profile(bob_dir.path()).unwrap();
+
+    let alice_key = load_signing_key(alice_dir.path()).unwrap();
+    let bob_key = load_signing_key(bob_dir.path()).unwrap();
+    let alice_ed = B64.encode(alice_key.verifying_key().to_bytes());
+    let bob_ed = B64.encode(bob_key.verifying_key().to_bytes());
+    let alice_x = load_x25519_public(alice_dir.path()).unwrap();
+    let bob_x = load_x25519_public(bob_dir.path()).unwrap();
+    let alice_x_b64 = B64.encode(alice_x.as_bytes());
+    let bob_x_b64 = B64.encode(bob_x.as_bytes());
+
+    contact_add(
+        alice_dir.path(),
+        "bob",
+        "psrntpu56hilbftscupr6f4ujxb6kjn6n2qy4366sen4lqkqpspjezid.onion",
+        &bob_ed,
+        &bob_x_b64,
+    )
+    .unwrap();
+    contact_add(
+        bob_dir.path(),
+        "alice",
+        "rog4qluztvbzq5sr2didprterk23tyo4q6e6775lkesx3jdqlm3jq5yd.onion",
+        &alice_ed,
+        &alice_x_b64,
+    )
+    .unwrap();
+
+    init_ratchet_alice(alice_dir.path(), "bob", &bob_x).unwrap();
+
+    let mut alice_state: RatchetState = bincode::deserialize(
+        &fs::read(RatchetState::path(
+            alice_dir.path(),
+            std::path::Path::new("bob"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let (h, n, c) = ratchet_encrypt(&mut alice_state, b"initial", &alice_ed).unwrap();
+    alice_state.save(alice_dir.path(), "bob").unwrap();
+    let mut initial = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: alice_ed.clone(),
+        timestamp_ms: 1,
+        body: "initial".into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: h,
+        ratchet_nonce_hex: n,
+        ratchet_ct_hex: c,
+    };
+    sign_message(&alice_key, &mut initial).unwrap();
+    initial.body.clear();
+    decrypt_and_verify(
+        &mut initial,
+        bob_dir.path(),
+        &load_contacts(bob_dir.path()).unwrap(),
+    )
+    .unwrap();
+
+    // Both processes restart, then each sends before receiving the other's new message.
+    let mut alice_after_restart: RatchetState = bincode::deserialize(
+        &fs::read(RatchetState::path(
+            alice_dir.path(),
+            std::path::Path::new("bob"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut bob_after_restart: RatchetState = bincode::deserialize(
+        &fs::read(RatchetState::path(
+            bob_dir.path(),
+            std::path::Path::new("alice"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (ah, an, ac) =
+        ratchet_encrypt(&mut alice_after_restart, b"alice concurrent", &alice_ed).unwrap();
+    let (bh, bn, bc) = ratchet_encrypt(&mut bob_after_restart, b"bob concurrent", &bob_ed).unwrap();
+    alice_after_restart.save(alice_dir.path(), "bob").unwrap();
+    bob_after_restart.save(bob_dir.path(), "alice").unwrap();
+
+    let mut alice_msg = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: alice_ed.clone(),
+        timestamp_ms: 2,
+        body: "alice concurrent".into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: ah,
+        ratchet_nonce_hex: an,
+        ratchet_ct_hex: ac,
+    };
+    sign_message(&alice_key, &mut alice_msg).unwrap();
+    alice_msg.body.clear();
+    let mut bob_msg = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: bob_ed.clone(),
+        timestamp_ms: 3,
+        body: "bob concurrent".into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: bh,
+        ratchet_nonce_hex: bn,
+        ratchet_ct_hex: bc,
+    };
+    sign_message(&bob_key, &mut bob_msg).unwrap();
+    bob_msg.body.clear();
+
+    let (alice_plain, alice_verified) = decrypt_and_verify(
+        &mut alice_msg,
+        bob_dir.path(),
+        &load_contacts(bob_dir.path()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(alice_plain, "alice concurrent");
+    assert!(alice_verified);
+
+    let (bob_plain, bob_verified) = decrypt_and_verify(
+        &mut bob_msg,
+        alice_dir.path(),
+        &load_contacts(alice_dir.path()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bob_plain, "bob concurrent");
+    assert!(bob_verified);
+}
+
+#[test]
+fn duplicate_old_ratchet_message_does_not_poison_state() {
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    init_profile(alice_dir.path()).unwrap();
+    init_profile(bob_dir.path()).unwrap();
+
+    let alice_key = load_signing_key(alice_dir.path()).unwrap();
+    let bob_key = load_signing_key(bob_dir.path()).unwrap();
+    let alice_ed = B64.encode(alice_key.verifying_key().to_bytes());
+    let bob_ed = B64.encode(bob_key.verifying_key().to_bytes());
+    let alice_x = load_x25519_public(alice_dir.path()).unwrap();
+    let bob_x = load_x25519_public(bob_dir.path()).unwrap();
+    let alice_x_b64 = B64.encode(alice_x.as_bytes());
+    let bob_x_b64 = B64.encode(bob_x.as_bytes());
+    contact_add(
+        alice_dir.path(),
+        "bob",
+        "psrntpu56hilbftscupr6f4ujxb6kjn6n2qy4366sen4lqkqpspjezid.onion",
+        &bob_ed,
+        &bob_x_b64,
+    )
+    .unwrap();
+    contact_add(
+        bob_dir.path(),
+        "alice",
+        "rog4qluztvbzq5sr2didprterk23tyo4q6e6775lkesx3jdqlm3jq5yd.onion",
+        &alice_ed,
+        &alice_x_b64,
+    )
+    .unwrap();
+
+    init_ratchet_alice(alice_dir.path(), "bob", &bob_x).unwrap();
+    let mut alice_state: RatchetState = bincode::deserialize(
+        &fs::read(RatchetState::path(
+            alice_dir.path(),
+            std::path::Path::new("bob"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let (h1, n1, c1) = ratchet_encrypt(&mut alice_state, b"first", &alice_ed).unwrap();
+    alice_state.save(alice_dir.path(), "bob").unwrap();
+    let mut first_msg = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: alice_ed.clone(),
+        timestamp_ms: 1,
+        body: "first".into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: h1,
+        ratchet_nonce_hex: n1,
+        ratchet_ct_hex: c1,
+    };
+    sign_message(&alice_key, &mut first_msg).unwrap();
+    first_msg.body.clear();
+    decrypt_and_verify(
+        &mut first_msg.clone(),
+        bob_dir.path(),
+        &load_contacts(bob_dir.path()).unwrap(),
+    )
+    .unwrap();
+
+    let mut bob_state: RatchetState = bincode::deserialize(
+        &fs::read(RatchetState::path(
+            bob_dir.path(),
+            std::path::Path::new("alice"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let (bh, bn, bc) = ratchet_encrypt(&mut bob_state, b"reply", &bob_ed).unwrap();
+    bob_state.save(bob_dir.path(), "alice").unwrap();
+    let mut reply_msg = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: bob_ed.clone(),
+        timestamp_ms: 2,
+        body: "reply".into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: bh,
+        ratchet_nonce_hex: bn,
+        ratchet_ct_hex: bc,
+    };
+    sign_message(&bob_key, &mut reply_msg).unwrap();
+    reply_msg.body.clear();
+    decrypt_and_verify(
+        &mut reply_msg,
+        alice_dir.path(),
+        &load_contacts(alice_dir.path()).unwrap(),
+    )
+    .unwrap();
+
+    // A duplicated first message arriving after Bob has advanced must not reset
+    // Bob's ratchet state. It may fail as a duplicate; poisoning is the bug.
+    let mut duplicate_first = first_msg.clone();
+    let _ = decrypt_and_verify(
+        &mut duplicate_first,
+        bob_dir.path(),
+        &load_contacts(bob_dir.path()).unwrap(),
+    );
+
+    let mut alice_state2: RatchetState = bincode::deserialize(
+        &fs::read(RatchetState::path(
+            alice_dir.path(),
+            std::path::Path::new("bob"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let (h2, n2, c2) = ratchet_encrypt(&mut alice_state2, b"after duplicate", &alice_ed).unwrap();
+    alice_state2.save(alice_dir.path(), "bob").unwrap();
+    let mut after_dup = ChatMessage {
+        v: 3,
+        r#type: "chat_message".into(),
+        from: alice_ed,
+        timestamp_ms: 3,
+        body: "after duplicate".into(),
+        sig_b64: String::new(),
+        enc_body: String::new(),
+        ratchet_header_b64: h2,
+        ratchet_nonce_hex: n2,
+        ratchet_ct_hex: c2,
+    };
+    sign_message(&alice_key, &mut after_dup).unwrap();
+    after_dup.body.clear();
+    let (plain, verified) = decrypt_and_verify(
+        &mut after_dup,
+        bob_dir.path(),
+        &load_contacts(bob_dir.path()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plain, "after duplicate");
+    assert!(verified);
 }
 
 #[test]
