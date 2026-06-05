@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 // ── palette ────────────────────────────────────────────────────────────────
 
@@ -107,9 +108,16 @@ class SidebandApp extends StatelessWidget {
 // ── data ────────────────────────────────────────────────────────────────────
 
 class Contact {
-  const Contact({required this.name, required this.onion});
+  const Contact({
+    required this.name,
+    required this.onion,
+    required this.pubkey,
+    required this.x25519Pubkey,
+  });
   final String name;
   final String onion;
+  final String pubkey;
+  final String x25519Pubkey;
 
   String get initial => name.isNotEmpty ? name[0].toUpperCase() : '?';
 
@@ -192,6 +200,56 @@ class _Cli {
     return (r.stdout as String).trim();
   }
 
+  Future<String> identity() => _run(['identity', '--profile', profile]);
+
+  Future<String> name([String? value]) {
+    final args = ['name', '--profile', profile];
+    if (value != null && value.trim().isNotEmpty) args.add(value.trim());
+    return _run(args);
+  }
+
+  Future<void> addContact({
+    required String name,
+    required String onion,
+    required String pubkey,
+    required String x25519Pubkey,
+  }) async {
+    await _run([
+      'contact',
+      'add',
+      '--profile',
+      profile,
+      '--name',
+      name,
+      '--onion',
+      onion,
+      '--pubkey',
+      pubkey,
+      '--x25519-pubkey',
+      x25519Pubkey,
+    ]);
+  }
+
+  Future<String> deleteContact(String name) => _run([
+        'contact',
+        'delete',
+        '--profile',
+        profile,
+        '--name',
+        name,
+      ]);
+
+  Future<String> clearHistory({String? contact}) {
+    final args = ['history', '--profile', profile, '--clear'];
+    if (contact != null && contact.trim().isNotEmpty) {
+      args.addAll(['--contact', contact.trim()]);
+    }
+    return _run(args);
+  }
+
+  Future<String> ratchet(String contact) =>
+      _run(['ratchet', '--profile', profile, contact]);
+
   Future<List<Contact>> contacts() async {
     final raw = await _run(['contact', 'list', '--profile', profile, '--json']);
     if (raw.isEmpty) return [];
@@ -207,6 +265,8 @@ class _Cli {
       parsed.add(Contact(
         name: item['name'] as String,
         onion: item['onion'] as String,
+        pubkey: item['pubkey_b64'] as String? ?? '',
+        x25519Pubkey: item['x25519_pubkey_b64'] as String? ?? '',
       ));
     }
     parsed.sort((a, b) => a.name.compareTo(b.name));
@@ -259,7 +319,7 @@ class _Cli {
   }
 
   Future<void> send({required String to, required String message}) async {
-    await _run(['send', '--profile', profile, '--to', to, '--message', message, '--static']);
+    await _run(['send', '--profile', profile, '--to', to, '--message', message]);
   }
 }
 
@@ -275,6 +335,7 @@ class _ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<_ChatScreen> {
   final _cli = _Cli();
   final _input = TextEditingController();
+  final _inputFocus = FocusNode();
   final _scroll = ScrollController();
 
   List<Contact> _contacts = [];
@@ -304,6 +365,7 @@ class _ChatScreenState extends State<_ChatScreen> {
     _poll.cancel();
     _listener?.kill(ProcessSignal.sigterm);
     _input.dispose();
+    _inputFocus.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -533,10 +595,16 @@ class _ChatScreenState extends State<_ChatScreen> {
 
   Future<void> _send() async {
     final c = _sel;
-    if (c == null) return;
     final t = _input.text.trim();
     if (t.isEmpty) return;
     _input.clear();
+
+    if (t.startsWith('/')) {
+      await _runSlashCommand(t);
+      return;
+    }
+
+    if (c == null) return;
 
     // optimistic
     final now = DateTime.now();
@@ -563,6 +631,232 @@ class _ChatScreenState extends State<_ChatScreen> {
     } finally {
       if (mounted) setState(() => _sending = false);
     }
+  }
+
+  void _showInfo(String title, String body) {
+    showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: _surface,
+        title: Text(title, style: const TextStyle(color: _text)),
+        content: SingleChildScrollView(
+          child: SelectableText(body,
+              style: const TextStyle(color: _text, fontSize: 12, height: 1.35)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<bool> _confirm(String title, String body) async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (_) => AlertDialog(
+            backgroundColor: _surface,
+            title: Text(title, style: const TextStyle(color: _text)),
+            content: Text(body, style: const TextStyle(color: _textDim)),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Do it'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  Future<void> _runSlashCommand(String raw) async {
+    final parts = raw.substring(1).trim().split(RegExp(r'\s+'));
+    final cmd = parts.isEmpty ? '' : parts.first.toLowerCase();
+    final arg = raw.substring(1).trim().contains(' ')
+        ? raw.substring(raw.indexOf(' ') + 1).trim()
+        : '';
+
+    try {
+      switch (cmd) {
+        case 'help':
+          _showInfo('Slash commands',
+              '/send <contact> <msg>\n/history [contact]\n/contacts\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
+          return;
+        case 'send':
+          if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
+          final contact = parts[1];
+          final msg = raw.split(RegExp(r'\s+')).skip(2).join(' ');
+          await _cli.send(to: contact, message: msg);
+          await _load();
+          return;
+        case 'history':
+          final contact = parts.length > 1 ? parts[1] : null;
+          final h = await _cli.history(contact: contact, limit: 200);
+          final lines = h.msgs.reversed.map((m) {
+            final arrow = m.direction == 'out' ? '→' : '←';
+            return '${_hm(m.ts)} $arrow ${m.contact}: ${m.text}';
+          });
+          _showInfo('History${contact == null ? '' : ' for $contact'}',
+              lines.isEmpty ? '(no messages)' : lines.join('\n'));
+          return;
+        case 'contacts':
+          await _load();
+          _showInfo(
+              'Contacts',
+              _contacts.isEmpty
+                  ? '(no contacts)'
+                  : _contacts
+                      .map((c) =>
+                          '${c.name}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}')
+                      .join('\n\n'));
+          return;
+        case 'add':
+          if (parts.length < 5) {
+            throw Exception('usage: /add <name> <onion> <ed25519_pubkey_b64> <x25519_pubkey_b64>');
+          }
+          await _cli.addContact(
+            name: parts[1],
+            onion: parts[2],
+            pubkey: parts[3],
+            x25519Pubkey: parts[4],
+          );
+          await _load();
+          return;
+        case 'delete':
+          if (parts.length < 2) throw Exception('usage: /delete <contact>');
+          _showInfo('Contact deleted', await _cli.deleteContact(parts[1]));
+          await _load();
+          return;
+        case 'name':
+          _showInfo('Name', await _cli.name(arg.isEmpty ? null : arg));
+          return;
+        case 'whoami':
+          _showInfo('Identity', await _cli.identity());
+          return;
+        case 'share':
+          final identity = await _cli.identity();
+          String value(String prefix) {
+            final line = identity
+                .split('\n')
+                .firstWhere((l) => l.startsWith(prefix), orElse: () => '');
+            return line.isEmpty ? '' : line.substring(prefix.length).trim();
+          }
+          final name = value('name:');
+          final ed = value('pubkey(ed25519,b64):');
+          final x = value('pubkey(x25519,b64):');
+          final onion = _listenerStatus.startsWith('listening ')
+              ? _listenerStatus.substring('listening '.length)
+              : '(waiting for Tor)';
+          _showInfo('Share contact', '/add $name $onion $ed $x');
+          return;
+        case 'onion':
+          _showInfo('Onion', _listenerStatus.startsWith('listening ')
+              ? _listenerStatus.substring('listening '.length)
+              : '(waiting for Tor)');
+          return;
+        case 'ratchet':
+          if (parts.length < 2) throw Exception('usage: /ratchet <contact>');
+          _showInfo('Ratchet', await _cli.ratchet(parts[1]));
+          return;
+        case 'status':
+          _showInfo('Status',
+              'listener: $_listenerStatus\nprofile: ${_cli.profile}\nbinary: ${_cli.bin}\ncontacts: ${_contacts.length}\nmessages visible: ${_msgs.length}');
+          return;
+        case 'clear':
+          setState(() => _msgs = []);
+          return;
+        case 'clearhistory':
+          final contact = parts.length > 1 ? parts[1] : _sel?.name;
+          final clearTarget = contact == null ? 'all message history' : 'history for $contact';
+          if (!await _confirm('Clear history', 'Delete $clearTarget?')) return;
+          _showInfo('History cleared', await _cli.clearHistory(contact: contact));
+          await _load();
+          return;
+        case 'settings':
+          await _showSettings();
+          return;
+        case 'file':
+        case 'transfers':
+          throw Exception('/$cmd is not wired in the GUI yet. Backend support is TUI-only right now. Annoying, but honest.');
+        default:
+          throw Exception('unknown command: /$cmd (try /help)');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _showAddContactDialog() async {
+    final name = TextEditingController();
+    final onion = TextEditingController();
+    final pubkey = TextEditingController();
+    final x25519 = TextEditingController();
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (_) => AlertDialog(
+          backgroundColor: _surface,
+          title: const Text('Add contact', style: TextStyle(color: _text)),
+          content: SizedBox(
+            width: 520,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(controller: name, decoration: const InputDecoration(labelText: 'Name')),
+                const SizedBox(height: 8),
+                TextField(controller: onion, decoration: const InputDecoration(labelText: 'Onion address')),
+                const SizedBox(height: 8),
+                TextField(controller: pubkey, decoration: const InputDecoration(labelText: 'Ed25519 pubkey')),
+                const SizedBox(height: 8),
+                TextField(controller: x25519, decoration: const InputDecoration(labelText: 'X25519 pubkey')),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Add')),
+          ],
+        ),
+      );
+      if (ok != true) return;
+      await _cli.addContact(
+        name: name.text.trim(),
+        onion: onion.text.trim(),
+        pubkey: pubkey.text.trim(),
+        x25519Pubkey: x25519.text.trim(),
+      );
+      await _load();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      name.dispose();
+      onion.dispose();
+      pubkey.dispose();
+      x25519.dispose();
+    }
+  }
+
+  Future<void> _deleteSelectedContact() async {
+    final c = _sel;
+    if (c == null) return;
+    if (!await _confirm('Delete contact', 'Delete ${c.name}? Message history is kept.')) return;
+    try {
+      _showInfo('Contact deleted', await _cli.deleteContact(c.name));
+      await _load();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _showSettings() async {
+    _showInfo('Settings',
+        'Profile: ${_cli.profile}\nBinary: ${_cli.bin}\nListener: $_listenerStatus\n\nUse /name <display-name> to change your display name. More knobs can land once there are actual knobs worth exposing.');
   }
 
   @override
@@ -638,6 +932,16 @@ class _ChatScreenState extends State<_ChatScreen> {
                 ),
                 const Spacer(),
                 IconButton(
+                  icon: const Icon(Icons.person_add_alt_1, size: 19),
+                  onPressed: _showAddContactDialog,
+                  tooltip: 'Add contact',
+                ),
+                IconButton(
+                  icon: const Icon(Icons.settings, size: 19),
+                  onPressed: _showSettings,
+                  tooltip: 'Settings',
+                ),
+                IconButton(
                   icon: const Icon(Icons.refresh, size: 19),
                   onPressed: _load,
                   tooltip: 'Refresh',
@@ -654,7 +958,7 @@ class _ChatScreenState extends State<_ChatScreen> {
                         child: Padding(
                           padding: const EdgeInsets.all(24),
                           child: Text(
-                            'No contacts yet.\nsideband contact add …',
+                            'No contacts yet.\nUse + or /add <name> <onion> <ed25519> <x25519>.',
                             textAlign: TextAlign.center,
                             style: TextStyle(
                                 color: _textDim, fontSize: 12, height: 1.6),
@@ -865,6 +1169,16 @@ class _ChatScreenState extends State<_ChatScreen> {
               ],
             ),
           ),
+          IconButton(
+            icon: const Icon(Icons.history, size: 18),
+            tooltip: 'History',
+            onPressed: () => _runSlashCommand('/history ${c.name}'),
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_outline, size: 18),
+            tooltip: 'Delete contact',
+            onPressed: _deleteSelectedContact,
+          ),
           Tooltip(
             message: _listenerStatus,
             child: Container(
@@ -1024,14 +1338,25 @@ class _ChatScreenState extends State<_ChatScreen> {
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           Expanded(
-            child: TextField(
-              controller: _input,
-              enabled: !_sending,
-              minLines: 1,
-              maxLines: 4,
-              style: const TextStyle(fontSize: 14, color: _text),
-              decoration: const InputDecoration(hintText: 'Send a message…'),
-              onSubmitted: (_) => _sending ? null : _send(),
+            child: KeyboardListener(
+              focusNode: _inputFocus,
+              onKeyEvent: (event) {
+                if (event is! KeyDownEvent) return;
+                if (event.logicalKey != LogicalKeyboardKey.enter) return;
+                if (HardwareKeyboard.instance.isShiftPressed) return;
+                if (!_sending) _send();
+              },
+              child: TextField(
+                controller: _input,
+                enabled: !_sending,
+                minLines: 1,
+                maxLines: 4,
+                style: const TextStyle(fontSize: 14, color: _text),
+                decoration: const InputDecoration(
+                    hintText: 'Message or /help for commands…'),
+                textInputAction: TextInputAction.newline,
+                onSubmitted: (_) => _sending ? null : _send(),
+              ),
             ),
           ),
           const SizedBox(width: 8),

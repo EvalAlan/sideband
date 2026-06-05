@@ -122,6 +122,9 @@ enum CommandKind {
         /// Emit machine-readable JSON instead of aligned text.
         #[arg(long)]
         json: bool,
+        /// Delete matching history rows instead of printing them.
+        #[arg(long)]
+        clear: bool,
     },
     Ratchet {
         #[command(flatten)]
@@ -151,6 +154,12 @@ enum ContactAction {
         pubkey: String,
         #[arg(long)]
         x25519_pubkey: String,
+    },
+    Delete {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        name: String,
     },
     List {
         #[command(flatten)]
@@ -1060,6 +1069,17 @@ pub(crate) fn load_history(
     }
 }
 
+fn clear_history(profile: &Path, contact_filter: Option<&str>) -> Result<()> {
+    let conn = init_db(profile)?;
+    let deleted = if let Some(c) = contact_filter {
+        conn.execute("DELETE FROM messages WHERE contact = ?1", params![c])?
+    } else {
+        conn.execute("DELETE FROM messages", [])?
+    };
+    println!("deleted {deleted} history row(s)");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tui event type
 // ---------------------------------------------------------------------------
@@ -1162,6 +1182,16 @@ async fn main() -> Result<()> {
                 ensure_profile(&profile)?;
                 contact_add(&profile, &name, &onion, &pubkey, &x25519_pubkey)
             }
+            ContactAction::Delete { profile, name } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                if contact_delete(&profile, &name)? {
+                    println!("contact '{name}' deleted");
+                } else {
+                    println!("contact '{name}' not found");
+                }
+                Ok(())
+            }
             ContactAction::List { profile, json } => {
                 let profile = profile.path()?;
                 ensure_profile(&profile)?;
@@ -1173,10 +1203,15 @@ async fn main() -> Result<()> {
             contact,
             limit,
             json,
+            clear,
         } => {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
-            history(&profile, contact.as_deref(), limit, json)
+            if clear {
+                clear_history(&profile, contact.as_deref())
+            } else {
+                history(&profile, contact.as_deref(), limit, json)
+            }
         }
         CommandKind::Ratchet { profile, contact } => {
             let profile = profile.path()?;
