@@ -2,7 +2,6 @@ plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
-    id("com.fzyzcjy.flutter_rust_bridge") version "2.0.0"
 }
 
 android {
@@ -33,19 +32,6 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
-}
-
-flutterRustBridge {
-    // Path to the Rust crate containing the FFI functions
-    crateRoot = file("../../").absolutePath
-    // The Rust crate name (from Cargo.toml)
-    crateName = "sideband"
-    // Output directory for generated JNI/Kotlin bindings
-    outputDir = file("src/main/kotlin").absolutePath
-    // Package for generated Kotlin bindings
-    packageName = "com.example.sideband_gui.bridge"
-    // Enable debug symbols
-    debug = true
 }
 
 dependencies {
