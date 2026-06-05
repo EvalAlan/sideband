@@ -38,7 +38,7 @@ This compiles `libsideband.so` for all 4 Android ABIs into `target/<arch>/releas
 
 1. **File → Open** → select `~/repos/sideband/gui` (the Flutter project root)
 2. Android Studio will detect `android/` subproject and sync Gradle
-3. Wait for Gradle sync to complete (downloads flutter_rust_bridge plugin, FRB dependencies)
+3. Wait for Gradle sync to complete
 
 ---
 
@@ -77,10 +77,10 @@ cd ~/repos/sideband/gui/android
 | File | Purpose |
 |------|---------|
 | `Cargo.toml` | Added `[lib]` cdylib + `[[bin]]` for dual binary/lib build |
-| `android/app/build.gradle.kts` | flutter_rust_bridge plugin + FRB config + `frb` dependency |
-| `android/settings.gradle.kts` | Added flutter_rust_bridge plugin to pluginManagement |
-| `flutter_rust_bridge.yaml` | Points to `../src/app_api.rs` for FFI generation |
-| `build-android-rust.sh` | Script to compile Rust `.so` for all Android ABIs |
+| `android/app/build.gradle.kts` | Standard Flutter Android app config; no FRB Gradle plugin/dependency |
+| `android/settings.gradle.kts` | Standard Flutter Gradle plugin setup |
+| `flutter_rust_bridge.yaml` | Points to `../src/app_api.rs` for future FFI generation |
+| `build-android-rust.sh` | Script to compile Rust `.so` for all Android ABIs once NDK/OpenSSL are configured |
 
 ---
 

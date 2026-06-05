@@ -34,10 +34,6 @@ android {
     }
 }
 
-dependencies {
-    implementation("dev.flutter.flutter_rust_bridge:frb:2.0.0")
-}
-
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

@@ -1,23 +1,12 @@
-# flutter_rust_bridge Android Gradle Plugin
-# Apply this in android/app/build.gradle.kts
+# flutter_rust_bridge Android Setup Notes
 
-# Add to plugins block:
-# id("dev.flutter.flutter-gradle-plugin")
-# id("com.fzyzcjy.flutter_rust_bridge") version "2.0.0" apply false
+There is **no** `com.fzyzcjy.flutter_rust_bridge` Gradle plugin and no Maven dependency named `dev.flutter.flutter_rust_bridge:frb` to add here. Do not add either; Gradle will fail resolving them.
 
-# Then in android block, add:
-# flutterRustBridge {
-#     // Path to the Rust crate containing the FFI functions
-#     crateRoot = file("../../").absolutePath
-#     // The Rust crate name (from Cargo.toml)
-#     crateName = "sideband"
-#     // Output directory for generated JNI/Kotlin bindings
-#     outputDir = file("src/main/kotlin").absolutePath
-#     // Package for generated Kotlin bindings
-#     packageName = "com.example.sideband_gui.bridge"
-#     // Enable debug symbols
-#     debug = true
-# }
+For a real Rust-backed Android build, use the FRB codegen CLI/package workflow:
 
-# Dependencies block:
-# implementation("dev.flutter.flutter_rust_bridge:frb:2.0.0")
+1. Add the Dart `flutter_rust_bridge` package to `pubspec.yaml`.
+2. Run `frb_codegen generate` from `gui/` using `flutter_rust_bridge.yaml`.
+3. Build `libsideband.so` for Android ABIs with `cargo-ndk` or the repo's `build-android-rust.sh` after NDK/OpenSSL are configured.
+4. Copy/link the generated JNI libs under `android/app/src/main/jniLibs/<abi>/` or configure Gradle source sets for them.
+
+Until that bridge is fully generated and wired, Android builds are Flutter-shell smoke builds only; desktop still uses the CLI subprocess backend.
