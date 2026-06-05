@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Sideband
+Comment=Tor-based decentralized messenger
+Exec=sideband_gui
+Icon=sideband_gui
+Type=Application
+Categories=Network;InstantMessaging;Security;
+StartupNotify=true
+Keywords=tor;messenger;privacy;encrypted;
