@@ -2385,6 +2385,7 @@ pub(crate) async fn serve(
     ));
 
     let (control_tx, mut control_rx) = mpsc::channel::<ServeControlCommand>(64);
+    let send_lock = Arc::new(tokio::sync::Mutex::new(()));
     if read_control_stdin {
         tokio::spawn(async move {
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -2437,7 +2438,9 @@ pub(crate) async fn serve(
             };
             let profile = profile.to_path_buf();
             let tor_client = tor_client.clone();
+            let send_lock = send_lock.clone();
             tokio::spawn(async move {
+                let _guard = send_lock.lock().await;
                 match resolve_to(&profile, &to) {
                     Ok(onion) => {
                         match send(&profile, &onion, &message, &to, None, tor_client, false).await {

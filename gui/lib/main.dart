@@ -400,6 +400,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   Process? _listener;
   bool _listenerRunning = false;
   String _listenerStatus = 'listener stopped';
+  String? _listenerOnion;
   String _listenerLogTail = '';
   late final File _listenerLogFile;
   bool _loading = true;
@@ -525,21 +526,17 @@ class _ChatScreenState extends State<_ChatScreen> {
     if (_listener != null) return;
     setState(() {
       _listenerStatus = 'listener starting';
+      _listenerOnion = null;
       _listenerRunning = false;
     });
 
     try {
       final existingPid = await _findExistingListenerPid();
       if (existingPid != null) {
-        if (!mounted) return;
-        setState(() {
-          _listenerRunning = true;
-          _listenerStatus = 'listener already running (pid $existingPid)';
-          _error = null;
-        });
         await _appendListenerLog(
-            'stdout', 'listener already running (pid $existingPid)');
-        return;
+            'stdout', 'stopping stale listener (pid $existingPid)');
+        Process.killPid(existingPid, ProcessSignal.sigterm);
+        await Future<void>.delayed(const Duration(milliseconds: 800));
       }
 
       final p = await Process.start(
@@ -559,16 +556,27 @@ class _ChatScreenState extends State<_ChatScreen> {
         unawaited(_appendListenerLog('stdout', chunk));
         final msg = chunk.trim();
         if (msg.isNotEmpty && mounted) {
-          final last = msg.split('\n').last.trim();
+          final lines = msg
+              .split('\n')
+              .map((line) => line.trim())
+              .where((line) => line.isNotEmpty)
+              .toList();
+          final onionLine = lines.lastWhere(
+            (line) => line.startsWith('onion='),
+            orElse: () => '',
+          );
+          final last = lines.isEmpty ? msg : lines.last;
           final lower = msg.toLowerCase();
           setState(() {
-            _listenerStatus = last.startsWith('onion=')
-                ? 'listening ${last.substring('onion='.length)}'
-                : last;
-            if (last.startsWith('onion=')) {
+            if (onionLine.isNotEmpty) {
+              _listenerOnion = onionLine.substring('onion='.length);
               _listenerRunning = true;
+              _listenerStatus = 'listening $_listenerOnion';
               _error = null;
-            } else if ((lower.contains('send error') ||
+            } else if (!_listenerRunning) {
+              _listenerStatus = last;
+            }
+            if ((lower.contains('send error') ||
                     lower.contains('resolve error') ||
                     lower.contains('control error')) &&
                 !_isRecentSendTransient(lower)) {
@@ -612,6 +620,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         setState(() {
           _listener = null;
           _listenerRunning = false;
+          _listenerOnion = null;
           _listenerStatus = 'listener exited: $code';
           if (code != 0) {
             final tail = _listenerLogTail.trim();
@@ -626,6 +635,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       setState(() {
         _listener = null;
         _listenerRunning = false;
+        _listenerOnion = null;
         _listenerStatus = 'listener failed';
         _error = '$e';
       });
@@ -650,8 +660,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   Future<void> _sendViaListener({required String to, required String message}) async {
     final listener = _listener;
     if (listener == null) {
-      await _cli.send(to: to, message: message);
-      return;
+      throw Exception('listener control channel is not available; restart the GUI');
     }
     listener.stdin.writeln(jsonEncode({
       'cmd': 'send',
@@ -1100,9 +1109,9 @@ class _ChatScreenState extends State<_ChatScreen> {
   }
 
   String? _currentOnion() {
-    if (!_listenerStatus.startsWith('listening ')) return null;
-    final onion = _listenerStatus.substring('listening '.length).trim();
-    return onion.isEmpty ? null : onion;
+    final onion = _listenerOnion;
+    if (onion == null || onion.trim().isEmpty) return null;
+    return onion.trim();
   }
 
   Future<ShareInfo> _shareInfo() async {

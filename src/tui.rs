@@ -736,12 +736,15 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
     let profile_for_send = profile.to_path_buf();
     let tui_tx_for_send = tui_tx.clone();
     let tor_for_send = Arc::clone(&tor_client);
+    let send_lock = Arc::new(tokio::sync::Mutex::new(()));
     tokio::spawn(async move {
         while let Some(cmd) = send_rx.recv().await {
             let profile = profile_for_send.clone();
             let tui_tx = tui_tx_for_send.clone();
             let tor = Arc::clone(&tor_for_send);
+            let send_lock = send_lock.clone();
             tokio::spawn(async move {
+                let _guard = send_lock.lock().await;
                 let contact = cmd.contact.clone();
                 let message = cmd.message.clone();
                 let onion = match crate::resolve_to(&profile, &contact) {
