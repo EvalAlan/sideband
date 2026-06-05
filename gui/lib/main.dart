@@ -350,6 +350,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   bool _loading = true;
   bool _sending = false;
   String? _error;
+  DateTime? _lastSendStartedAt;
   late final Timer _poll;
 
   @override
@@ -436,6 +437,36 @@ class _ChatScreenState extends State<_ChatScreen> {
     return null;
   }
 
+  bool _isRecentSendTransient(String lower) {
+    final last = _lastSendStartedAt;
+    if (last == null) return false;
+    final recent = DateTime.now().difference(last) < const Duration(seconds: 8);
+    return recent &&
+        (lower.contains('send error') ||
+            lower.contains('resolve error') ||
+            lower.contains('control error') ||
+            lower.contains('stream not connected') ||
+            lower.contains('end cell with reason misc'));
+  }
+
+  bool _isFatalBackendLine(String lower) {
+    return lower.contains('fatal') ||
+        lower.contains('panic') ||
+        lower.contains('failed to bootstrap arti tor client') ||
+        lower.contains('incorrect permissions');
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _scroll.animateTo(
+        _scroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
   Future<void> _startListener() async {
     if (_listener != null) return;
     setState(() {
@@ -483,9 +514,10 @@ class _ChatScreenState extends State<_ChatScreen> {
             if (last.startsWith('onion=')) {
               _listenerRunning = true;
               _error = null;
-            } else if (lower.contains('send error') ||
-                lower.contains('resolve error') ||
-                lower.contains('control error')) {
+            } else if ((lower.contains('send error') ||
+                    lower.contains('resolve error') ||
+                    lower.contains('control error')) &&
+                !_isRecentSendTransient(lower)) {
               _error = msg;
             }
           });
@@ -509,9 +541,9 @@ class _ChatScreenState extends State<_ChatScreen> {
                 lower.contains('failed')) {
               _listenerStatus = msg.split('\n').last.trim();
             }
-            // Keep the full backend failure visible somewhere. Silent empty
-            // panes are how we got here.
-            if (lower.contains('error') || lower.contains('failed')) {
+            // Arti logs plenty of scary-but-normal stream churn to stderr.
+            // Only surface backend errors that require the user to act.
+            if (_isFatalBackendLine(lower)) {
               _error = msg;
             }
           });
@@ -557,7 +589,7 @@ class _ChatScreenState extends State<_ChatScreen> {
     _pendingMsgs.removeWhere(
         (pending) => history.any((stored) => _matchesPending(pending, stored)));
     final merged = [..._pendingMsgs, ...history];
-    merged.sort((a, b) => b.tsMs.compareTo(a.tsMs));
+    merged.sort((a, b) => a.tsMs.compareTo(b.tsMs));
     return merged;
   }
 
@@ -596,6 +628,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         _msgs = _mergePending(h.msgs);
         _loading = false;
       });
+      _scrollToBottom();
     } catch (e) {
       setState(() {
         _error = '$e';
@@ -622,8 +655,8 @@ class _ChatScreenState extends State<_ChatScreen> {
       final h = await _historyVisibleFor(_sel!.name);
       setState(() {
         _msgs = _mergePending(h.msgs);
-        _error = null;
       });
+      _scrollToBottom();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = '$e');
@@ -654,10 +687,12 @@ class _ChatScreenState extends State<_ChatScreen> {
         tsMs: now.millisecondsSinceEpoch);
     setState(() {
       _sending = true;
+      _lastSendStartedAt = now;
       _error = null;
       _pendingMsgs.add(pending);
       _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
     });
+    _scrollToBottom();
 
     try {
       await _sendViaListener(to: c.name, message: t);
