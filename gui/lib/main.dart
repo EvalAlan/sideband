@@ -792,46 +792,80 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
   }
 
-  Future<void> _showAddContactDialog() async {
-    final name = TextEditingController();
-    final onion = TextEditingController();
-    final pubkey = TextEditingController();
-    final x25519 = TextEditingController();
+  Future<void> _showAddContactDialog() => _showContactDialog();
+
+  Future<void> _showEditContactDialog(Contact contact) =>
+      _showContactDialog(contact: contact);
+
+  Future<void> _showContactDialog({Contact? contact}) async {
+    final editing = contact != null;
+    final name = TextEditingController(text: contact?.name ?? '');
+    final onion = TextEditingController(text: contact?.onion ?? '');
+    final pubkey = TextEditingController(text: contact?.pubkey ?? '');
+    final x25519 = TextEditingController(text: contact?.x25519Pubkey ?? '');
     try {
       final ok = await showDialog<bool>(
         context: context,
         builder: (_) => AlertDialog(
           backgroundColor: _surface,
-          title: const Text('Add contact', style: TextStyle(color: _text)),
+          title: Text(editing ? 'Edit contact' : 'Add contact',
+              style: const TextStyle(color: _text)),
           content: SizedBox(
             width: 520,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                TextField(controller: name, decoration: const InputDecoration(labelText: 'Name')),
+                TextField(
+                    controller: name,
+                    decoration: const InputDecoration(labelText: 'Name')),
                 const SizedBox(height: 8),
-                TextField(controller: onion, decoration: const InputDecoration(labelText: 'Onion address')),
+                TextField(
+                    controller: onion,
+                    decoration:
+                        const InputDecoration(labelText: 'Onion address')),
                 const SizedBox(height: 8),
-                TextField(controller: pubkey, decoration: const InputDecoration(labelText: 'Ed25519 pubkey')),
+                TextField(
+                    controller: pubkey,
+                    decoration:
+                        const InputDecoration(labelText: 'Ed25519 pubkey')),
                 const SizedBox(height: 8),
-                TextField(controller: x25519, decoration: const InputDecoration(labelText: 'X25519 pubkey')),
+                TextField(
+                    controller: x25519,
+                    decoration:
+                        const InputDecoration(labelText: 'X25519 pubkey')),
               ],
             ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-            FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Add')),
+            TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel')),
+            FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: Text(editing ? 'Save' : 'Add')),
           ],
         ),
       );
       if (ok != true) return;
+
+      final newName = name.text.trim();
+      if (newName.isEmpty) throw Exception('contact name is required');
       await _cli.addContact(
-        name: name.text.trim(),
+        name: newName,
         onion: onion.text.trim(),
         pubkey: pubkey.text.trim(),
         x25519Pubkey: x25519.text.trim(),
       );
+      if (editing && contact.name != newName) {
+        await _cli.deleteContact(contact.name);
+      }
       await _load();
+      if (editing) {
+        for (final updated in _contacts.where((c) => c.name == newName)) {
+          setState(() => _sel = updated);
+          break;
+        }
+      }
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     } finally {
@@ -842,12 +876,130 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
   }
 
-  Future<void> _deleteSelectedContact() async {
-    final c = _sel;
-    if (c == null) return;
-    if (!await _confirm('Delete contact', 'Delete ${c.name}? Message history is kept.')) return;
+  Future<void> _deleteContact(Contact contact) async {
+    if (!await _confirm(
+        'Delete contact', 'Delete ${contact.name}? Message history is kept.')) {
+      return;
+    }
     try {
-      _showInfo('Contact deleted', await _cli.deleteContact(c.name));
+      _showInfo('Contact deleted', await _cli.deleteContact(contact.name));
+      await _load();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _clearHistoryFor(Contact contact) async {
+    if (!await _confirm(
+        'Delete history', 'Delete all message history for ${contact.name}?')) {
+      return;
+    }
+    try {
+      _showInfo('History deleted', await _cli.clearHistory(contact: contact.name));
+      await _load();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _showContactMenu(Contact contact, Offset position) async {
+    final action = await showMenu<String>(
+      context: context,
+      position:
+          RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
+      color: _surface,
+      items: const [
+        PopupMenuItem(value: 'history', child: Text('Show history')),
+        PopupMenuItem(value: 'clear-history', child: Text('Delete history')),
+        PopupMenuDivider(),
+        PopupMenuItem(value: 'edit', child: Text('Edit contact')),
+        PopupMenuItem(value: 'delete', child: Text('Delete contact')),
+        PopupMenuDivider(),
+        PopupMenuItem(value: 'details', child: Text('Contact details')),
+      ],
+    );
+    if (action == null) return;
+    switch (action) {
+      case 'history':
+        await _runSlashCommand('/history ${contact.name}');
+        return;
+      case 'clear-history':
+        await _clearHistoryFor(contact);
+        return;
+      case 'edit':
+        await _showEditContactDialog(contact);
+        return;
+      case 'delete':
+        await _deleteContact(contact);
+        return;
+      case 'details':
+        _showInfo('Contact details',
+            '${contact.name}\nonion=${contact.onion}\npubkey=${contact.pubkey}\nx25519=${contact.x25519Pubkey}');
+        return;
+    }
+  }
+
+  Future<void> _changeDisplayName() async {
+    final current = await _cli.name();
+    final controller = TextEditingController(text: current.trim());
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (_) => AlertDialog(
+          backgroundColor: _surface,
+          title: const Text('Display name', style: TextStyle(color: _text)),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(labelText: 'Name'),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel')),
+            FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Save')),
+          ],
+        ),
+      );
+      if (ok == true) {
+        _showInfo('Name', await _cli.name(controller.text.trim()));
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      controller.dispose();
+    }
+  }
+
+  Future<String> _shareCommand() async {
+    final identity = await _cli.identity();
+    String value(String prefix) {
+      final line = identity
+          .split('\n')
+          .firstWhere((l) => l.startsWith(prefix), orElse: () => '');
+      return line.isEmpty ? '' : line.substring(prefix.length).trim();
+    }
+
+    final name = value('name:');
+    final ed = value('pubkey(ed25519,b64):');
+    final x = value('pubkey(x25519,b64):');
+    final onion = _listenerStatus.startsWith('listening ')
+        ? _listenerStatus.substring('listening '.length)
+        : '(waiting for Tor)';
+    return '/add $name $onion $ed $x';
+  }
+
+  Future<void> _copyShareCommand() async {
+    final command = await _shareCommand();
+    await Clipboard.setData(ClipboardData(text: command));
+    _showInfo('Share contact', '$command\n\nCopied to clipboard.');
+  }
+
+  Future<void> _clearAllHistory() async {
+    if (!await _confirm('Delete all history', 'Delete all message history?')) return;
+    try {
+      _showInfo('History deleted', await _cli.clearHistory());
       await _load();
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
@@ -855,8 +1007,91 @@ class _ChatScreenState extends State<_ChatScreen> {
   }
 
   Future<void> _showSettings() async {
-    _showInfo('Settings',
-        'Profile: ${_cli.profile}\nBinary: ${_cli.bin}\nListener: $_listenerStatus\n\nUse /name <display-name> to change your display name. More knobs can land once there are actual knobs worth exposing.');
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: _surface,
+        title: const Text('Settings', style: TextStyle(color: _text)),
+        content: SizedBox(
+          width: 560,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.badge_outlined),
+                title: const Text('Display name'),
+                subtitle: const Text('Set the name shared with contacts'),
+                onTap: () {
+                  Navigator.pop(context);
+                  unawaited(_changeDisplayName());
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.person_add_alt_1),
+                title: const Text('Add contact'),
+                subtitle: const Text('Paste a shared /add command by hand, because QR is not here yet'),
+                onTap: () {
+                  Navigator.pop(context);
+                  unawaited(_showAddContactDialog());
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.ios_share),
+                title: const Text('Copy my contact command'),
+                subtitle: Text(_listenerStatus),
+                onTap: () {
+                  Navigator.pop(context);
+                  unawaited(_copyShareCommand());
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.fingerprint),
+                title: const Text('Show identity'),
+                subtitle: const Text('Public keys and profile identity'),
+                onTap: () {
+                  Navigator.pop(context);
+                  unawaited(_runSlashCommand('/whoami'));
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.info_outline),
+                title: const Text('Runtime status'),
+                subtitle: Text('${_cli.profile} • ${_contacts.length} contacts'),
+                onTap: () {
+                  Navigator.pop(context);
+                  unawaited(_runSlashCommand('/status'));
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete_sweep_outlined),
+                title: const Text('Delete all history'),
+                subtitle: const Text('Contacts stay. Messages go away.'),
+                onTap: () {
+                  Navigator.pop(context);
+                  unawaited(_clearAllHistory());
+                },
+              ),
+              if (!_listenerRunning)
+                ListTile(
+                  leading: const Icon(Icons.power_settings_new),
+                  title: const Text('Start listener'),
+                  subtitle: const Text('Bring the onion service back up'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    unawaited(_startListener());
+                  },
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -971,36 +1206,80 @@ class _ChatScreenState extends State<_ChatScreen> {
                     itemBuilder: (_, i) {
                       final c = _contacts[i];
                       final on = _sel?.name == c.name;
-                      return ListTile(
-                        selected: on,
-                        leading: CircleAvatar(
-                          radius: 17,
-                          backgroundColor: c.avatarColor,
-                          child: Text(c.initial,
-                              style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w700)),
-                        ),
-                        title: Text(c.name,
+                      return GestureDetector(
+                        onSecondaryTapDown: (details) =>
+                            _showContactMenu(c, details.globalPosition),
+                        child: ListTile(
+                          selected: on,
+                          leading: CircleAvatar(
+                            radius: 17,
+                            backgroundColor: c.avatarColor,
+                            child: Text(c.initial,
+                                style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700)),
+                          ),
+                          title: Text(c.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                fontWeight:
+                                    on ? FontWeight.w600 : FontWeight.w500,
+                                color: on ? _teal : _text,
+                              )),
+                          subtitle: Text(
+                            c.shortOnion,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 13.5,
-                              fontWeight:
-                                  on ? FontWeight.w600 : FontWeight.w500,
-                              color: on ? _teal : _text,
-                            )),
-                        subtitle: Text(
-                          c.shortOnion,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontSize: 10.5, color: _textDim),
+                            style: TextStyle(fontSize: 10.5, color: _textDim),
+                          ),
+                          trailing: PopupMenuButton<String>(
+                            tooltip: 'Contact menu',
+                            icon: const Icon(Icons.more_vert, size: 17),
+                            color: _surface,
+                            onSelected: (action) async {
+                              switch (action) {
+                                case 'history':
+                                  await _runSlashCommand('/history ${c.name}');
+                                  return;
+                                case 'clear-history':
+                                  await _clearHistoryFor(c);
+                                  return;
+                                case 'edit':
+                                  await _showEditContactDialog(c);
+                                  return;
+                                case 'delete':
+                                  await _deleteContact(c);
+                                  return;
+                                case 'details':
+                                  _showInfo('Contact details',
+                                      '${c.name}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
+                                  return;
+                              }
+                            },
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(
+                                  value: 'history', child: Text('Show history')),
+                              PopupMenuItem(
+                                  value: 'clear-history',
+                                  child: Text('Delete history')),
+                              PopupMenuDivider(),
+                              PopupMenuItem(
+                                  value: 'edit', child: Text('Edit contact')),
+                              PopupMenuItem(
+                                  value: 'delete', child: Text('Delete contact')),
+                              PopupMenuDivider(),
+                              PopupMenuItem(
+                                  value: 'details', child: Text('Contact details')),
+                            ],
+                          ),
+                          onTap: () async {
+                            setState(() => _sel = c);
+                            await _refresh();
+                          },
                         ),
-                        onTap: () async {
-                          setState(() => _sel = c);
-                          await _refresh();
-                        },
                       );
                     },
                   ),
@@ -1175,9 +1454,9 @@ class _ChatScreenState extends State<_ChatScreen> {
             onPressed: () => _runSlashCommand('/history ${c.name}'),
           ),
           IconButton(
-            icon: const Icon(Icons.delete_outline, size: 18),
-            tooltip: 'Delete contact',
-            onPressed: _deleteSelectedContact,
+            icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+            tooltip: 'Delete history',
+            onPressed: () => _clearHistoryFor(c),
           ),
           Tooltip(
             message: _listenerStatus,
