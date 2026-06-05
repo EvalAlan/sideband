@@ -295,29 +295,21 @@ impl App {
                     return false;
                 }
                 Some("share") => {
-                    let pk = crate::load_signing_key(&self.profile)
-                        .ok()
-                        .map(|k| {
-                            let vk = k.verifying_key();
-                            base64::engine::general_purpose::STANDARD.encode(vk.to_bytes())
-                        })
-                        .unwrap_or_else(|| "(error)".into());
-                    let x25519_pk = crate::load_x25519_public(&self.profile)
-                        .ok()
-                        .map(|p| base64::engine::general_purpose::STANDARD.encode(p.as_bytes()))
-                        .unwrap_or_else(|| "(error)".into());
-                    let onion = if self.onion.is_empty() {
-                        "(not yet — waiting for Tor)".into()
-                    } else {
-                        self.onion.clone()
-                    };
-                    self.push_sys(
-                        &format!(
-                            "Send this to your contact:\n  /add {} {} {} {}",
-                            self.profile_name, onion, pk, x25519_pk,
+                    if self.onion.is_empty() {
+                        self.push_sys("share unavailable: waiting for Tor onion address", "error");
+                        return false;
+                    }
+                    match crate::share_command(&self.profile, &self.onion)
+                        .and_then(|command| Ok((crate::qr_unicode(&command)?, command)))
+                    {
+                        Ok((qr, command)) => self.push_sys(
+                            &format!(
+                                "Send this to your contact:\n  {command}\n\nScan to add:\n{qr}"
+                            ),
+                            "info",
                         ),
-                        "info",
-                    );
+                        Err(e) => self.push_sys(&format!("share failed: {e}"), "error"),
+                    }
                     return false;
                 }
                 Some("onion") => {

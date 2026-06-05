@@ -163,6 +163,12 @@ class _History {
   final String bin;
 }
 
+class ShareInfo {
+  const ShareInfo({required this.command, required this.qr});
+  final String command;
+  final List<String> qr;
+}
+
 class _SendMessageIntent extends Intent {
   const _SendMessageIntent();
 }
@@ -205,6 +211,22 @@ class _Cli {
   }
 
   Future<String> identity() => _run(['identity', '--profile', profile]);
+
+  Future<ShareInfo> share(String onion) async {
+    final raw = await _run(['share', '--profile', profile, '--onion', onion, '--json']);
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) {
+      throw Exception('share JSON was not an object');
+    }
+    final qr = decoded['qr'];
+    if (qr is! List) {
+      throw Exception('share QR JSON was not a list');
+    }
+    return ShareInfo(
+      command: decoded['command'] as String,
+      qr: qr.map((row) => row.toString()).toList(growable: false),
+    );
+  }
 
   Future<String> name([String? value]) {
     final args = ['name', '--profile', profile];
@@ -325,6 +347,36 @@ class _Cli {
   Future<void> send({required String to, required String message}) async {
     await _run(['send', '--profile', profile, '--to', to, '--message', message]);
   }
+}
+
+class _QrPainter extends CustomPainter {
+  const _QrPainter(this.rows);
+
+  final List<String> rows;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (rows.isEmpty) return;
+    final paint = Paint()..color = Colors.black;
+    final n = rows.length;
+    final cell = size.shortestSide / n;
+    final offsetX = (size.width - cell * n) / 2;
+    final offsetY = (size.height - cell * n) / 2;
+    for (var y = 0; y < rows.length; y++) {
+      final row = rows[y];
+      for (var x = 0; x < row.length; x++) {
+        if (row.codeUnitAt(x) == 49) {
+          canvas.drawRect(
+            Rect.fromLTWH(offsetX + x * cell, offsetY + y * cell, cell, cell),
+            paint,
+          );
+        }
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _QrPainter oldDelegate) => oldDelegate.rows != rows;
 }
 
 // ── screen ──────────────────────────────────────────────────────────────────
@@ -1047,28 +1099,84 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
   }
 
-  Future<String> _shareCommand() async {
-    final identity = await _cli.identity();
-    String value(String prefix) {
-      final line = identity
-          .split('\n')
-          .firstWhere((l) => l.startsWith(prefix), orElse: () => '');
-      return line.isEmpty ? '' : line.substring(prefix.length).trim();
-    }
-
-    final name = value('name:');
-    final ed = value('pubkey(ed25519,b64):');
-    final x = value('pubkey(x25519,b64):');
-    final onion = _listenerStatus.startsWith('listening ')
-        ? _listenerStatus.substring('listening '.length)
-        : '(waiting for Tor)';
-    return '/add $name $onion $ed $x';
+  String? _currentOnion() {
+    if (!_listenerStatus.startsWith('listening ')) return null;
+    final onion = _listenerStatus.substring('listening '.length).trim();
+    return onion.isEmpty ? null : onion;
   }
 
-  Future<void> _copyShareCommand() async {
-    final command = await _shareCommand();
-    await Clipboard.setData(ClipboardData(text: command));
-    _showInfo('Share contact', '$command\n\nCopied to clipboard.');
+  Future<ShareInfo> _shareInfo() async {
+    final onion = _currentOnion();
+    if (onion == null) {
+      throw Exception('onion address is not ready yet');
+    }
+    return _cli.share(onion);
+  }
+
+  Future<void> _showShareDialog() async {
+    try {
+      final share = await _shareInfo();
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          backgroundColor: _surface,
+          title: const Text('Share contact', style: TextStyle(color: _text)),
+          content: SizedBox(
+            width: 520,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: SizedBox(
+                    width: 280,
+                    height: 280,
+                    child: CustomPaint(painter: _QrPainter(share.qr)),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Scan this QR code to add this contact, or copy the command below.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: _textDim),
+                ),
+                const SizedBox(height: 12),
+                SelectableText(
+                  share.command,
+                  style: const TextStyle(
+                    color: _text,
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+            FilledButton.icon(
+              icon: const Icon(Icons.copy, size: 16),
+              label: const Text('Copy'),
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: share.command));
+                if (context.mounted) Navigator.pop(context);
+                _showInfo('Share contact', '${share.command}\n\nCopied to clipboard.');
+              },
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
   }
 
   Future<void> _clearAllHistory() async {
@@ -1104,7 +1212,7 @@ class _ChatScreenState extends State<_ChatScreen> {
               ListTile(
                 leading: const Icon(Icons.person_add_alt_1),
                 title: const Text('Add contact'),
-                subtitle: const Text('Paste a shared /add command by hand, because QR is not here yet'),
+                subtitle: const Text('Paste a shared /add command by hand'),
                 onTap: () {
                   Navigator.pop(context);
                   unawaited(_showAddContactDialog());
@@ -1112,11 +1220,11 @@ class _ChatScreenState extends State<_ChatScreen> {
               ),
               ListTile(
                 leading: const Icon(Icons.ios_share),
-                title: const Text('Copy my contact command'),
+                title: const Text('Share my contact'),
                 subtitle: Text(_listenerStatus),
                 onTap: () {
                   Navigator.pop(context);
-                  unawaited(_copyShareCommand());
+                  unawaited(_showShareDialog());
                 },
               ),
               ListTile(
@@ -1241,20 +1349,41 @@ class _ChatScreenState extends State<_ChatScreen> {
                   ),
                 ),
                 const Spacer(),
-                IconButton(
-                  icon: const Icon(Icons.person_add_alt_1, size: 19),
-                  onPressed: _showAddContactDialog,
-                  tooltip: 'Add contact',
+                SizedBox(
+                  width: 34,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    icon: const Icon(Icons.person_add_alt_1, size: 19),
+                    onPressed: _showAddContactDialog,
+                    tooltip: 'Add contact',
+                  ),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.settings, size: 19),
-                  onPressed: _showSettings,
-                  tooltip: 'Settings',
+                SizedBox(
+                  width: 34,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    icon: const Icon(Icons.qr_code, size: 19),
+                    onPressed: _showShareDialog,
+                    tooltip: 'Share contact',
+                  ),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.refresh, size: 19),
-                  onPressed: _load,
-                  tooltip: 'Refresh',
+                SizedBox(
+                  width: 34,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    icon: const Icon(Icons.settings, size: 19),
+                    onPressed: _showSettings,
+                    tooltip: 'Settings',
+                  ),
+                ),
+                SizedBox(
+                  width: 34,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    icon: const Icon(Icons.refresh, size: 19),
+                    onPressed: _load,
+                    tooltip: 'Refresh',
+                  ),
                 ),
               ],
             ),

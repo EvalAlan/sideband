@@ -15,6 +15,7 @@ use chacha20poly1305::{
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
+use qrcode::{render::unicode, Color as QrColor, QrCode};
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,16 @@ fn expand_home(path: &Path) -> PathBuf {
 enum CommandKind {
     Init(ProfileArg),
     Identity(ProfileArg),
+    Share {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Onion address to include. Omit when Tor has not published one yet.
+        #[arg(long)]
+        onion: Option<String>,
+        /// Emit machine-readable JSON with command and QR matrix.
+        #[arg(long)]
+        json: bool,
+    },
     Serve(ProfileArg),
     Send {
         #[command(flatten)]
@@ -174,6 +185,12 @@ enum ContactAction {
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct ShareInfo {
+    command: String,
+    qr: Vec<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct IdentityFile {
@@ -1139,6 +1156,15 @@ async fn main() -> Result<()> {
             ensure_profile(&profile)?;
             print_identity(&profile)
         }
+        CommandKind::Share {
+            profile,
+            onion,
+            json,
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            print_share(&profile, onion.as_deref(), json)
+        }
         CommandKind::Serve(args) => {
             let profile = args.path()?;
             ensure_profile(&profile)?;
@@ -1452,6 +1478,73 @@ fn print_identity(profile: &Path) -> Result<()> {
     println!("name: {}", display_name);
     println!("pubkey(ed25519,b64): {}", B64.encode(verify.to_bytes()));
     println!("pubkey(x25519,b64): {}", B64.encode(x25519_pub.as_bytes()));
+    Ok(())
+}
+
+pub(crate) fn share_command(profile: &Path, onion: &str) -> Result<String> {
+    if onion.trim().is_empty() || onion.starts_with('(') {
+        anyhow::bail!("onion address is not ready yet");
+    }
+    let key = load_signing_key(profile)?;
+    let verify: VerifyingKey = key.verifying_key();
+    let x25519_pub = load_x25519_public(profile)?;
+    let display_name = load_display_name(profile)?;
+    Ok(format!(
+        "/add {} {} {} {}",
+        display_name,
+        onion,
+        B64.encode(verify.to_bytes()),
+        B64.encode(x25519_pub.as_bytes())
+    ))
+}
+
+pub(crate) fn qr_unicode(payload: &str) -> Result<String> {
+    let code = QrCode::new(payload.as_bytes()).context("generate QR code")?;
+    Ok(code
+        .render::<unicode::Dense1x2>()
+        .quiet_zone(true)
+        .module_dimensions(2, 1)
+        .build())
+}
+
+fn qr_matrix(payload: &str) -> Result<Vec<String>> {
+    let code = QrCode::new(payload.as_bytes()).context("generate QR code")?;
+    let width = code.width();
+    let quiet = 4usize;
+    let mut rows = Vec::with_capacity(width + quiet * 2);
+    for y in 0..(width + quiet * 2) {
+        let mut row = String::with_capacity(width + quiet * 2);
+        for x in 0..(width + quiet * 2) {
+            let dark = x >= quiet
+                && y >= quiet
+                && x < width + quiet
+                && y < width + quiet
+                && code[(x - quiet, y - quiet)] == QrColor::Dark;
+            row.push(if dark { '1' } else { '0' });
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn print_share(profile: &Path, onion: Option<&str>, json: bool) -> Result<()> {
+    let onion = onion.ok_or_else(|| anyhow!("onion address is not ready yet"))?;
+    let command = share_command(profile, onion)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ShareInfo {
+                qr: qr_matrix(&command)?,
+                command,
+            })?
+        );
+    } else {
+        println!("Send this to your contact:");
+        println!("  {command}");
+        println!();
+        println!("Scan to add:");
+        println!("{}", qr_unicode(&command)?);
+    }
     Ok(())
 }
 
