@@ -340,6 +340,7 @@ class _ChatScreenState extends State<_ChatScreen> {
 
   List<Contact> _contacts = [];
   List<ChatMsg> _msgs = [];
+  final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
   Process? _listener;
   bool _listenerRunning = false;
@@ -474,6 +475,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         final msg = chunk.trim();
         if (msg.isNotEmpty && mounted) {
           final last = msg.split('\n').last.trim();
+          final lower = msg.toLowerCase();
           setState(() {
             _listenerStatus = last.startsWith('onion=')
                 ? 'listening ${last.substring('onion='.length)}'
@@ -481,11 +483,17 @@ class _ChatScreenState extends State<_ChatScreen> {
             if (last.startsWith('onion=')) {
               _listenerRunning = true;
               _error = null;
+            } else if (lower.contains('send error') ||
+                lower.contains('resolve error') ||
+                lower.contains('control error')) {
+              _error = msg;
             }
           });
-          final lower = msg.toLowerCase();
           if (lower.contains('message received') ||
-              lower.contains('incoming connection')) {
+              lower.contains('incoming connection') ||
+              lower.contains('message sent') ||
+              lower.contains('send error') ||
+              lower.contains('resolve error')) {
             unawaited(_refresh());
           }
         }
@@ -538,6 +546,35 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
   }
 
+  bool _matchesPending(ChatMsg pending, ChatMsg stored) {
+    return stored.out &&
+        stored.contact == pending.contact &&
+        stored.text == pending.text &&
+        (stored.tsMs - pending.tsMs).abs() <= 120000;
+  }
+
+  List<ChatMsg> _mergePending(List<ChatMsg> history) {
+    _pendingMsgs.removeWhere(
+        (pending) => history.any((stored) => _matchesPending(pending, stored)));
+    final merged = [..._pendingMsgs, ...history];
+    merged.sort((a, b) => b.tsMs.compareTo(a.tsMs));
+    return merged;
+  }
+
+  Future<void> _sendViaListener({required String to, required String message}) async {
+    final listener = _listener;
+    if (listener == null) {
+      await _cli.send(to: to, message: message);
+      return;
+    }
+    listener.stdin.writeln(jsonEncode({
+      'cmd': 'send',
+      'to': to,
+      'message': message,
+    }));
+    await listener.stdin.flush();
+  }
+
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -556,7 +593,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       setState(() {
         _contacts = c;
         _sel = s;
-        _msgs = h.msgs;
+        _msgs = _mergePending(h.msgs);
         _loading = false;
       });
     } catch (e) {
@@ -584,7 +621,7 @@ class _ChatScreenState extends State<_ChatScreen> {
     try {
       final h = await _historyVisibleFor(_sel!.name);
       setState(() {
-        _msgs = h.msgs;
+        _msgs = _mergePending(h.msgs);
         _error = null;
       });
     } catch (e) {
@@ -608,24 +645,25 @@ class _ChatScreenState extends State<_ChatScreen> {
 
     // optimistic
     final now = DateTime.now();
+    final pending = ChatMsg(
+        id: -now.millisecondsSinceEpoch,
+        direction: 'out',
+        status: 'sending',
+        contact: c.name,
+        text: t,
+        tsMs: now.millisecondsSinceEpoch);
     setState(() {
       _sending = true;
-      _msgs = [
-        ChatMsg(
-            id: -now.millisecondsSinceEpoch,
-            direction: 'out',
-            status: 'sending',
-            contact: c.name,
-            text: t,
-            tsMs: now.millisecondsSinceEpoch),
-        ..._msgs,
-      ];
+      _error = null;
+      _pendingMsgs.add(pending);
+      _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
     });
 
     try {
-      await _cli.send(to: c.name, message: t);
+      await _sendViaListener(to: c.name, message: t);
       await _refresh();
     } catch (e) {
+      _pendingMsgs.removeWhere((m) => m.id == pending.id);
       setState(() => _error = '$e');
       await _refresh();
     } finally {

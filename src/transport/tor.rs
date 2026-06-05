@@ -184,7 +184,7 @@ impl TorTransport {
         tui_tx: mpsc::Sender<TuiEvent>,
         quit_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
-        crate::serve(profile, tui_tx, quit_rx, self.client.clone()).await
+        crate::serve(profile, tui_tx, quit_rx, self.client.clone(), false).await
     }
 
     pub async fn send_message(

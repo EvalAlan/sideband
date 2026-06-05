@@ -19,6 +19,7 @@ use rand::rngs::OsRng;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -1102,6 +1103,13 @@ pub(crate) enum TuiEvent {
     StatusUpdate(String),
 }
 
+#[derive(Debug, Deserialize)]
+struct ServeControlCommand {
+    cmd: String,
+    to: Option<String>,
+    message: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------------
@@ -1147,7 +1155,7 @@ async fn main() -> Result<()> {
             let (_quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
             let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
             let tor = transport::tor::TorTransport::new(None, tor_client);
-            tor.serve(&profile, tx, quit_rx).await
+            crate::serve(&profile, tx, quit_rx, tor.client.clone(), true).await
         }
         CommandKind::Send {
             profile,
@@ -2255,11 +2263,12 @@ async fn create_tor_client(profile: &Path) -> Result<TorClient<PreferredRuntime>
 // Serve
 // ---------------------------------------------------------------------------
 
-async fn serve(
+pub(crate) async fn serve(
     profile: &Path,
     tui_tx: mpsc::Sender<TuiEvent>,
     quit_rx: tokio::sync::oneshot::Receiver<()>,
     tor_client: Arc<TorClient<PreferredRuntime>>,
+    read_control_stdin: bool,
 ) -> Result<()> {
     let _key = crate::load_signing_key(profile)?;
     if let Err(e) = crate::load_incoming_states(profile) {
@@ -2271,6 +2280,36 @@ async fn serve(
         Some(tui_tx.clone()),
     ));
 
+    let (control_tx, mut control_rx) = mpsc::channel::<ServeControlCommand>(64);
+    if read_control_stdin {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(tokio::io::stdin()).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<ServeControlCommand>(line) {
+                            Ok(cmd) => {
+                                if control_tx.send(cmd).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => println!("control error: {e}"),
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        println!("control error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     // Spawn the inbound IO loop (pure transport: accepts connections, parses
     // lines, pushes Envelopes into the channel).
     let io_transport = Arc::clone(&transport);
@@ -2279,6 +2318,34 @@ async fn serve(
     // Main dispatch loop: pull envelopes from the channel and handle them.
     // This is the only place that calls handle_inbound — transport is agnostic.
     loop {
+        while let Ok(cmd) = control_rx.try_recv() {
+            if cmd.cmd != "send" {
+                println!("control error: unknown cmd '{}'", cmd.cmd);
+                continue;
+            }
+            let Some(to) = cmd.to else {
+                println!("send error: missing to");
+                continue;
+            };
+            let Some(message) = cmd.message else {
+                println!("send error: missing message");
+                continue;
+            };
+            let profile = profile.to_path_buf();
+            let tor_client = tor_client.clone();
+            tokio::spawn(async move {
+                match resolve_to(&profile, &to) {
+                    Ok(onion) => {
+                        match send(&profile, &onion, &message, &to, None, tor_client, false).await {
+                            Ok(()) => println!("message sent"),
+                            Err(e) => println!("send error: {e}"),
+                        }
+                    }
+                    Err(e) => println!("resolve error: {e}"),
+                }
+            });
+        }
+
         match (*transport).try_recv().await {
             Ok(Some(envelope)) => {
                 let body =
