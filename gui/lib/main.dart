@@ -163,6 +163,10 @@ class _History {
   final String bin;
 }
 
+class _SendMessageIntent extends Intent {
+  const _SendMessageIntent();
+}
+
 // ── cli ─────────────────────────────────────────────────────────────────────
 
 class _Cli {
@@ -335,7 +339,6 @@ class _ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<_ChatScreen> {
   final _cli = _Cli();
   final _input = TextEditingController();
-  final _inputFocus = FocusNode();
   final _scroll = ScrollController();
 
   List<Contact> _contacts = [];
@@ -367,7 +370,6 @@ class _ChatScreenState extends State<_ChatScreen> {
     _poll.cancel();
     _listener?.kill(ProcessSignal.sigterm);
     _input.dispose();
-    _inputFocus.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -1690,24 +1692,30 @@ class _ChatScreenState extends State<_ChatScreen> {
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           Expanded(
-            child: KeyboardListener(
-              focusNode: _inputFocus,
-              onKeyEvent: (event) {
-                if (event is! KeyDownEvent) return;
-                if (event.logicalKey != LogicalKeyboardKey.enter) return;
-                if (HardwareKeyboard.instance.isShiftPressed) return;
-                if (!_sending) _send();
+            child: Shortcuts(
+              shortcuts: const <ShortcutActivator, Intent>{
+                SingleActivator(LogicalKeyboardKey.enter): _SendMessageIntent(),
               },
-              child: TextField(
-                controller: _input,
-                enabled: !_sending,
-                minLines: 1,
-                maxLines: 4,
-                style: const TextStyle(fontSize: 14, color: _text),
-                decoration: const InputDecoration(
-                    hintText: 'Message or /help for commands…'),
-                textInputAction: TextInputAction.newline,
-                onSubmitted: (_) => _sending ? null : _send(),
+              child: Actions(
+                actions: <Type, Action<Intent>>{
+                  _SendMessageIntent: CallbackAction<_SendMessageIntent>(
+                    onInvoke: (_) {
+                      if (!_sending) unawaited(_send());
+                      return null;
+                    },
+                  ),
+                },
+                child: TextField(
+                  controller: _input,
+                  enabled: !_sending,
+                  minLines: 1,
+                  maxLines: 4,
+                  keyboardType: TextInputType.multiline,
+                  style: const TextStyle(fontSize: 14, color: _text),
+                  decoration: const InputDecoration(
+                      hintText: 'Message or /help for commands…'),
+                  textInputAction: TextInputAction.newline,
+                ),
               ),
             ),
           ),
