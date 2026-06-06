@@ -65,6 +65,10 @@ jobs:
         working-directory: gui
         run: flutter analyze --no-fatal-infos
 
+      - name: Test Flutter GUI
+        working-directory: gui
+        run: flutter test
+
       - name: Build AppImage
         run: ./gui/build-appimage.sh
 

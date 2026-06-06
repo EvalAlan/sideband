@@ -113,11 +113,13 @@ class Contact {
     required this.onion,
     required this.pubkey,
     required this.x25519Pubkey,
+    required this.ratchetActive,
   });
   final String name;
   final String onion;
   final String pubkey;
   final String x25519Pubkey;
+  final bool ratchetActive;
 
   String get initial => name.isNotEmpty ? name[0].toUpperCase() : '?';
 
@@ -129,6 +131,30 @@ class Contact {
   String get shortOnion {
     if (onion.length <= 20) return onion;
     return '${onion.substring(0, 10)}…${onion.substring(onion.length - 8)}';
+  }
+
+  bool get staticKeyActive => x25519Pubkey.trim().isNotEmpty;
+
+  String get securityIcon {
+    if (ratchetActive) return '🔒';
+    if (staticKeyActive) return '🔐';
+    return '✍';
+  }
+
+  String get securityLabel {
+    if (ratchetActive) return 'Double Ratchet';
+    if (staticKeyActive) return 'Static key';
+    return 'Signed only';
+  }
+
+  String get securityDescription {
+    if (ratchetActive) {
+      return 'Double Ratchet active: encrypted with forward secrecy.';
+    }
+    if (staticKeyActive) {
+      return 'Static X25519 encryption: encrypted, but no ratchet yet.';
+    }
+    return 'Signed-only legacy contact: no X25519 encryption key is present.';
   }
 }
 
@@ -200,6 +226,21 @@ class _Cli {
   String get bin => _bin;
   final String profile =
       Platform.environment['SIDEBAND_PROFILE'] ?? '~/.sideband';
+
+  String expandedProfilePath() {
+    final p = profile;
+    if (p == '~') return Platform.environment['HOME'] ?? p;
+    if (p.startsWith('~/')) {
+      final home = Platform.environment['HOME'];
+      if (home != null && home.isNotEmpty) return '$home/${p.substring(2)}';
+    }
+    return p;
+  }
+
+  bool _ratchetActive(String contactName) {
+    if (contactName.trim().isEmpty) return false;
+    return File('${expandedProfilePath()}/ratchet/$contactName.bin').existsSync();
+  }
 
   Future<String> _run(List<String> args) async {
     final r = await Process.run(_bin, args);
@@ -295,6 +336,7 @@ class _Cli {
         onion: item['onion'] as String,
         pubkey: item['pubkey_b64'] as String? ?? '',
         x25519Pubkey: item['x25519_pubkey_b64'] as String? ?? '',
+        ratchetActive: _ratchetActive(item['name'] as String),
       ));
     }
     parsed.sort((a, b) => a.name.compareTo(b.name));
@@ -446,8 +488,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   }
 
   String _expandedProfilePath() {
-    final p = _cli.profile;
-    return _expandProfileArg(p);
+    return _cli.expandedProfilePath();
   }
 
   String _expandProfileArg(String p) {
@@ -659,6 +700,18 @@ class _ChatScreenState extends State<_ChatScreen> {
     return merged;
   }
 
+  Color _securityColor(Contact c) => c.ratchetActive
+      ? _teal
+      : c.staticKeyActive
+          ? const Color(0xFF9CDCFE)
+          : _textDim;
+
+  IconData _securityIcon(Contact c) => c.ratchetActive
+      ? Icons.lock_rounded
+      : c.staticKeyActive
+          ? Icons.lock_outline
+          : Icons.edit_outlined;
+
   Future<void> _sendViaListener({required String to, required String message}) async {
     final listener = _listener;
     if (listener == null) {
@@ -851,7 +904,7 @@ class _ChatScreenState extends State<_ChatScreen> {
                   ? '(no contacts)'
                   : _contacts
                       .map((c) =>
-                          '${c.name}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}')
+                          '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}')
                       .join('\n\n'));
           return;
         case 'add':
@@ -900,7 +953,9 @@ class _ChatScreenState extends State<_ChatScreen> {
           return;
         case 'ratchet':
           if (parts.length < 2) throw Exception('usage: /ratchet <contact>');
-          _showInfo('Ratchet', await _cli.ratchet(parts[1]));
+          final result = await _cli.ratchet(parts[1]);
+          await _load();
+          _showInfo('Ratchet', result);
           return;
         case 'status':
           _showInfo('Status',
@@ -1435,20 +1490,53 @@ class _ChatScreenState extends State<_ChatScreen> {
                                     fontSize: 12,
                                     fontWeight: FontWeight.w700)),
                           ),
-                          title: Text(c.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 13.5,
-                                fontWeight:
-                                    on ? FontWeight.w600 : FontWeight.w500,
-                                color: on ? _teal : _text,
-                              )),
-                          subtitle: Text(
-                            c.shortOnion,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 10.5, color: _textDim),
+                          title: Row(
+                            children: [
+                              Expanded(
+                                child: Text(c.name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 13.5,
+                                      fontWeight:
+                                          on ? FontWeight.w600 : FontWeight.w500,
+                                      color: on ? _teal : _text,
+                                    )),
+                              ),
+                              const SizedBox(width: 6),
+                              Tooltip(
+                                message: c.securityDescription,
+                                child: Icon(_securityIcon(c),
+                                    size: 13, color: _securityColor(c)),
+                              ),
+                            ],
+                          ),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                c.shortOnion,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(fontSize: 10.5, color: _textDim),
+                              ),
+                              const SizedBox(height: 1),
+                              Row(
+                                children: [
+                                  Icon(_securityIcon(c),
+                                      size: 9, color: _securityColor(c)),
+                                  const SizedBox(width: 3),
+                                  Expanded(
+                                    child: Text(c.securityLabel,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                            fontSize: 10,
+                                            color: _securityColor(c))),
+                                  ),
+                                ],
+                              ),
+                            ],
                           ),
                           trailing: PopupMenuButton<String>(
                             tooltip: 'Contact menu',
@@ -1470,7 +1558,7 @@ class _ChatScreenState extends State<_ChatScreen> {
                                   return;
                                 case 'details':
                                   _showInfo('Contact details',
-                                      '${c.name}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
+                                      '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
                                   return;
                               }
                             },
@@ -1652,13 +1740,17 @@ class _ChatScreenState extends State<_ChatScreen> {
                         fontSize: 14.5,
                         fontWeight: FontWeight.w700)),
                 const SizedBox(height: 1),
-                Row(
-                  children: [
-                    Icon(Icons.lock, size: 9, color: _textDim),
-                    const SizedBox(width: 3),
-                    Text('End-to-end encrypted',
-                        style: TextStyle(fontSize: 10.5, color: _textDim)),
-                  ],
+                Tooltip(
+                  message: c.securityDescription,
+                  child: Row(
+                    children: [
+                      Icon(_securityIcon(c), size: 11, color: _securityColor(c)),
+                      const SizedBox(width: 4),
+                      Text(c.securityLabel,
+                          style: TextStyle(
+                              fontSize: 10.5, color: _securityColor(c))),
+                    ],
+                  ),
                 ),
               ],
             ),
