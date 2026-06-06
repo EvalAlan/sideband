@@ -1420,6 +1420,10 @@ class _ChatScreenState extends State<_ChatScreen> {
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    style: IconButton.styleFrom(
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
                     icon: const Icon(Icons.person_add_alt_1, size: 19),
                     onPressed: _showAddContactDialog,
                     tooltip: 'Add contact',
@@ -1430,6 +1434,10 @@ class _ChatScreenState extends State<_ChatScreen> {
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    style: IconButton.styleFrom(
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
                     icon: const Icon(Icons.qr_code, size: 19),
                     onPressed: _showShareDialog,
                     tooltip: 'Share contact',
@@ -1440,6 +1448,10 @@ class _ChatScreenState extends State<_ChatScreen> {
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    style: IconButton.styleFrom(
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
                     icon: const Icon(Icons.settings, size: 19),
                     onPressed: _showSettings,
                     tooltip: 'Settings',
@@ -1450,6 +1462,10 @@ class _ChatScreenState extends State<_ChatScreen> {
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    style: IconButton.styleFrom(
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
                     icon: const Icon(Icons.refresh, size: 19),
                     onPressed: _load,
                     tooltip: 'Refresh',
