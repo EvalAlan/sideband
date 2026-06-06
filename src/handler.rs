@@ -13,9 +13,10 @@ use tokio::sync::mpsc;
 
 use crate::transport::tor::TorTransport;
 use crate::{
-    decrypt_and_verify, resolve_contact_name_by_pubkey, send_typed_message, store_message,
-    ChatMessage, ContactsMap, DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload,
-    FileOfferPayload, IncomingFileState, TuiEvent,
+    decrypt_and_verify, discover_or_update_group, resolve_contact_name_by_pubkey,
+    send_typed_message, store_message, store_message_for_conversation, ChatMessage, ContactsMap,
+    DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload, FileOfferPayload,
+    GroupMessagePayload, IncomingFileState, TuiEvent,
 };
 
 /// Parse a raw inbound line into a [`ChatMessage`].
@@ -82,28 +83,15 @@ pub async fn handle_inbound(
 
     let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
 
-    store_message(
+    record_inbound_chat_plaintext(
         profile,
-        "in",
+        tui_tx,
         &contact_name,
-        "",
         &body_for_display,
         msg.timestamp_ms,
-        if verified {
-            DeliveryStatus::Delivered
-        } else {
-            DeliveryStatus::Failed
-        },
-    )?;
-
-    let _ = tui_tx
-        .send(TuiEvent::InboundMessage {
-            contact: contact_name.clone(),
-            body: body_for_display,
-            timestamp_ms: msg.timestamp_ms,
-            verified,
-        })
-        .await;
+        verified,
+    )
+    .await?;
 
     if verified {
         tracing::info!(recv=true, v=%msg.v, "message received and verified");
@@ -111,6 +99,76 @@ pub async fn handle_inbound(
         tracing::warn!(from=%msg.from, "signature verification FAILED");
     }
 
+    Ok(())
+}
+
+pub(crate) async fn record_inbound_chat_plaintext(
+    profile: &Path,
+    tui_tx: &mpsc::Sender<TuiEvent>,
+    contact_name: &str,
+    plaintext: &str,
+    timestamp_ms: u128,
+    verified: bool,
+) -> Result<()> {
+    let status = if verified {
+        DeliveryStatus::Delivered
+    } else {
+        DeliveryStatus::Failed
+    };
+
+    if verified {
+        if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(plaintext) {
+            if payload.kind == "group_message" {
+                let group = discover_or_update_group(
+                    profile,
+                    &payload.group_id,
+                    &payload.group_title,
+                    contact_name,
+                )?;
+                store_message_for_conversation(
+                    profile,
+                    "in",
+                    contact_name,
+                    "",
+                    &payload.body,
+                    timestamp_ms,
+                    status,
+                    "group",
+                    &group.id,
+                )?;
+                let _ = tui_tx
+                    .send(TuiEvent::InboundGroupMessage {
+                        group_id: group.id,
+                        group_title: group.title,
+                        contact: contact_name.to_string(),
+                        body: payload.body,
+                        timestamp_ms,
+                        verified,
+                    })
+                    .await;
+                return Ok(());
+            }
+        }
+    }
+
+    store_message(
+        profile,
+        "in",
+        contact_name,
+        "",
+        plaintext,
+        timestamp_ms,
+        status,
+    )?;
+
+    let _ = tui_tx
+        .send(TuiEvent::InboundMessage {
+            contact: contact_name.to_string(),
+            body: plaintext.to_string(),
+            timestamp_ms,
+            verified,
+        })
+        .await;
     Ok(())
 }
 
@@ -571,5 +629,71 @@ mod tests {
             "[decryption failed: unknown sender pubkey: abc]"
         );
         assert_eq!(body_for_inbound_display("hello", None), "hello");
+    }
+}
+
+#[cfg(test)]
+mod group_chat_tests {
+    use super::*;
+    use crate::{contact_add, init_profile, load_group_history, load_groups, load_history};
+
+    #[tokio::test]
+    async fn inbound_group_payload_stores_group_history_not_direct_history() {
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel::<TuiEvent>(4);
+        let payload = serde_json::json!({
+            "kind": "group_message",
+            "group_id": "g-ops",
+            "group_title": "Ops",
+            "body": "ops hello"
+        })
+        .to_string();
+
+        record_inbound_chat_plaintext(dir.path(), &tx, "alice", &payload, 123, true)
+            .await
+            .unwrap();
+
+        let groups = load_groups(dir.path()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "g-ops");
+        assert_eq!(groups[0].title, "Ops");
+        assert!(groups[0].members.iter().any(|m| m.contact == "alice"));
+
+        let group_rows = load_group_history(dir.path(), "g-ops", 10).unwrap();
+        assert_eq!(group_rows.len(), 1);
+        assert_eq!(group_rows[0].body, "ops hello");
+        assert_eq!(group_rows[0].contact, "alice");
+        assert_eq!(group_rows[0].conversation_kind, "group");
+        assert_eq!(group_rows[0].conversation_id, "g-ops");
+        assert!(load_history(dir.path(), Some("alice"), 10)
+            .unwrap()
+            .is_empty());
+
+        match rx.recv().await.unwrap() {
+            TuiEvent::InboundGroupMessage {
+                group_id,
+                group_title,
+                contact,
+                body,
+                ..
+            } => {
+                assert_eq!(group_id, "g-ops");
+                assert_eq!(group_title, "Ops");
+                assert_eq!(contact, "alice");
+                assert_eq!(body, "ops hello");
+            }
+            other => panic!("expected group event, got {other:?}"),
+        }
     }
 }

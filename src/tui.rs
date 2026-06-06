@@ -70,6 +70,7 @@ struct App {
     last_error: Option<String>,
     error_until: Option<Instant>,
     unread_contacts: HashSet<String>,
+    unread_groups: HashSet<String>,
 }
 
 struct DisplayMessage {
@@ -120,6 +121,7 @@ impl App {
             last_error: None,
             error_until: None,
             unread_contacts: HashSet::new(),
+            unread_groups: HashSet::new(),
         }
     }
 
@@ -565,6 +567,9 @@ impl App {
         if let Some(contact) = self.selected_contact_name() {
             self.unread_contacts.remove(&contact);
         }
+        if let Some(group_id) = self.selected_group_id() {
+            self.unread_groups.remove(&group_id);
+        }
         self.scroll_offset = 0;
     }
 
@@ -586,6 +591,35 @@ impl App {
             direction: "in".into(),
             contact,
             body,
+            _timestamp_ms: timestamp_ms,
+            status: status.into(),
+            pending: false,
+        });
+        self.messages_recv += 1;
+    }
+
+    fn record_inbound_group_message(
+        &mut self,
+        group_id: String,
+        group_title: String,
+        contact: String,
+        body: String,
+        timestamp_ms: u128,
+        verified: bool,
+    ) {
+        if !self.groups.iter().any(|group| group.id == group_id) {
+            if let Ok(groups) = crate::load_groups(&self.profile) {
+                self.groups = groups;
+            }
+        }
+        if self.selected_group_id().as_deref() != Some(group_id.as_str()) {
+            self.unread_groups.insert(group_id.clone());
+        }
+        let status = if verified { "verified" } else { "UNVERIFIED" };
+        self.messages.push(DisplayMessage {
+            direction: "in".into(),
+            contact: group_title,
+            body: format!("{contact}: {body}"),
             _timestamp_ms: timestamp_ms,
             status: status.into(),
             pending: false,
@@ -686,6 +720,9 @@ impl App {
     }
 
     fn show_group_history(&mut self, group: &str) {
+        let group_title = crate::resolve_group(&self.profile, group)
+            .map(|group| group.title)
+            .unwrap_or_else(|_| group.to_string());
         match crate::load_group_history(&self.profile, group, 20) {
             Ok(rows) => {
                 if rows.is_empty() {
@@ -695,10 +732,15 @@ impl App {
                         let status_label = crate::DeliveryStatus::from_i64(r.status)
                             .map(|s| s.label())
                             .unwrap_or("?");
+                        let body = if r.direction == "in" {
+                            format!("{}: {}", r.contact, r.body)
+                        } else {
+                            r.body
+                        };
                         self.messages.push(DisplayMessage {
                             direction: r.direction,
-                            contact: r.contact,
-                            body: r.body,
+                            contact: group_title.clone(),
+                            body,
                             _timestamp_ms: r.timestamp_ms as u128,
                             status: status_label.into(),
                             pending: false,
@@ -767,6 +809,23 @@ impl App {
                     verified,
                 } => {
                     self.record_inbound_message(contact, body, timestamp_ms, verified);
+                }
+                TuiEvent::InboundGroupMessage {
+                    group_id,
+                    group_title,
+                    contact,
+                    body,
+                    timestamp_ms,
+                    verified,
+                } => {
+                    self.record_inbound_group_message(
+                        group_id,
+                        group_title,
+                        contact,
+                        body,
+                        timestamp_ms,
+                        verified,
+                    );
                 }
                 TuiEvent::OutboundMessage {
                     contact,
@@ -1361,7 +1420,19 @@ fn draw_contacts(f: &mut Frame, area: Rect, app: &App) {
             } else if is_header {
                 label.clone()
             } else {
-                format!("  {}", label)
+                let group_index = group_header_index
+                    .and_then(|header| i.checked_sub(header + 1))
+                    .filter(|idx| *idx < app.groups.len());
+                if let Some(idx) = group_index {
+                    let unread_marker = if app.unread_groups.contains(&app.groups[idx].id) {
+                        "● "
+                    } else {
+                        ""
+                    };
+                    format!("  {unread_marker}{}", label)
+                } else {
+                    format!("  {}", label)
+                }
             };
             let group_index = group_header_index
                 .and_then(|header| i.checked_sub(header + 1))
@@ -1383,6 +1454,9 @@ fn draw_contacts(f: &mut Frame, area: Rect, app: &App) {
             } else if contact_index
                 .map(|idx| app.unread_contacts.contains(&app.contacts[idx]))
                 .unwrap_or(false)
+                || group_index
+                    .map(|idx| app.unread_groups.contains(&app.groups[idx].id))
+                    .unwrap_or(false)
             {
                 Style::default()
                     .fg(Color::Yellow)

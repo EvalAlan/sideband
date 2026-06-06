@@ -299,6 +299,25 @@ pub(crate) struct ChatMessage {
     ratchet_ct_hex: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct GroupMessagePayload {
+    pub(crate) kind: String,
+    pub(crate) group_id: String,
+    pub(crate) group_title: String,
+    pub(crate) body: String,
+}
+
+impl GroupMessagePayload {
+    pub(crate) fn new(group: &GroupInfo, body: &str) -> Self {
+        Self {
+            kind: "group_message".to_string(),
+            group_id: group.id.clone(),
+            group_title: group.title.clone(),
+            body: body.to_string(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // File transfer
 // ---------------------------------------------------------------------------
@@ -1364,6 +1383,36 @@ pub(crate) fn resolve_group(profile: &Path, group_ref: &str) -> Result<GroupInfo
     }
 }
 
+pub(crate) fn discover_or_update_group(
+    profile: &Path,
+    group_id: &str,
+    title: &str,
+    sender_contact: &str,
+) -> Result<GroupInfo> {
+    let group_id = group_id.trim();
+    if group_id.is_empty() {
+        return Err(anyhow!("group id is required"));
+    }
+    let title = title.trim();
+    let title = if title.is_empty() { group_id } else { title };
+    let sender_contact = sender_contact.trim();
+    let now = now_ms_i64()?;
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO groups (id, title, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(id) DO UPDATE SET title=excluded.title, updated_at_ms=excluded.updated_at_ms",
+        params![group_id, title, now],
+    )?;
+    if !sender_contact.is_empty() {
+        conn.execute(
+            "INSERT OR IGNORE INTO group_members (group_id, contact, role, added_at_ms) VALUES (?1, ?2, 'member', ?3)",
+            params![group_id, sender_contact, now],
+        )?;
+    }
+    drop(conn);
+    resolve_group(profile, group_id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GroupSendFailure {
     pub(crate) contact: String,
@@ -1399,10 +1448,11 @@ pub(crate) async fn send_group(
             });
             continue;
         };
+        let payload = serde_json::to_string(&GroupMessagePayload::new(&group, message))?;
         match send_in_conversation(
             profile,
             &contact.onion,
-            message,
+            &payload,
             &member.contact,
             None,
             tor_client.clone(),
@@ -1462,6 +1512,14 @@ fn clear_history(profile: &Path, contact_filter: Option<&str>) -> Result<()> {
 #[allow(dead_code)]
 pub(crate) enum TuiEvent {
     InboundMessage {
+        contact: String,
+        body: String,
+        timestamp_ms: u128,
+        verified: bool,
+    },
+    InboundGroupMessage {
+        group_id: String,
+        group_title: String,
         contact: String,
         body: String,
         timestamp_ms: u128,
@@ -1531,6 +1589,7 @@ async fn main() -> Result<()> {
                     match evt {
                         TuiEvent::StatusUpdate(text) => println!("{text}"),
                         TuiEvent::InboundMessage { .. } => println!("message received"),
+                        TuiEvent::InboundGroupMessage { .. } => println!("group message received"),
                         TuiEvent::OutboundMessage { .. } => {}
                     }
                 }
@@ -3115,12 +3174,17 @@ pub(crate) async fn send_in_conversation(
     }
 
     // Store outbound in DB.
+    let body_for_history = serde_json::from_str::<GroupMessagePayload>(message)
+        .ok()
+        .filter(|payload| payload.kind == "group_message")
+        .map(|payload| payload.body)
+        .unwrap_or_else(|| message.to_string());
     if let Err(e) = store_message_for_conversation(
         profile,
         "out",
         contact_hint,
         to,
-        message,
+        &body_for_history,
         msg.timestamp_ms,
         status,
         conversation_kind,
