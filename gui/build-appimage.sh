@@ -171,7 +171,8 @@ cd "${SCRIPT_DIR}"
 
 APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --appdir "${APPDIR}" \
-    --executable "${APPDIR}/usr/bin/sideband_gui" \
+    --executable "${APPDIR}/usr/bin/sideband_gui.bin" \
+    --executable "${APPDIR}/usr/bin/sideband" \
     --desktop-file "${APPDIR}/usr/share/applications/sideband_gui.desktop" \
     --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg" \
     --output appimage
