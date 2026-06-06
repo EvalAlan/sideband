@@ -390,9 +390,11 @@ class _Cli {
     return parsed;
   }
 
-  Future<_History> history({String? contact, int limit = 80}) async {
+  Future<_History> history({String? contact, String? group, int limit = 80}) async {
     final args = ['history', '--profile', profile, '--limit', '$limit', '--json'];
-    if (contact != null && contact.trim().isNotEmpty) {
+    if (group != null && group.trim().isNotEmpty) {
+      args.addAll(['--group', group.trim()]);
+    } else if (contact != null && contact.trim().isNotEmpty) {
       args.addAll(['--contact', contact.trim()]);
     }
     final raw = await _run(args);
@@ -489,6 +491,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
+  GroupInfo? _selGroup;
   Process? _listener;
   bool _listenerRunning = false;
   String _listenerStatus = 'listener stopped';
@@ -760,14 +763,15 @@ class _ChatScreenState extends State<_ChatScreen> {
           ? Icons.lock_outline
           : Icons.edit_outlined;
 
-  Future<void> _sendViaListener({required String to, required String message}) async {
+  Future<void> _sendViaListener({String? to, String? group, required String message}) async {
     final listener = _listener;
     if (listener == null) {
       throw Exception('listener control channel is not available; restart the GUI');
     }
     listener.stdin.writeln(jsonEncode({
-      'cmd': 'send',
-      'to': to,
+      'cmd': group == null ? 'send' : 'group_send',
+      if (to != null) 'to': to,
+      if (group != null) 'group': group,
       'message': message,
     }));
     await listener.stdin.flush();
@@ -782,17 +786,27 @@ class _ChatScreenState extends State<_ChatScreen> {
       final c = await _cli.contacts();
       final g = await _cli.groups();
       var s = _sel;
-      if (s == null && c.isNotEmpty) {
-        s = c.first;
-      } else if (s != null) {
-        final idx = c.indexWhere((x) => x.name == s!.name);
-        s = idx >= 0 ? c[idx] : (c.isNotEmpty ? c.first : null);
+      var sg = _selGroup;
+      if (sg != null) {
+        final idx = g.indexWhere((x) => x.id == sg!.id);
+        sg = idx >= 0 ? g[idx] : null;
       }
-      final h = await _historyVisibleFor(s?.name);
+      if (sg == null) {
+        if (s == null && c.isNotEmpty) {
+          s = c.first;
+        } else if (s != null) {
+          final idx = c.indexWhere((x) => x.name == s!.name);
+          s = idx >= 0 ? c[idx] : (c.isNotEmpty ? c.first : null);
+        }
+      } else {
+        s = null;
+      }
+      final h = await _historyVisibleFor(s?.name, group: sg?.id);
       setState(() {
         _contacts = c;
         _groups = g;
         _sel = s;
+        _selGroup = sg;
         _msgs = _mergePending(h.msgs);
         _loading = false;
       });
@@ -805,9 +819,9 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
   }
 
-  Future<_History> _historyVisibleFor(String? contact) async {
-    final filtered = await _cli.history(contact: contact);
-    if (filtered.msgs.isNotEmpty || contact == null || contact.trim().isEmpty) {
+  Future<_History> _historyVisibleFor(String? contact, {String? group}) async {
+    final filtered = await _cli.history(contact: contact, group: group);
+    if (group != null || filtered.msgs.isNotEmpty || contact == null || contact.trim().isEmpty) {
       return filtered;
     }
 
@@ -818,9 +832,9 @@ class _ChatScreenState extends State<_ChatScreen> {
   }
 
   Future<void> _refresh() async {
-    if (_sel == null) return;
+    if (_sel == null && _selGroup == null) return;
     try {
-      final h = await _historyVisibleFor(_sel!.name);
+      final h = await _historyVisibleFor(_sel?.name, group: _selGroup?.id);
       setState(() {
         _msgs = _mergePending(h.msgs);
       });
@@ -833,6 +847,7 @@ class _ChatScreenState extends State<_ChatScreen> {
 
   Future<void> _send() async {
     final c = _sel;
+    final g = _selGroup;
     final t = _input.text.trim();
     if (t.isEmpty) return;
     _input.clear();
@@ -842,7 +857,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       return;
     }
 
-    if (c == null) return;
+    if (c == null && g == null) return;
 
     // optimistic
     final now = DateTime.now();
@@ -850,7 +865,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         id: -now.millisecondsSinceEpoch,
         direction: 'out',
         status: 'sending',
-        contact: c.name,
+        contact: c?.name ?? g!.sidebarLabel,
         text: t,
         tsMs: now.millisecondsSinceEpoch);
     setState(() {
@@ -863,7 +878,11 @@ class _ChatScreenState extends State<_ChatScreen> {
     _scrollToBottom();
 
     try {
-      await _sendViaListener(to: c.name, message: t);
+      if (g != null) {
+        await _sendViaListener(group: g.id, message: t);
+      } else {
+        await _sendViaListener(to: c!.name, message: t);
+      }
       await _refresh();
     } catch (e) {
       _pendingMsgs.removeWhere((m) => m.id == pending.id);
@@ -927,7 +946,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       switch (cmd) {
         case 'help':
           _showInfo('Slash commands',
-              '/send <contact> <msg>\n/history [contact]\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
+              '/send <contact> <msg>\n/group <id-or-title> <msg>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
           return;
         case 'send':
           if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
@@ -935,6 +954,11 @@ class _ChatScreenState extends State<_ChatScreen> {
           final msg = raw.split(RegExp(r'\s+')).skip(2).join(' ');
           await _cli.send(to: contact, message: msg);
           await _load();
+          return;
+        case 'group':
+          if (parts.length < 3) throw Exception('usage: /group <id-or-title> <message>');
+          await _sendViaListener(group: parts[1], message: raw.split(RegExp(r'\s+')).skip(2).join(' '));
+          await _refresh();
           return;
         case 'history':
           final contact = parts.length > 1 ? parts[1] : null;
@@ -945,6 +969,10 @@ class _ChatScreenState extends State<_ChatScreen> {
           });
           _showInfo('History${contact == null ? '' : ' for $contact'}',
               lines.isEmpty ? '(no messages)' : lines.join('\n'));
+          return;
+        case 'history-group':
+          if (parts.length < 2) throw Exception('usage: /history-group <id-or-title>');
+          await _loadGroupHistory(parts[1]);
           return;
         case 'contacts':
           await _load();
@@ -1124,6 +1152,16 @@ class _ChatScreenState extends State<_ChatScreen> {
       onion.dispose();
       pubkey.dispose();
       x25519.dispose();
+    }
+  }
+
+  Future<void> _loadGroupHistory(String group) async {
+    try {
+      final h = await _cli.history(group: group);
+      setState(() => _msgs = _mergePending(h.msgs));
+      _scrollToBottom();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
     }
   }
 
@@ -1435,14 +1473,14 @@ class _ChatScreenState extends State<_ChatScreen> {
           }
 
           if (constraints.maxWidth < 720) {
-            return _sel == null ? _sidebar() : _chat();
+            return _sel == null && _selGroup == null ? _sidebar() : _chat();
           }
 
           return Row(
             children: [
               SizedBox(width: 320, child: _sidebar()),
               Container(width: 1, color: _border),
-              Expanded(child: _sel == null ? _empty() : _chat()),
+              Expanded(child: _sel == null && _selGroup == null ? _empty() : _chat()),
             ],
           );
         },
@@ -1586,8 +1624,16 @@ class _ChatScreenState extends State<_ChatScreen> {
                             tooltip: 'Group details',
                             onPressed: () => _showInfo('Group details', g.details),
                           ),
-                          onTap: () => _showInfo('Group chat',
-                              '${g.sidebarLabel}\n\nGroup messaging is not wired yet. This is visibility only, because pretending otherwise would be how bugs breed.'),
+                          selected: _selGroup?.id == g.id,
+                          onTap: () async {
+                            final h = await _historyVisibleFor(null, group: g.id);
+                            setState(() {
+                              _sel = null;
+                              _selGroup = g;
+                              _msgs = _mergePending(h.msgs);
+                            });
+                            _scrollToBottom();
+                          },
                         );
                       }
                       final c = _contacts[i];
@@ -1695,7 +1741,10 @@ class _ChatScreenState extends State<_ChatScreen> {
                             ],
                           ),
                           onTap: () async {
-                            setState(() => _sel = c);
+                            setState(() {
+                              _sel = c;
+                              _selGroup = null;
+                            });
                             await _refresh();
                           },
                         ),
@@ -1830,7 +1879,10 @@ class _ChatScreenState extends State<_ChatScreen> {
   }
 
   Widget _chatHeader() {
-    final c = _sel!;
+    final c = _sel;
+    final g = _selGroup;
+    final title = c?.name ?? g!.sidebarLabel;
+    final subtitle = c?.securityLabel ?? 'Group fan-out to ${g!.memberSummary}';
     return Container(
       color: _surface,
       padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
@@ -1838,8 +1890,8 @@ class _ChatScreenState extends State<_ChatScreen> {
         children: [
           CircleAvatar(
             radius: 16,
-            backgroundColor: c.avatarColor,
-            child: Text(c.initial,
+            backgroundColor: c?.avatarColor ?? _teal.withAlpha(110),
+            child: Text(c?.initial ?? 'G',
                 style: const TextStyle(
                     color: Colors.white,
                     fontSize: 11,
@@ -1850,21 +1902,21 @@ class _ChatScreenState extends State<_ChatScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(c.name,
+                Text(title,
                     style: const TextStyle(
                         color: _text,
                         fontSize: 14.5,
                         fontWeight: FontWeight.w700)),
                 const SizedBox(height: 1),
                 Tooltip(
-                  message: c.securityDescription,
+                  message: c?.securityDescription ?? 'Group messages are sent separately to each member using their contact crypto.',
                   child: Row(
                     children: [
-                      Icon(_securityIcon(c), size: 11, color: _securityColor(c)),
+                      Icon(c == null ? Icons.groups_rounded : _securityIcon(c), size: 11, color: c == null ? _teal : _securityColor(c)),
                       const SizedBox(width: 4),
-                      Text(c.securityLabel,
+                      Text(subtitle,
                           style: TextStyle(
-                              fontSize: 10.5, color: _securityColor(c))),
+                              fontSize: 10.5, color: c == null ? _teal : _securityColor(c))),
                     ],
                   ),
                 ),
@@ -1874,12 +1926,14 @@ class _ChatScreenState extends State<_ChatScreen> {
           IconButton(
             icon: const Icon(Icons.history, size: 18),
             tooltip: 'History',
-            onPressed: () => _runSlashCommand('/history ${c.name}'),
+            onPressed: () => c == null
+                ? _runSlashCommand('/history-group ${g!.id}')
+                : _runSlashCommand('/history ${c.name}'),
           ),
           IconButton(
             icon: const Icon(Icons.delete_sweep_outlined, size: 18),
             tooltip: 'Delete history',
-            onPressed: () => _clearHistoryFor(c),
+            onPressed: c == null ? null : () => _clearHistoryFor(c),
           ),
           Tooltip(
             message: _listenerStatus,

@@ -132,6 +132,9 @@ enum CommandKind {
         /// Filter by contact name or onion address.
         #[arg(long)]
         contact: Option<String>,
+        /// Filter by group id or exact title.
+        #[arg(long)]
+        group: Option<String>,
         /// Max rows (default 50)
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -207,6 +210,18 @@ enum GroupAction {
         /// Emit machine-readable JSON instead of text.
         #[arg(long)]
         json: bool,
+    },
+    Send {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Group id or exact title.
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        message: String,
+        /// Force static X25519 encryption instead of Double Ratchet.
+        #[arg(long = "static")]
+        force_static: bool,
     },
 }
 
@@ -1162,7 +1177,7 @@ pub(crate) fn load_history(
         let mut stmt = conn.prepare(
             "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at, conversation_kind, conversation_id
              FROM messages
-             WHERE contact = ?1
+             WHERE conversation_kind = 'contact' AND contact = ?1
              ORDER BY timestamp_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![c, limit as i64], history_row_from_sql)?;
@@ -1184,6 +1199,27 @@ pub(crate) fn load_history(
         }
         Ok(out)
     }
+}
+
+pub(crate) fn load_group_history(
+    profile: &Path,
+    group_ref: &str,
+    limit: usize,
+) -> Result<Vec<HistoryRow>> {
+    let group = resolve_group(profile, group_ref)?;
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at, conversation_kind, conversation_id
+         FROM messages
+         WHERE conversation_kind = 'group' AND conversation_id = ?1
+         ORDER BY timestamp_ms DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![group.id, limit as i64], history_row_from_sql)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn history_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
@@ -1310,6 +1346,103 @@ pub(crate) fn load_groups(profile: &Path) -> Result<Vec<GroupInfo>> {
     Ok(groups)
 }
 
+pub(crate) fn resolve_group(profile: &Path, group_ref: &str) -> Result<GroupInfo> {
+    let group_ref = group_ref.trim();
+    if group_ref.is_empty() {
+        return Err(anyhow!("group is required"));
+    }
+    let matches: Vec<GroupInfo> = load_groups(profile)?
+        .into_iter()
+        .filter(|g| g.id == group_ref || g.title == group_ref)
+        .collect();
+    match matches.len() {
+        0 => Err(anyhow!("unknown group '{group_ref}'")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => Err(anyhow!(
+            "ambiguous group title '{group_ref}'; use the group id"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroupSendFailure {
+    pub(crate) contact: String,
+    pub(crate) error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroupSendResult {
+    pub(crate) group_id: String,
+    pub(crate) group_title: String,
+    pub(crate) total: usize,
+    pub(crate) sent: usize,
+    pub(crate) failures: Vec<GroupSendFailure>,
+}
+
+pub(crate) async fn send_group(
+    profile: &Path,
+    group_ref: &str,
+    message: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+    force_static: bool,
+) -> Result<GroupSendResult> {
+    let group = resolve_group(profile, group_ref)?;
+    let contacts = load_contacts(profile)?;
+    let mut failures = Vec::new();
+    let mut sent = 0usize;
+
+    for member in &group.members {
+        let Some(contact) = contacts.get(&member.contact) else {
+            failures.push(GroupSendFailure {
+                contact: member.contact.clone(),
+                error: "contact no longer exists".to_string(),
+            });
+            continue;
+        };
+        match send_in_conversation(
+            profile,
+            &contact.onion,
+            message,
+            &member.contact,
+            None,
+            tor_client.clone(),
+            force_static,
+            "group",
+            &group.id,
+        )
+        .await
+        {
+            Ok(()) => sent += 1,
+            Err(e) => failures.push(GroupSendFailure {
+                contact: member.contact.clone(),
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    Ok(GroupSendResult {
+        group_id: group.id,
+        group_title: group.title,
+        total: group.members.len(),
+        sent,
+        failures,
+    })
+}
+
+fn clear_group_history(profile: &Path, group_filter: Option<&str>) -> Result<()> {
+    let Some(group_filter) = group_filter else {
+        return Err(anyhow!("--group is required when clearing group history"));
+    };
+    let group = resolve_group(profile, group_filter)?;
+    let conn = init_db(profile)?;
+    let deleted = conn.execute(
+        "DELETE FROM messages WHERE conversation_kind = 'group' AND conversation_id = ?1",
+        params![group.id],
+    )?;
+    println!("deleted {deleted} group history row(s)");
+    Ok(())
+}
+
 fn clear_history(profile: &Path, contact_filter: Option<&str>) -> Result<()> {
     let conn = init_db(profile)?;
     let deleted = if let Some(c) = contact_filter {
@@ -1347,6 +1480,7 @@ pub(crate) enum TuiEvent {
 struct ServeControlCommand {
     cmd: String,
     to: Option<String>,
+    group: Option<String>,
     message: Option<String>,
 }
 
@@ -1502,10 +1636,33 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
+            GroupAction::Send {
+                profile,
+                group,
+                message,
+                force_static,
+            } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
+                let result =
+                    send_group(&profile, &group, &message, tor_client, force_static).await?;
+                println!(
+                    "group '{}' sent to {}/{} member(s)",
+                    result.group_title, result.sent, result.total
+                );
+                if !result.failures.is_empty() {
+                    for failure in result.failures {
+                        println!("failed {}: {}", failure.contact, failure.error);
+                    }
+                }
+                Ok(())
+            }
         },
         CommandKind::History {
             profile,
             contact,
+            group,
             limit,
             json,
             clear,
@@ -1513,9 +1670,13 @@ async fn main() -> Result<()> {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
             if clear {
-                clear_history(&profile, contact.as_deref())
+                if group.is_some() {
+                    clear_group_history(&profile, group.as_deref())
+                } else {
+                    clear_history(&profile, contact.as_deref())
+                }
             } else {
-                history(&profile, contact.as_deref(), limit, json)
+                history(&profile, contact.as_deref(), group.as_deref(), limit, json)
             }
         }
         CommandKind::Ratchet { profile, contact } => {
@@ -2695,14 +2856,6 @@ pub(crate) async fn serve(
     // This is the only place that calls handle_inbound — transport is agnostic.
     loop {
         while let Ok(cmd) = control_rx.try_recv() {
-            if cmd.cmd != "send" {
-                println!("control error: unknown cmd '{}'", cmd.cmd);
-                continue;
-            }
-            let Some(to) = cmd.to else {
-                println!("send error: missing to");
-                continue;
-            };
             let Some(message) = cmd.message else {
                 println!("send error: missing message");
                 continue;
@@ -2710,18 +2863,45 @@ pub(crate) async fn serve(
             let profile = profile.to_path_buf();
             let tor_client = tor_client.clone();
             let send_lock = send_lock.clone();
-            tokio::spawn(async move {
-                let _guard = send_lock.lock().await;
-                match resolve_to(&profile, &to) {
-                    Ok(onion) => {
-                        match send(&profile, &onion, &message, &to, None, tor_client, false).await {
-                            Ok(()) => println!("message sent"),
+            match cmd.cmd.as_str() {
+                "send" => {
+                    let Some(to) = cmd.to else {
+                        println!("send error: missing to");
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        let _guard = send_lock.lock().await;
+                        match resolve_to(&profile, &to) {
+                            Ok(onion) => {
+                                match send(&profile, &onion, &message, &to, None, tor_client, false)
+                                    .await
+                                {
+                                    Ok(()) => println!("message sent"),
+                                    Err(e) => println!("send error: {e}"),
+                                }
+                            }
+                            Err(e) => println!("resolve error: {e}"),
+                        }
+                    });
+                }
+                "group_send" => {
+                    let Some(group) = cmd.group else {
+                        println!("send error: missing group");
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        let _guard = send_lock.lock().await;
+                        match send_group(&profile, &group, &message, tor_client, false).await {
+                            Ok(result) => println!(
+                                "group message sent: {} {}/{}",
+                                result.group_title, result.sent, result.total
+                            ),
                             Err(e) => println!("send error: {e}"),
                         }
-                    }
-                    Err(e) => println!("resolve error: {e}"),
+                    });
                 }
-            });
+                other => println!("control error: unknown cmd '{}'", other),
+            }
         }
 
         match (*transport).try_recv().await {
@@ -2785,9 +2965,34 @@ pub(crate) async fn send(
     to: &str,
     message: &str,
     contact_hint: &str,
+    reuse_socks_port: Option<u16>,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+    force_static: bool,
+) -> Result<()> {
+    send_in_conversation(
+        profile,
+        to,
+        message,
+        contact_hint,
+        reuse_socks_port,
+        tor_client,
+        force_static,
+        "contact",
+        contact_hint,
+    )
+    .await
+}
+
+pub(crate) async fn send_in_conversation(
+    profile: &Path,
+    to: &str,
+    message: &str,
+    contact_hint: &str,
     _reuse_socks_port: Option<u16>,
     tor_client: Arc<TorClient<PreferredRuntime>>,
     force_static: bool,
+    conversation_kind: &str,
+    conversation_id: &str,
 ) -> Result<()> {
     if !to.ends_with(".onion") {
         return Err(anyhow!("resolved --to must be an onion address"));
@@ -2910,7 +3115,7 @@ pub(crate) async fn send(
     }
 
     // Store outbound in DB.
-    if let Err(e) = store_message(
+    if let Err(e) = store_message_for_conversation(
         profile,
         "out",
         contact_hint,
@@ -2918,6 +3123,8 @@ pub(crate) async fn send(
         message,
         msg.timestamp_ms,
         status,
+        conversation_kind,
+        conversation_id,
     ) {
         error!(error=%e, "failed to store outbound message");
     }
@@ -2937,8 +3144,18 @@ pub(crate) async fn send(
 // History
 // ---------------------------------------------------------------------------
 
-fn history(profile: &Path, contact: Option<&str>, limit: usize, json: bool) -> Result<()> {
-    let rows = load_history(profile, contact, limit)?;
+fn history(
+    profile: &Path,
+    contact: Option<&str>,
+    group: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let rows = if let Some(group) = group {
+        load_group_history(profile, group, limit)?
+    } else {
+        load_history(profile, contact, limit)?
+    };
     if json {
         println!("{}", serde_json::to_string(&rows)?);
         return Ok(());
@@ -3095,6 +3312,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = create_group(dir.path(), "Ops", &["ghost".into()]).unwrap_err();
         assert!(err.to_string().contains("unknown group member"));
+    }
+
+    #[test]
+    fn group_history_filters_by_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+        let group = create_group(dir.path(), "Ops", &["alice".into()]).unwrap();
+        store_message_for_conversation(
+            dir.path(),
+            "out",
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            "ops hello",
+            42,
+            DeliveryStatus::Sent,
+            "group",
+            &group.id,
+        )
+        .unwrap();
+        store_message(
+            dir.path(),
+            "out",
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            "direct hello",
+            43,
+            DeliveryStatus::Sent,
+        )
+        .unwrap();
+
+        let group_rows = load_group_history(dir.path(), "Ops", 10).unwrap();
+        assert_eq!(group_rows.len(), 1);
+        assert_eq!(group_rows[0].body, "ops hello");
+        assert_eq!(group_rows[0].conversation_kind, "group");
+        assert_eq!(group_rows[0].conversation_id, group.id);
+
+        let contact_rows = load_history(dir.path(), Some("alice"), 10).unwrap();
+        assert_eq!(contact_rows.len(), 1);
+        assert_eq!(contact_rows[0].body, "direct hello");
+    }
+
+    #[test]
+    fn resolve_group_rejects_ambiguous_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+        let first = create_group(dir.path(), "Ops", &["alice".into()]).unwrap();
+        let _second = create_group(dir.path(), "Ops", &["alice".into()]).unwrap();
+
+        assert_eq!(resolve_group(dir.path(), &first.id).unwrap().id, first.id);
+        assert!(resolve_group(dir.path(), "Ops")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
     }
 
     #[test]

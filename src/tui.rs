@@ -34,6 +34,7 @@ use crate::TuiEvent;
 #[derive(Debug)]
 pub struct SendCommand {
     pub contact: String,
+    pub group: Option<String>,
     pub message: String,
 }
 
@@ -143,8 +144,18 @@ impl App {
                         return false;
                     }
                     let contact = parts[1].to_string();
-                    let message = parts[2].to_string();
+                    let message = parts[2..].join(" ");
                     self.do_send(&contact, &message);
+                    return false;
+                }
+                Some("group") => {
+                    if parts.len() < 3 {
+                        self.push_sys("usage: /group <id-or-title> <message>", "error");
+                        return false;
+                    }
+                    let group = parts[1].to_string();
+                    let message = parts[2..].join(" ");
+                    self.do_send_group(&group, &message);
                     return false;
                 }
                 Some("file") => {
@@ -164,6 +175,14 @@ impl App {
                 Some("history") => {
                     let contact = parts.get(1).copied();
                     self.show_history(contact);
+                    return false;
+                }
+                Some("history-group") => {
+                    let Some(group) = parts.get(1).copied() else {
+                        self.push_sys("usage: /history-group <id-or-title>", "error");
+                        return false;
+                    };
+                    self.show_group_history(group);
                     return false;
                 }
                 Some("groups") => {
@@ -190,7 +209,7 @@ impl App {
                 }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send message\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
                         "help",
                     );
                     return false;
@@ -473,7 +492,12 @@ impl App {
             }
         }
 
-        // Plain text — send to selected contact.
+        // Plain text — send to selected contact or group.
+        if let Some(group_id) = self.selected_group_id() {
+            self.do_send_group(&group_id, &raw);
+            self.input.clear();
+            return false;
+        }
         if self.contacts.is_empty()
             || (self.contacts.len() == 1 && self.contacts[0] == "(no contacts)")
         {
@@ -488,7 +512,9 @@ impl App {
             self.input.clear();
             return false;
         }
-        let contact = self.contacts[self.selected_contact].clone();
+        let contact = self
+            .selected_contact_name()
+            .unwrap_or_else(|| self.contacts[self.selected_contact].clone());
         self.do_send(&contact, &raw);
         self.input.clear();
         false
@@ -518,9 +544,37 @@ impl App {
         }
     }
 
+    fn sendable_contact_count(&self) -> usize {
+        if self.contacts.len() == 1 && self.contacts[0] == "(no contacts)" {
+            0
+        } else {
+            self.contacts.len()
+        }
+    }
+
+    fn conversation_count(&self) -> usize {
+        self.sendable_contact_count() + self.groups.len()
+    }
+
+    fn selected_contact_name(&self) -> Option<String> {
+        if self.selected_contact < self.sendable_contact_count() {
+            Some(self.contacts[self.selected_contact].clone())
+        } else {
+            None
+        }
+    }
+
+    fn selected_group_id(&self) -> Option<String> {
+        let idx = self
+            .selected_contact
+            .checked_sub(self.sendable_contact_count())?;
+        self.groups.get(idx).map(|g| g.id.clone())
+    }
+
     fn do_send(&mut self, contact: &str, message: &str) {
         let _ = self.send_tx.try_send(SendCommand {
             contact: contact.to_string(),
+            group: None,
             message: message.to_string(),
         });
         let ts = std::time::SystemTime::now()
@@ -530,6 +584,32 @@ impl App {
         self.messages.push(DisplayMessage {
             direction: "out".into(),
             contact: contact.to_string(),
+            body: message.to_string(),
+            _timestamp_ms: ts,
+            status: "sending".into(),
+            pending: true,
+        });
+    }
+
+    fn do_send_group(&mut self, group: &str, message: &str) {
+        let label = self
+            .groups
+            .iter()
+            .find(|g| g.id == group || g.title == group)
+            .map(|g| g.title.clone())
+            .unwrap_or_else(|| group.to_string());
+        let _ = self.send_tx.try_send(SendCommand {
+            contact: label.clone(),
+            group: Some(group.to_string()),
+            message: message.to_string(),
+        });
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        self.messages.push(DisplayMessage {
+            direction: "out".into(),
+            contact: label,
             body: message.to_string(),
             _timestamp_ms: ts,
             status: "sending".into(),
@@ -554,6 +634,31 @@ impl App {
             status: "sending".into(),
             pending: true,
         });
+    }
+
+    fn show_group_history(&mut self, group: &str) {
+        match crate::load_group_history(&self.profile, group, 20) {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    self.push_sys("(no group messages)", "info");
+                } else {
+                    for r in rows.into_iter().rev() {
+                        let status_label = crate::DeliveryStatus::from_i64(r.status)
+                            .map(|s| s.label())
+                            .unwrap_or("?");
+                        self.messages.push(DisplayMessage {
+                            direction: r.direction,
+                            contact: r.contact,
+                            body: r.body,
+                            _timestamp_ms: r.timestamp_ms as u128,
+                            status: status_label.into(),
+                            pending: false,
+                        });
+                    }
+                }
+            }
+            Err(e) => self.push_sys(&format!("group history error: {}", e), "error"),
+        }
     }
 
     fn show_history(&mut self, contact: Option<&str>) {
@@ -770,7 +875,46 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
             tokio::spawn(async move {
                 let _guard = send_lock.lock().await;
                 let contact = cmd.contact.clone();
+                let group = cmd.group.clone();
                 let message = cmd.message.clone();
+                if let Some(group) = group {
+                    match crate::send_group(&profile, &group, &message, Arc::clone(&tor), false)
+                        .await
+                    {
+                        Ok(result) => {
+                            let status = if result.failures.is_empty() {
+                                crate::DeliveryStatus::Sent
+                            } else {
+                                crate::DeliveryStatus::Failed
+                            };
+                            let _ = tui_tx
+                                .send(TuiEvent::OutboundMessage {
+                                    contact: result.group_title,
+                                    body: message,
+                                    timestamp_ms: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis())
+                                        .unwrap_or(0),
+                                    status,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tui_tx
+                                .send(TuiEvent::StatusUpdate(format!("send error: {e}")))
+                                .await;
+                            let _ = tui_tx
+                                .send(TuiEvent::OutboundMessage {
+                                    contact,
+                                    body: message,
+                                    timestamp_ms: 0,
+                                    status: crate::DeliveryStatus::Failed,
+                                })
+                                .await;
+                        }
+                    }
+                    return;
+                }
                 let onion = match crate::resolve_to(&profile, &contact) {
                     Ok(o) => o,
                     Err(e) => {
@@ -910,9 +1054,9 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
                             app.input.clear();
                         }
                         KeyCode::Tab => {
-                            if !app.contacts.is_empty() {
-                                app.selected_contact =
-                                    (app.selected_contact + 1) % app.contacts.len();
+                            let count = app.conversation_count();
+                            if count > 0 {
+                                app.selected_contact = (app.selected_contact + 1) % count;
                             }
                         }
                         KeyCode::Up => {
@@ -921,9 +1065,8 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
                             }
                         }
                         KeyCode::Down => {
-                            if !app.contacts.is_empty()
-                                && app.selected_contact < app.contacts.len() - 1
-                            {
+                            let count = app.conversation_count();
+                            if count > 0 && app.selected_contact < count - 1 {
                                 app.selected_contact += 1;
                             }
                         }
@@ -1094,6 +1237,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 fn draw_contacts(f: &mut Frame, area: Rect, app: &App) {
     let rows = sidebar_items(&app.contacts, &app.groups);
     let contact_row_offset = 1;
+    let sendable_contacts = app.sendable_contact_count();
     let group_header_index = if app.groups.is_empty() {
         None
     } else {
@@ -1121,11 +1265,19 @@ fn draw_contacts(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!("  {}", label)
             };
+            let group_index = group_header_index
+                .and_then(|header| i.checked_sub(header + 1))
+                .filter(|idx| *idx < app.groups.len());
+            let selected_group = group_index
+                .map(|idx| app.selected_contact == sendable_contacts + idx)
+                .unwrap_or(false);
+            let selected_contact = contact_index == Some(app.selected_contact)
+                && app.selected_contact < sendable_contacts;
             let style = if is_header {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
-            } else if contact_index == Some(app.selected_contact) {
+            } else if selected_contact || selected_group {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -1199,11 +1351,13 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
-    let selected = if app.contacts.is_empty() || app.contacts[0] == "(no contacts)" {
-        None
-    } else {
-        Some(app.contacts[app.selected_contact].as_str())
-    };
+    let selected = app.selected_contact_name();
+    let selected_group = app.selected_group_id().and_then(|id| {
+        app.groups
+            .iter()
+            .find(|g| g.id == id)
+            .map(|g| g.title.clone())
+    });
 
     let visible: Vec<&DisplayMessage> = app
         .messages
@@ -1212,9 +1366,12 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
             if m.direction != "in" && m.direction != "out" {
                 return true; // keep system/status lines visible
             }
-            match selected {
-                Some(name) => m.contact == name,
-                None => true,
+            match &selected {
+                Some(name) => m.contact == *name,
+                None => selected_group
+                    .as_ref()
+                    .map(|g| m.contact == *g)
+                    .unwrap_or(true),
             }
         })
         .collect();
