@@ -6,7 +6,7 @@ edition = "2021"
 [lib]
 name = "sideband"
 crate-type = ["cdylib", "rlib"]
-path = "src/main.rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "sideband"
