@@ -60,9 +60,8 @@ if [[ ! -x "${BUILD_DIR}/sideband_gui" ]]; then
 fi
 log "Flutter bundle ready at ${BUILD_DIR}/sideband_gui"
 
-# Step 2: Install linuxdeploy + Flutter plugin if needed
+# Step 2: Install linuxdeploy if needed
 LINUXDEPLOY="${HOME}/.local/bin/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
-PLUGIN="${HOME}/.local/bin/linuxdeploy-plugin-flutter-${APPIMAGE_ARCH}.AppImage"
 
 mkdir -p "${HOME}/.local/bin"
 
@@ -72,14 +71,6 @@ if [[ ! -x "${LINUXDEPLOY}" ]]; then
         "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
     chmod +x "${LINUXDEPLOY}"
 fi
-
-if [[ ! -x "${PLUGIN}" ]]; then
-    log "Downloading linuxdeploy Flutter plugin..."
-    wget -q -O "${PLUGIN}" \
-        "https://github.com/linuxdeploy/linuxdeploy-plugin-flutter/releases/download/continuous/linuxdeploy-plugin-flutter-${APPIMAGE_ARCH}.AppImage"
-    chmod +x "${PLUGIN}"
-fi
-ln -sf "${PLUGIN}" "${HOME}/.local/bin/linuxdeploy-plugin-flutter"
 export PATH="${HOME}/.local/bin:${PATH}"
 
 # Step 3: Generate PNG icons from SVG (requires imagemagick or inkscape)
@@ -180,7 +171,6 @@ cd "${SCRIPT_DIR}"
 
 APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --appdir "${APPDIR}" \
-    --plugin flutter \
     --executable "${APPDIR}/usr/bin/sideband_gui" \
     --desktop-file "${APPDIR}/usr/share/applications/sideband_gui.desktop" \
     --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg" \
