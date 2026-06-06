@@ -1382,7 +1382,7 @@ class _ChatScreenState extends State<_ChatScreen> {
 
           return Row(
             children: [
-              SizedBox(width: 260, child: _sidebar()),
+              SizedBox(width: 320, child: _sidebar()),
               Container(width: 1, color: _border),
               Expanded(child: _sel == null ? _empty() : _chat()),
             ],
