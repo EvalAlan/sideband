@@ -30,6 +30,17 @@ void main() {
     expect(contact.securityLabel, 'Static key');
   });
 
+  test('group label shows title and member count', () {
+    const group = GroupInfo(
+      id: 'g1',
+      title: 'Ops',
+      members: ['alice', 'bob'],
+    );
+
+    expect(group.sidebarLabel, 'Ops');
+    expect(group.memberSummary, '2 members');
+  });
+
   testWidgets('app boot does not crash', (WidgetTester tester) async {
     await tester.pumpWidget(const SidebandApp());
     await tester.pump(const Duration(milliseconds: 500));

@@ -158,6 +158,22 @@ class Contact {
   }
 }
 
+class GroupInfo {
+  const GroupInfo({
+    required this.id,
+    required this.title,
+    required this.members,
+  });
+
+  final String id;
+  final String title;
+  final List<String> members;
+
+  String get sidebarLabel => title.trim().isEmpty ? id : title;
+  String get memberSummary => members.length == 1 ? '1 member' : '${members.length} members';
+  String get details => '$sidebarLabel\nid=$id\nmembers=${members.join(', ')}';
+}
+
 class ChatMsg {
   const ChatMsg({
     required this.id,
@@ -343,6 +359,37 @@ class _Cli {
     return parsed;
   }
 
+  Future<List<GroupInfo>> groups() async {
+    final raw = await _run(['group', 'list', '--profile', profile, '--json']);
+    if (raw.isEmpty) return [];
+
+    final decoded = jsonDecode(raw);
+    if (decoded is! List) {
+      throw Exception('group list JSON was not a list');
+    }
+
+    final parsed = <GroupInfo>[];
+    for (final item in decoded) {
+      if (item is! Map) continue;
+      final members = <String>[];
+      final rawMembers = item['members'];
+      if (rawMembers is List) {
+        for (final member in rawMembers) {
+          if (member is Map && member['contact'] != null) {
+            members.add(member['contact'].toString());
+          }
+        }
+      }
+      parsed.add(GroupInfo(
+        id: item['id'].toString(),
+        title: item['title'].toString(),
+        members: members,
+      ));
+    }
+    parsed.sort((a, b) => a.sidebarLabel.compareTo(b.sidebarLabel));
+    return parsed;
+  }
+
   Future<_History> history({String? contact, int limit = 80}) async {
     final args = ['history', '--profile', profile, '--limit', '$limit', '--json'];
     if (contact != null && contact.trim().isNotEmpty) {
@@ -438,6 +485,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   final _scroll = ScrollController();
 
   List<Contact> _contacts = [];
+  List<GroupInfo> _groups = [];
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -732,6 +780,7 @@ class _ChatScreenState extends State<_ChatScreen> {
     });
     try {
       final c = await _cli.contacts();
+      final g = await _cli.groups();
       var s = _sel;
       if (s == null && c.isNotEmpty) {
         s = c.first;
@@ -742,6 +791,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       final h = await _historyVisibleFor(s?.name);
       setState(() {
         _contacts = c;
+        _groups = g;
         _sel = s;
         _msgs = _mergePending(h.msgs);
         _loading = false;
@@ -877,7 +927,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       switch (cmd) {
         case 'help':
           _showInfo('Slash commands',
-              '/send <contact> <msg>\n/history [contact]\n/contacts\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
+              '/send <contact> <msg>\n/history [contact]\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
           return;
         case 'send':
           if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
@@ -906,6 +956,14 @@ class _ChatScreenState extends State<_ChatScreen> {
                       .map((c) =>
                           '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}')
                       .join('\n\n'));
+          return;
+        case 'groups':
+          await _load();
+          _showInfo(
+              'Groups',
+              _groups.isEmpty
+                  ? '(no groups)'
+                  : _groups.map((g) => g.details).join('\n\n'));
           return;
         case 'add':
           if (parts.length < 5) {
@@ -959,7 +1017,7 @@ class _ChatScreenState extends State<_ChatScreen> {
           return;
         case 'status':
           _showInfo('Status',
-              'listener: $_listenerStatus\nprofile: ${_cli.profile}\nbinary: ${_cli.bin}\ncontacts: ${_contacts.length}\nmessages visible: ${_msgs.length}');
+              'listener: $_listenerStatus\nprofile: ${_cli.profile}\nbinary: ${_cli.bin}\ncontacts: ${_contacts.length}\ngroups: ${_groups.length}\nmessages visible: ${_msgs.length}');
           return;
         case 'clear':
           setState(() => _msgs = []);
@@ -1478,7 +1536,7 @@ class _ChatScreenState extends State<_ChatScreen> {
           Expanded(
             child: _error != null && _contacts.isEmpty
                 ? _sidebarError()
-                : _contacts.isEmpty
+                : _contacts.isEmpty && _groups.isEmpty
                     ? Center(
                         child: Padding(
                           padding: const EdgeInsets.all(24),
@@ -1492,8 +1550,46 @@ class _ChatScreenState extends State<_ChatScreen> {
                       )
                     : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 6),
-                    itemCount: _contacts.length,
+                    itemCount: _contacts.length + (_groups.isEmpty ? 0 : _groups.length + 1),
                     itemBuilder: (_, i) {
+                      if (i >= _contacts.length) {
+                        if (i == _contacts.length) {
+                          return const Padding(
+                            padding: EdgeInsets.fromLTRB(14, 14, 14, 6),
+                            child: Text('Groups',
+                                style: TextStyle(
+                                    color: _teal,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700)),
+                          );
+                        }
+                        final g = _groups[i - _contacts.length - 1];
+                        return ListTile(
+                          leading: const CircleAvatar(
+                            radius: 17,
+                            backgroundColor: _surface2,
+                            child: Icon(Icons.groups, size: 17, color: _teal),
+                          ),
+                          title: Text(g.sidebarLabel,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  fontSize: 13.5,
+                                  fontWeight: FontWeight.w500,
+                                  color: _text)),
+                          subtitle: Text(g.memberSummary,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 10.5, color: _textDim)),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.info_outline, size: 17),
+                            tooltip: 'Group details',
+                            onPressed: () => _showInfo('Group details', g.details),
+                          ),
+                          onTap: () => _showInfo('Group chat',
+                              '${g.sidebarLabel}\n\nGroup messaging is not wired yet. This is visibility only, because pretending otherwise would be how bugs breed.'),
+                        );
+                      }
                       final c = _contacts[i];
                       final on = _sel?.name == c.name;
                       return GestureDetector(

@@ -245,18 +245,18 @@ pub(crate) type ContactsMap = HashMap<String, ContactFile>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct GroupMember {
-    contact: String,
-    role: String,
-    added_at_ms: i64,
+    pub(crate) contact: String,
+    pub(crate) role: String,
+    pub(crate) added_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct GroupInfo {
-    id: String,
-    title: String,
-    created_at_ms: i64,
-    updated_at_ms: i64,
-    members: Vec<GroupMember>,
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) created_at_ms: i64,
+    pub(crate) updated_at_ms: i64,
+    pub(crate) members: Vec<GroupMember>,
 }
 
 /// Chat message format (v1 = signed plaintext, v2 = signed + encrypted, v3 = double ratchet).

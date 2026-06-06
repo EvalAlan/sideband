@@ -49,6 +49,7 @@ pub struct FileCommand {
 
 struct App {
     contacts: Vec<String>,
+    groups: Vec<crate::GroupInfo>,
     selected_contact: usize,
     messages: Vec<DisplayMessage>,
     input: String,
@@ -97,6 +98,7 @@ impl App {
         });
         Self {
             contacts,
+            groups: crate::load_groups(&profile).unwrap_or_default(),
             selected_contact: 0,
             messages: Vec::new(),
             input: String::new(),
@@ -164,9 +166,31 @@ impl App {
                     self.show_history(contact);
                     return false;
                 }
+                Some("groups") => {
+                    self.groups = crate::load_groups(&self.profile).unwrap_or_default();
+                    let list = if self.groups.is_empty() {
+                        "(no groups)".to_string()
+                    } else {
+                        self.groups
+                            .iter()
+                            .map(|g| {
+                                let members = g
+                                    .members
+                                    .iter()
+                                    .map(|m| m.contact.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("{}  id={}  members={}", g.title, g.id, members)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    self.push_sys(&format!("groups:\n{}", list), "info");
+                    return false;
+                }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send message\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/contacts — list contacts with keys\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send message\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
                         "help",
                     );
                     return false;
@@ -953,6 +977,46 @@ fn load_contact_names(profile: &Path) -> Vec<String> {
     names
 }
 
+fn sidebar_items(contacts: &[String], groups: &[crate::GroupInfo]) -> Vec<String> {
+    let mut items = vec!["Contacts".to_string()];
+    items.extend(contacts.iter().cloned());
+    if !groups.is_empty() {
+        items.push("Groups".to_string());
+        items.extend(
+            groups
+                .iter()
+                .map(|g| format!("👥 {} ({})", g.title, g.members.len())),
+        );
+    }
+    items
+}
+
+#[cfg(test)]
+mod group_sidebar_tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_items_include_group_section() {
+        let groups = vec![crate::GroupInfo {
+            id: "g1".to_string(),
+            title: "Ops".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            members: vec![crate::GroupMember {
+                contact: "alice".to_string(),
+                role: "member".to_string(),
+                added_at_ms: 1,
+            }],
+        }];
+
+        let items = sidebar_items(&["alice".to_string()], &groups);
+
+        assert!(items.iter().any(|item| item == "Contacts"));
+        assert!(items.iter().any(|item| item == "Groups"));
+        assert!(items.iter().any(|item| item == "👥 Ops (1)"));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
@@ -1028,23 +1092,46 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_contacts(f: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app
-        .contacts
+    let rows = sidebar_items(&app.contacts, &app.groups);
+    let contact_row_offset = 1;
+    let group_header_index = if app.groups.is_empty() {
+        None
+    } else {
+        Some(contact_row_offset + app.contacts.len())
+    };
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, name)| {
-            let ratchet_active =
-                crate::RatchetState::path(&app.profile, std::path::Path::new(name)).exists();
-            let display = if ratchet_active && name != "(no contacts)" {
-                format!("🔒 {}", name)
+        .map(|(i, label)| {
+            let is_header = i == 0 || group_header_index == Some(i);
+            let contact_index = i
+                .checked_sub(contact_row_offset)
+                .filter(|idx| *idx < app.contacts.len());
+            let display = if let Some(idx) = contact_index {
+                let name = &app.contacts[idx];
+                let ratchet_active =
+                    crate::RatchetState::path(&app.profile, std::path::Path::new(name)).exists();
+                if ratchet_active && name != "(no contacts)" {
+                    format!("  🔒 {}", name)
+                } else {
+                    format!("  {}", name)
+                }
+            } else if is_header {
+                label.clone()
             } else {
-                name.clone()
+                format!("  {}", label)
             };
-            let style = if i == app.selected_contact {
+            let style = if is_header {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if contact_index == Some(app.selected_contact) {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else if contact_index.is_none() {
+                Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -1054,15 +1141,11 @@ fn draw_contacts(f: &mut Frame, area: Rect, app: &App) {
 
     let widget = List::new(items).block(
         Block::default()
-            .title("Contacts")
+            .title("Contacts / Groups")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
-    f.render_stateful_widget(
-        widget,
-        area,
-        &mut ListState::default().with_selected(Some(app.selected_contact)),
-    );
+    f.render_widget(widget, area);
 }
 
 fn chat_scroll_position(
