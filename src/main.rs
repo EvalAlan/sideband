@@ -122,6 +122,10 @@ enum CommandKind {
         #[command(subcommand)]
         action: ContactAction,
     },
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
     History {
         #[command(flatten)]
         profile: ProfileArg,
@@ -177,6 +181,30 @@ enum ContactAction {
         #[command(flatten)]
         profile: ProfileArg,
         /// Emit machine-readable JSON instead of tab-separated text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GroupAction {
+    Create {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Human-readable group title.
+        #[arg(long)]
+        title: String,
+        /// Contact name to include. Repeat --member for multiple contacts.
+        #[arg(long = "member")]
+        members: Vec<String>,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Emit machine-readable JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -1425,6 +1453,54 @@ async fn main() -> Result<()> {
                 let profile = profile.path()?;
                 ensure_profile(&profile)?;
                 contact_list(&profile, json)
+            }
+        },
+        CommandKind::Group { action } => match action {
+            GroupAction::Create {
+                profile,
+                title,
+                members,
+                json,
+            } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let group = create_group(&profile, &title, &members)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&group)?);
+                } else {
+                    println!("group '{}' created ({})", group.title, group.id);
+                    println!(
+                        "members: {}",
+                        group
+                            .members
+                            .iter()
+                            .map(|m| m.contact.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                Ok(())
+            }
+            GroupAction::List { profile, json } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let groups = load_groups(&profile)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&groups)?);
+                } else if groups.is_empty() {
+                    println!("(no groups)");
+                } else {
+                    for group in groups {
+                        let members = group
+                            .members
+                            .iter()
+                            .map(|m| m.contact.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("{}\t{}\t{}", group.id, group.title, members);
+                    }
+                }
+                Ok(())
             }
         },
         CommandKind::History {

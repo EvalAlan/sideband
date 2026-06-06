@@ -58,6 +58,9 @@ jobs:
       - name: Enable Flutter Linux desktop
         run: flutter config --enable-linux-desktop
 
+      - name: Check Rust warnings
+        run: RUSTFLAGS='-D warnings' cargo check --bin sideband
+
       - name: Test Rust backend
         run: cargo test --quiet
 
