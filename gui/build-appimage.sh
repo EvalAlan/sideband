@@ -83,6 +83,7 @@ if [[ ! -f "${ICON_SVG}" ]]; then
 fi
 
 log "Generating PNG icons from SVG..."
+rm -rf "${APPDIR}"
 for size in 16 32 48 64 128 256 512; do
     mkdir -p "${ICON_DIR}/${size}x${size}/apps"
     if command -v magick >/dev/null 2>&1; then
@@ -104,7 +105,6 @@ cp "${ICON_SVG}" "${ICON_DIR}/scalable/apps/sideband_gui.svg"
 
 # Step 4: Create AppDir structure
 log "Creating AppDir..."
-rm -rf "${APPDIR}"
 mkdir -p "${APPDIR}/usr/bin"
 mkdir -p "${APPDIR}/usr/share/applications"
 mkdir -p "${APPDIR}/usr/share/metainfo"
