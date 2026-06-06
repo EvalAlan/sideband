@@ -6,7 +6,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build/linux/x64/release/bundle"
+MACHINE_ARCH="$(uname -m)"
+case "${MACHINE_ARCH}" in
+    x86_64|amd64)
+        FLUTTER_ARCH="x64"
+        APPIMAGE_ARCH="x86_64"
+        ;;
+    aarch64|arm64)
+        FLUTTER_ARCH="arm64"
+        APPIMAGE_ARCH="aarch64"
+        ;;
+    *)
+        echo "Unsupported AppImage architecture: ${MACHINE_ARCH}" >&2
+        exit 1
+        ;;
+esac
+BUILD_DIR="${SCRIPT_DIR}/build/linux/${FLUTTER_ARCH}/release/bundle"
 APPDIR="${SCRIPT_DIR}/AppDir"
 OUTPUT_DIR="${REPO_ROOT}/dist"
 
@@ -42,24 +57,26 @@ fi
 log "Flutter bundle ready at ${BUILD_DIR}/sideband_gui"
 
 # Step 2: Install linuxdeploy + Flutter plugin if needed
-LINUXDEPLOY="${HOME}/.local/bin/linuxdeploy-x86_64.AppImage"
-PLUGIN="${HOME}/.local/bin/linuxdeploy-plugin-flutter-x86_64.AppImage"
+LINUXDEPLOY="${HOME}/.local/bin/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
+PLUGIN="${HOME}/.local/bin/linuxdeploy-plugin-flutter-${APPIMAGE_ARCH}.AppImage"
 
 mkdir -p "${HOME}/.local/bin"
 
 if [[ ! -x "${LINUXDEPLOY}" ]]; then
     log "Downloading linuxdeploy..."
     wget -q -O "${LINUXDEPLOY}" \
-        "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+        "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
     chmod +x "${LINUXDEPLOY}"
 fi
 
 if [[ ! -x "${PLUGIN}" ]]; then
     log "Downloading linuxdeploy Flutter plugin..."
     wget -q -O "${PLUGIN}" \
-        "https://github.com/linuxdeploy/linuxdeploy-plugin-flutter/releases/download/continuous/linuxdeploy-plugin-flutter-x86_64.AppImage"
+        "https://github.com/linuxdeploy/linuxdeploy-plugin-flutter/releases/download/continuous/linuxdeploy-plugin-flutter-${APPIMAGE_ARCH}.AppImage"
     chmod +x "${PLUGIN}"
 fi
+ln -sf "${PLUGIN}" "${HOME}/.local/bin/linuxdeploy-plugin-flutter"
+export PATH="${HOME}/.local/bin:${PATH}"
 
 # Step 3: Generate PNG icons from SVG (requires imagemagick or inkscape)
 ICON_SVG="${SCRIPT_DIR}/linux/icons/sideband_gui.svg"
@@ -99,6 +116,7 @@ mkdir -p "${APPDIR}/usr/share/metainfo"
 
 # Copy Flutter bundle
 cp -r "${BUILD_DIR}/." "${APPDIR}/usr/bin/"
+mv "${APPDIR}/usr/bin/sideband_gui" "${APPDIR}/usr/bin/sideband_gui.bin"
 
 # Create wrapper script that sets up environment
 cat > "${APPDIR}/usr/bin/sideband_gui" <<'WRAPPER'
@@ -107,7 +125,7 @@ cat > "${APPDIR}/usr/bin/sideband_gui" <<'WRAPPER'
 HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 export LD_LIBRARY_PATH="${HERE}/lib:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${HERE}/../share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-exec "${HERE}/sideband_gui" "$@"
+exec "${HERE}/sideband_gui.bin" "$@"
 WRAPPER
 chmod +x "${APPDIR}/usr/bin/sideband_gui"
 
@@ -154,14 +172,13 @@ mkdir -p "${OUTPUT_DIR}"
 
 cd "${SCRIPT_DIR}"
 
-"${LINUXDEPLOY}" \
+APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --appdir "${APPDIR}" \
     --plugin flutter \
     --executable "${APPDIR}/usr/bin/sideband_gui" \
     --desktop-file "${APPDIR}/usr/share/applications/sideband_gui.desktop" \
     --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg" \
-    --output appimage \
-    --appimage-extract-and-run
+    --output appimage
 
 # Find and move the generated AppImage
 APPIMAGE=$(find "${SCRIPT_DIR}" -maxdepth 1 -name "*.AppImage" -type f | head -1)
