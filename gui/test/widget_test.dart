@@ -41,6 +41,16 @@ void main() {
     expect(group.memberSummary, '2 members');
   });
 
+
+  test('known empty contact history does not fall back to global history', () {
+    expect(shouldFallbackToGlobalHistory(
+      groupSelected: false,
+      filteredHistoryEmpty: true,
+      contact: 'alice',
+      knownContacts: const ['alice', 'bob'],
+    ), isFalse);
+  });
+
   testWidgets('app boot does not crash', (WidgetTester tester) async {
     await tester.pumpWidget(const SidebandApp());
     await tester.pump(const Duration(milliseconds: 500));

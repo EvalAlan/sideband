@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -68,6 +69,7 @@ struct App {
     scroll_offset: usize,
     last_error: Option<String>,
     error_until: Option<Instant>,
+    unread_contacts: HashSet<String>,
 }
 
 struct DisplayMessage {
@@ -117,6 +119,7 @@ impl App {
             scroll_offset: 0,
             last_error: None,
             error_until: None,
+            unread_contacts: HashSet::new(),
         }
     }
 
@@ -263,8 +266,7 @@ impl App {
                     match crate::contact_add(&self.profile, &name, &onion, &pubkey, &x25519_pubkey)
                     {
                         Ok(()) => {
-                            self.contacts.push(name.clone());
-                            self.contacts.sort();
+                            self.reload_contacts();
                             self.push_sys(&format!("contact '{}' added", name), "info");
                         }
                         Err(e) => {
@@ -281,12 +283,7 @@ impl App {
                     let name = parts[1].trim().to_string();
                     match crate::contact_delete(&self.profile, &name) {
                         Ok(true) => {
-                            self.contacts.retain(|c| c != &name);
-                            if self.selected_contact >= self.contacts.len()
-                                && !self.contacts.is_empty()
-                            {
-                                self.selected_contact = self.contacts.len() - 1;
-                            }
+                            self.reload_contacts();
                             self.push_sys(&format!("contact '{}' deleted", name), "info");
                         }
                         Ok(false) => {
@@ -544,6 +541,58 @@ impl App {
         }
     }
 
+    fn set_contacts(&mut self, mut contacts: Vec<String>) {
+        contacts.sort();
+        if contacts.is_empty() {
+            contacts.push("(no contacts)".to_string());
+        }
+        self.contacts = contacts;
+        let count = self.conversation_count();
+        if count == 0 {
+            self.selected_contact = 0;
+        } else if self.selected_contact >= count {
+            self.selected_contact = count - 1;
+        }
+        self.unread_contacts
+            .retain(|name| self.contacts.iter().any(|contact| contact == name));
+    }
+
+    fn reload_contacts(&mut self) {
+        self.set_contacts(load_contact_names(&self.profile));
+    }
+
+    fn selected_conversation_changed(&mut self) {
+        if let Some(contact) = self.selected_contact_name() {
+            self.unread_contacts.remove(&contact);
+        }
+        self.scroll_offset = 0;
+    }
+
+    fn record_inbound_message(
+        &mut self,
+        contact: String,
+        body: String,
+        timestamp_ms: u128,
+        verified: bool,
+    ) {
+        if !self.contacts.iter().any(|name| name == &contact) {
+            self.reload_contacts();
+        }
+        if self.selected_contact_name().as_deref() != Some(contact.as_str()) {
+            self.unread_contacts.insert(contact.clone());
+        }
+        let status = if verified { "verified" } else { "UNVERIFIED" };
+        self.messages.push(DisplayMessage {
+            direction: "in".into(),
+            contact,
+            body,
+            _timestamp_ms: timestamp_ms,
+            status: status.into(),
+            pending: false,
+        });
+        self.messages_recv += 1;
+    }
+
     fn sendable_contact_count(&self) -> usize {
         if self.contacts.len() == 1 && self.contacts[0] == "(no contacts)" {
             0
@@ -717,16 +766,7 @@ impl App {
                     timestamp_ms,
                     verified,
                 } => {
-                    let status = if verified { "verified" } else { "UNVERIFIED" };
-                    self.messages.push(DisplayMessage {
-                        direction: "in".into(),
-                        contact,
-                        body,
-                        _timestamp_ms: timestamp_ms,
-                        status: status.into(),
-                        pending: false,
-                    });
-                    self.messages_recv += 1;
+                    self.record_inbound_message(contact, body, timestamp_ms, verified);
                 }
                 TuiEvent::OutboundMessage {
                     contact,
@@ -1057,17 +1097,20 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
                             let count = app.conversation_count();
                             if count > 0 {
                                 app.selected_contact = (app.selected_contact + 1) % count;
+                                app.selected_conversation_changed();
                             }
                         }
                         KeyCode::Up => {
                             if app.selected_contact > 0 {
                                 app.selected_contact -= 1;
+                                app.selected_conversation_changed();
                             }
                         }
                         KeyCode::Down => {
                             let count = app.conversation_count();
                             if count > 0 && app.selected_contact < count - 1 {
                                 app.selected_contact += 1;
+                                app.selected_conversation_changed();
                             }
                         }
                         KeyCode::PageUp => {
@@ -1157,6 +1200,59 @@ mod group_sidebar_tests {
         assert!(items.iter().any(|item| item == "Contacts"));
         assert!(items.iter().any(|item| item == "Groups"));
         assert!(items.iter().any(|item| item == "👥 Ops (1)"));
+    }
+}
+
+#[cfg(test)]
+mod contact_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn adding_first_contact_replaces_no_contacts_placeholder() {
+        let (tui_tx, tui_rx) = mpsc::channel::<TuiEvent>(1);
+        let (send_tx, _send_rx) = mpsc::channel::<SendCommand>(1);
+        let (file_tx, _file_rx) = mpsc::channel::<FileCommand>(1);
+        drop(tui_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            tui_rx,
+            send_tx,
+            file_tx,
+            vec!["(no contacts)".to_string()],
+            quit_tx,
+        );
+
+        app.set_contacts(vec!["alice".to_string()]);
+
+        assert_eq!(app.contacts, vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn inbound_from_unselected_contact_marks_unread_until_selected() {
+        let (tui_tx, tui_rx) = mpsc::channel::<TuiEvent>(1);
+        let (send_tx, _send_rx) = mpsc::channel::<SendCommand>(1);
+        let (file_tx, _file_rx) = mpsc::channel::<FileCommand>(1);
+        drop(tui_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            tui_rx,
+            send_tx,
+            file_tx,
+            vec!["alice".to_string(), "bob".to_string()],
+            quit_tx,
+        );
+        app.selected_contact = 0;
+
+        app.record_inbound_message("bob".to_string(), "yo".to_string(), 1, true);
+
+        assert!(app.unread_contacts.contains("bob"));
+        app.selected_contact = 1;
+        app.selected_conversation_changed();
+        assert!(!app.unread_contacts.contains("bob"));
     }
 }
 
@@ -1255,10 +1351,12 @@ fn draw_contacts(f: &mut Frame, area: Rect, app: &App) {
                 let name = &app.contacts[idx];
                 let ratchet_active =
                     crate::RatchetState::path(&app.profile, std::path::Path::new(name)).exists();
+                let unread = app.unread_contacts.contains(name);
+                let unread_marker = if unread { "● " } else { "" };
                 if ratchet_active && name != "(no contacts)" {
-                    format!("  🔒 {}", name)
+                    format!("  {unread_marker}🔒 {}", name)
                 } else {
-                    format!("  {}", name)
+                    format!("  {unread_marker}{}", name)
                 }
             } else if is_header {
                 label.clone()
@@ -1281,6 +1379,13 @@ fn draw_contacts(f: &mut Frame, area: Rect, app: &App) {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if contact_index
+                .map(|idx| app.unread_contacts.contains(&app.contacts[idx]))
+                .unwrap_or(false)
+            {
+                Style::default()
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else if contact_index.is_none() {
                 Style::default().fg(Color::Yellow)

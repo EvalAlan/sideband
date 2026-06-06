@@ -174,6 +174,18 @@ class GroupInfo {
   String get details => '$sidebarLabel\nid=$id\nmembers=${members.join(', ')}';
 }
 
+bool shouldFallbackToGlobalHistory({
+  required bool groupSelected,
+  required bool filteredHistoryEmpty,
+  required String? contact,
+  required Iterable<String> knownContacts,
+}) {
+  if (groupSelected || !filteredHistoryEmpty) return false;
+  final name = contact?.trim();
+  if (name == null || name.isEmpty) return false;
+  return !knownContacts.contains(name);
+}
+
 class ChatMsg {
   const ChatMsg({
     required this.id,
@@ -801,7 +813,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       } else {
         s = null;
       }
-      final h = await _historyVisibleFor(s?.name, group: sg?.id);
+      final h = await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((c) => c.name));
       setState(() {
         _contacts = c;
         _groups = g;
@@ -819,15 +831,25 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
   }
 
-  Future<_History> _historyVisibleFor(String? contact, {String? group}) async {
+  Future<_History> _historyVisibleFor(
+    String? contact, {
+    String? group,
+    Iterable<String>? knownContacts,
+  }) async {
     final filtered = await _cli.history(contact: contact, group: group);
-    if (group != null || filtered.msgs.isNotEmpty || contact == null || contact.trim().isEmpty) {
+    if (!shouldFallbackToGlobalHistory(
+      groupSelected: group != null,
+      filteredHistoryEmpty: filtered.msgs.isEmpty,
+      contact: contact,
+      knownContacts: knownContacts ?? _contacts.map((c) => c.name),
+    )) {
       return filtered;
     }
 
     // If inbound was stored under a raw pubkey/verified-peer because the local
     // contact record is stale, a strict contact filter hides the only evidence.
-    // Fall back to the global transcript instead of showing a lying empty pane.
+    // Fall back to the global transcript only for unknown/stale contacts. Known
+    // contacts with no history must show an empty pane, not somebody else's mail.
     return _cli.history();
   }
 
