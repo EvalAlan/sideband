@@ -46,6 +46,10 @@ if [[ -z "${FLUTTER}" || ! -x "${FLUTTER}" ]]; then
 fi
 
 # Step 1: Build Flutter Linux release bundle
+log "Building Sideband Rust release binary..."
+cd "${REPO_ROOT}"
+cargo build --release --bin sideband
+
 log "Building Flutter Linux release bundle..."
 cd "${SCRIPT_DIR}"
 "${FLUTTER}" build linux --release
@@ -117,6 +121,8 @@ mkdir -p "${APPDIR}/usr/share/metainfo"
 # Copy Flutter bundle
 cp -r "${BUILD_DIR}/." "${APPDIR}/usr/bin/"
 mv "${APPDIR}/usr/bin/sideband_gui" "${APPDIR}/usr/bin/sideband_gui.bin"
+cp "${REPO_ROOT}/target/release/sideband" "${APPDIR}/usr/bin/sideband"
+chmod +x "${APPDIR}/usr/bin/sideband"
 
 # Create wrapper script that sets up environment
 cat > "${APPDIR}/usr/bin/sideband_gui" <<'WRAPPER'

@@ -182,7 +182,9 @@ class _Cli {
     final env = Platform.environment['SIDEBAND_BIN'];
     if (env != null && env.trim().isNotEmpty) return env;
 
-    const candidates = [
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    final candidates = [
+      '$exeDir/sideband',
       '../target/debug/sideband',
       '../target/release/sideband',
       '../../target/debug/sideband',
