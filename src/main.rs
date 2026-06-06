@@ -215,6 +215,22 @@ struct ContactFile {
 /// On-disk format: name -> ContactFile
 pub(crate) type ContactsMap = HashMap<String, ContactFile>;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct GroupMember {
+    contact: String,
+    role: String,
+    added_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct GroupInfo {
+    id: String,
+    title: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    members: Vec<GroupMember>,
+}
+
 /// Chat message format (v1 = signed plaintext, v2 = signed + encrypted, v3 = double ratchet).
 /// In v2 the `body` field empty on wire, `enc_body` holds ChaCha20-Poly1305 ciphertext.
 /// In v3 `body` and `enc_body` are empty; ratchet_header_b64, ratchet_nonce_hex,
@@ -958,6 +974,25 @@ fn init_db(profile: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_messages_ts
             ON messages(timestamp_ms);
 
+        CREATE TABLE IF NOT EXISTS groups (
+            id            TEXT PRIMARY KEY,
+            title         TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS group_members (
+            group_id    TEXT NOT NULL,
+            contact     TEXT NOT NULL,
+            role        TEXT NOT NULL DEFAULT 'member',
+            added_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (group_id, contact),
+            FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_group_members_contact
+            ON group_members(contact);
+
         CREATE TABLE IF NOT EXISTS outbound_transfers (
             hash            TEXT PRIMARY KEY,
             contact_name    TEXT NOT NULL,
@@ -989,7 +1024,37 @@ fn init_db(profile: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_inbound_transfers_updated
             ON inbound_transfers(updated_at);",
     )?;
+    ensure_message_column(
+        &conn,
+        "conversation_kind",
+        "ALTER TABLE messages ADD COLUMN conversation_kind TEXT NOT NULL DEFAULT 'contact'",
+    )?;
+    ensure_message_column(
+        &conn,
+        "conversation_id",
+        "ALTER TABLE messages ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute(
+        "UPDATE messages SET conversation_id = contact WHERE conversation_id = ''",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_kind, conversation_id)",
+        [],
+    )?;
     Ok(conn)
+}
+
+fn ensure_message_column(conn: &Connection, column: &str, alter_sql: &str) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for col in cols {
+        if col? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(alter_sql, [])?;
+    Ok(())
 }
 
 pub(crate) fn store_message(
@@ -1001,17 +1066,43 @@ pub(crate) fn store_message(
     timestamp_ms: u128,
     status: DeliveryStatus,
 ) -> Result<()> {
+    store_message_for_conversation(
+        profile,
+        direction,
+        contact,
+        onion,
+        body,
+        timestamp_ms,
+        status,
+        "contact",
+        contact,
+    )
+}
+
+pub(crate) fn store_message_for_conversation(
+    profile: &Path,
+    direction: &str,
+    contact: &str,
+    onion: &str,
+    body: &str,
+    timestamp_ms: u128,
+    status: DeliveryStatus,
+    conversation_kind: &str,
+    conversation_id: &str,
+) -> Result<()> {
     let conn = init_db(profile)?;
     conn.execute(
-        "INSERT INTO messages (direction, contact, onion, body, timestamp_ms, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO messages (direction, contact, onion, body, timestamp_ms, status, conversation_kind, conversation_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             direction,
             contact,
             onion,
             body,
             timestamp_ms as i64,
-            status.as_i64()
+            status.as_i64(),
+            conversation_kind,
+            conversation_id,
         ],
     )?;
     Ok(())
@@ -1028,6 +1119,8 @@ pub(crate) struct HistoryRow {
     timestamp_ms: i64,
     status: i64,
     created_at: String,
+    conversation_kind: String,
+    conversation_id: String,
 }
 
 pub(crate) fn load_history(
@@ -1039,23 +1132,12 @@ pub(crate) fn load_history(
 
     if let Some(c) = contact_filter {
         let mut stmt = conn.prepare(
-            "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at
+            "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at, conversation_kind, conversation_id
              FROM messages
              WHERE contact = ?1
              ORDER BY timestamp_ms DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![c, limit as i64], |r| {
-            Ok(HistoryRow {
-                id: r.get(0)?,
-                direction: r.get(1)?,
-                contact: r.get(2)?,
-                onion: r.get(3)?,
-                body: r.get(4)?,
-                timestamp_ms: r.get(5)?,
-                status: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![c, limit as i64], history_row_from_sql)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1063,28 +1145,141 @@ pub(crate) fn load_history(
         Ok(out)
     } else {
         let mut stmt = conn.prepare(
-            "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at
+            "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at, conversation_kind, conversation_id
              FROM messages
              ORDER BY timestamp_ms DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
-            Ok(HistoryRow {
-                id: r.get(0)?,
-                direction: r.get(1)?,
-                contact: r.get(2)?,
-                onion: r.get(3)?,
-                body: r.get(4)?,
-                timestamp_ms: r.get(5)?,
-                status: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![limit as i64], history_row_from_sql)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
         }
         Ok(out)
     }
+}
+
+fn history_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
+    Ok(HistoryRow {
+        id: r.get(0)?,
+        direction: r.get(1)?,
+        contact: r.get(2)?,
+        onion: r.get(3)?,
+        body: r.get(4)?,
+        timestamp_ms: r.get(5)?,
+        status: r.get(6)?,
+        created_at: r.get(7)?,
+        conversation_kind: r.get(8)?,
+        conversation_id: r.get(9)?,
+    })
+}
+
+fn now_ms_i64() -> Result<i64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
+}
+
+fn generate_group_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    hex::encode(bytes)
+}
+
+pub(crate) fn create_group(profile: &Path, title: &str, members: &[String]) -> Result<GroupInfo> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(anyhow!("group title is required"));
+    }
+    if members.is_empty() {
+        return Err(anyhow!("group requires at least one member"));
+    }
+
+    let contacts = load_contacts(profile)?;
+    let mut unique_members: Vec<String> = Vec::new();
+    for member in members {
+        let member = member.trim();
+        if member.is_empty() {
+            continue;
+        }
+        if !contacts.contains_key(member) {
+            return Err(anyhow!("unknown group member '{member}'"));
+        }
+        if !unique_members.iter().any(|m| m == member) {
+            unique_members.push(member.to_string());
+        }
+    }
+    if unique_members.is_empty() {
+        return Err(anyhow!("group requires at least one member"));
+    }
+
+    let conn = init_db(profile)?;
+    let id = generate_group_id();
+    let now = now_ms_i64()?;
+    conn.execute(
+        "INSERT INTO groups (id, title, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+        params![id, title, now, now],
+    )?;
+    for member in &unique_members {
+        conn.execute(
+            "INSERT INTO group_members (group_id, contact, role, added_at_ms) VALUES (?1, ?2, 'member', ?3)",
+            params![id, member, now],
+        )?;
+    }
+
+    Ok(GroupInfo {
+        id,
+        title: title.to_string(),
+        created_at_ms: now,
+        updated_at_ms: now,
+        members: unique_members
+            .into_iter()
+            .map(|contact| GroupMember {
+                contact,
+                role: "member".to_string(),
+                added_at_ms: now,
+            })
+            .collect(),
+    })
+}
+
+pub(crate) fn load_groups(profile: &Path) -> Result<Vec<GroupInfo>> {
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, title, created_at_ms, updated_at_ms FROM groups ORDER BY updated_at_ms DESC, title ASC",
+    )?;
+    let group_rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    let mut groups = Vec::new();
+    for row in group_rows {
+        let (id, title, created_at_ms, updated_at_ms) = row?;
+        let mut member_stmt = conn.prepare(
+            "SELECT contact, role, added_at_ms FROM group_members WHERE group_id = ?1 ORDER BY contact ASC",
+        )?;
+        let member_rows = member_stmt.query_map(params![id], |r| {
+            Ok(GroupMember {
+                contact: r.get(0)?,
+                role: r.get(1)?,
+                added_at_ms: r.get(2)?,
+            })
+        })?;
+        let mut members = Vec::new();
+        for member in member_rows {
+            members.push(member?);
+        }
+        groups.push(GroupInfo {
+            id,
+            title,
+            created_at_ms,
+            updated_at_ms,
+            members,
+        });
+    }
+    Ok(groups)
 }
 
 fn clear_history(profile: &Path, contact_filter: Option<&str>) -> Result<()> {
@@ -2780,6 +2975,70 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pk = B64.encode([1u8; 16]);
         assert!(contact_add(dir.path(), "bob", "bbbb.onion", &pk, &B64.encode([2u8; 32])).is_err());
+    }
+
+    // -- groups --
+
+    #[test]
+    fn db_group_create_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+        contact_add(
+            dir.path(),
+            "bob",
+            "psrntpu56hilbftscupr6f4ujxb6kjn6n2qy4366sen4lqkqpspjezid.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+
+        let created = create_group(dir.path(), "Ops", &["alice".into(), "bob".into()]).unwrap();
+        assert_eq!(created.title, "Ops");
+        assert_eq!(created.members.len(), 2);
+        assert!(created.members.iter().any(|m| m.contact == "alice"));
+        assert!(created.members.iter().any(|m| m.contact == "bob"));
+
+        let groups = load_groups(dir.path()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, created.id);
+        assert_eq!(groups[0].title, "Ops");
+        assert_eq!(groups[0].members.len(), 2);
+    }
+
+    #[test]
+    fn group_create_rejects_unknown_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = create_group(dir.path(), "Ops", &["ghost".into()]).unwrap_err();
+        assert!(err.to_string().contains("unknown group member"));
+    }
+
+    #[test]
+    fn history_rows_have_contact_conversation_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        store_message(
+            dir.path(),
+            "out",
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            "hello",
+            42,
+            DeliveryStatus::Sent,
+        )
+        .unwrap();
+
+        let rows = load_history(dir.path(), Some("alice"), 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_kind, "contact");
+        assert_eq!(rows[0].conversation_id, "alice");
     }
 
     // -- signing / verification --
