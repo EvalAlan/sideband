@@ -682,9 +682,11 @@ impl App {
     fn selected_conversation_changed(&mut self) {
         if let Some(contact) = self.selected_contact_name() {
             self.unread_contacts.remove(&contact);
+            self.show_history(Some(&contact));
         }
         if let Some(group_id) = self.selected_group_id() {
             self.unread_groups.remove(&group_id);
+            self.show_group_history(&group_id);
         }
         self.scroll_offset = 0;
     }
