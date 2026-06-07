@@ -8,7 +8,7 @@
 #include "flutter/generated_plugin_registrant.h"
 
 static void set_window_icon(GtkWindow* window) {
-  const char* icon_path = "data/flutter_assets/packages/sideband_gui/assets/icon_256x256.png";
+  const char* icon_path = "data/flutter_assets/assets/icon_256x256.png";
   g_autoptr(GError) error = nullptr;
   g_autoptr(GdkPixbuf) icon = gdk_pixbuf_new_from_file_at_scale(
       icon_path, 256, 256, TRUE, &error);
