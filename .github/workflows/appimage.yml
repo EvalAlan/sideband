@@ -63,7 +63,7 @@ jobs:
         run: RUSTFLAGS='-D warnings' cargo check --bin sideband
 
       - name: Test Rust backend
-        run: cargo test --quiet
+        run: cargo test --bin sideband --quiet
 
       - name: Analyze Flutter GUI
         working-directory: gui
