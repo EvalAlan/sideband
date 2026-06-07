@@ -124,6 +124,7 @@ pub(crate) async fn record_inbound_chat_plaintext(
                     &payload.group_id,
                     &payload.group_title,
                     contact_name,
+                    &payload.members,
                 )?;
                 store_message_for_conversation(
                     profile,
@@ -651,11 +652,20 @@ mod group_chat_tests {
             &xpk,
         )
         .unwrap();
+        contact_add(
+            dir.path(),
+            "bob",
+            "psrntpu56hilbftscupr6f4ujxb6kjn6n2qy4366sen4lqkqpspjezid.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
         let (tx, mut rx) = mpsc::channel::<TuiEvent>(4);
         let payload = serde_json::json!({
             "kind": "group_message",
             "group_id": "g-ops",
             "group_title": "Ops",
+            "members": ["bob", "local-self-is-not-a-contact"],
             "body": "ops hello"
         })
         .to_string();
@@ -669,6 +679,11 @@ mod group_chat_tests {
         assert_eq!(groups[0].id, "g-ops");
         assert_eq!(groups[0].title, "Ops");
         assert!(groups[0].members.iter().any(|m| m.contact == "alice"));
+        assert!(groups[0].members.iter().any(|m| m.contact == "bob"));
+        assert!(!groups[0]
+            .members
+            .iter()
+            .any(|m| m.contact == "local-self-is-not-a-contact"));
 
         let group_rows = load_group_history(dir.path(), "g-ops", 10).unwrap();
         assert_eq!(group_rows.len(), 1);

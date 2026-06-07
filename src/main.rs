@@ -304,6 +304,8 @@ pub(crate) struct GroupMessagePayload {
     pub(crate) kind: String,
     pub(crate) group_id: String,
     pub(crate) group_title: String,
+    #[serde(default)]
+    pub(crate) members: Vec<String>,
     pub(crate) body: String,
 }
 
@@ -313,6 +315,7 @@ impl GroupMessagePayload {
             kind: "group_message".to_string(),
             group_id: group.id.clone(),
             group_title: group.title.clone(),
+            members: group.members.iter().map(|m| m.contact.clone()).collect(),
             body: body.to_string(),
         }
     }
@@ -1388,6 +1391,7 @@ pub(crate) fn discover_or_update_group(
     group_id: &str,
     title: &str,
     sender_contact: &str,
+    advertised_members: &[String],
 ) -> Result<GroupInfo> {
     let group_id = group_id.trim();
     if group_id.is_empty() {
@@ -1403,10 +1407,24 @@ pub(crate) fn discover_or_update_group(
          ON CONFLICT(id) DO UPDATE SET title=excluded.title, updated_at_ms=excluded.updated_at_ms",
         params![group_id, title, now],
     )?;
+    let contacts = load_contacts(profile)?;
+    let mut members_to_add = Vec::new();
     if !sender_contact.is_empty() {
+        members_to_add.push(sender_contact.to_string());
+    }
+    for member in advertised_members {
+        let member = member.trim();
+        if member.is_empty() || !contacts.contains_key(member) {
+            continue;
+        }
+        if !members_to_add.iter().any(|m| m == member) {
+            members_to_add.push(member.to_string());
+        }
+    }
+    for member in members_to_add {
         conn.execute(
             "INSERT OR IGNORE INTO group_members (group_id, contact, role, added_at_ms) VALUES (?1, ?2, 'member', ?3)",
-            params![group_id, sender_contact, now],
+            params![group_id, member, now],
         )?;
     }
     drop(conn);
@@ -1459,6 +1477,7 @@ pub(crate) async fn send_group(
             force_static,
             "group",
             &group.id,
+            false,
         )
         .await
         {
@@ -1468,6 +1487,24 @@ pub(crate) async fn send_group(
                 error: e.to_string(),
             }),
         }
+    }
+
+    if let Err(e) = store_message_for_conversation(
+        profile,
+        "out",
+        "You",
+        "",
+        message,
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+        if sent > 0 {
+            DeliveryStatus::Sent
+        } else {
+            DeliveryStatus::Failed
+        },
+        "group",
+        &group.id,
+    ) {
+        error!(error=%e, "failed to store outbound group message");
     }
 
     Ok(GroupSendResult {
@@ -3038,6 +3075,7 @@ pub(crate) async fn send(
         force_static,
         "contact",
         contact_hint,
+        true,
     )
     .await
 }
@@ -3052,6 +3090,7 @@ pub(crate) async fn send_in_conversation(
     force_static: bool,
     conversation_kind: &str,
     conversation_id: &str,
+    store_outbound_history: bool,
 ) -> Result<()> {
     if !to.ends_with(".onion") {
         return Err(anyhow!("resolved --to must be an onion address"));
@@ -3179,18 +3218,20 @@ pub(crate) async fn send_in_conversation(
         .filter(|payload| payload.kind == "group_message")
         .map(|payload| payload.body)
         .unwrap_or_else(|| message.to_string());
-    if let Err(e) = store_message_for_conversation(
-        profile,
-        "out",
-        contact_hint,
-        to,
-        &body_for_history,
-        msg.timestamp_ms,
-        status,
-        conversation_kind,
-        conversation_id,
-    ) {
-        error!(error=%e, "failed to store outbound message");
+    if store_outbound_history {
+        if let Err(e) = store_message_for_conversation(
+            profile,
+            "out",
+            contact_hint,
+            to,
+            &body_for_history,
+            msg.timestamp_ms,
+            status,
+            conversation_kind,
+            conversation_id,
+        ) {
+            error!(error=%e, "failed to store outbound message");
+        }
     }
 
     drop(tor_client);

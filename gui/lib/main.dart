@@ -925,7 +925,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         id: -now.millisecondsSinceEpoch,
         direction: 'out',
         status: 'sending',
-        contact: c?.name ?? g!.sidebarLabel,
+        contact: c?.name ?? 'You',
         text: t,
         tsMs: now.millisecondsSinceEpoch);
     setState(() {
@@ -2217,6 +2217,7 @@ class _ChatScreenState extends State<_ChatScreen> {
 
   Widget _bubble(ChatMsg m) {
     final right = m.out;
+    final showGroupSender = _selGroup != null;
     return Align(
       alignment: right ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -2236,6 +2237,14 @@ class _ChatScreenState extends State<_ChatScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (showGroupSender) ...[
+              Text(right ? 'You' : m.contact,
+                  style: TextStyle(
+                      color: right ? _teal : _textDim,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700)),
+              const SizedBox(height: 3),
+            ],
             Text(m.text,
                 style:
                     const TextStyle(color: _text, fontSize: 14, height: 1.35)),
