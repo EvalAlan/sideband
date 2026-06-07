@@ -153,6 +153,37 @@ impl App {
                     self.do_send(&contact, &message);
                     return false;
                 }
+                Some("group-create") => {
+                    if parts.len() < 3 {
+                        self.push_sys(group_create_usage_text(), "error");
+                        return false;
+                    }
+                    let title = parts[1];
+                    let members = parts[2..]
+                        .iter()
+                        .map(|member| member.to_string())
+                        .collect::<Vec<_>>();
+                    match crate::create_group(&self.profile, title, &members) {
+                        Ok(group) => {
+                            self.groups = crate::load_groups(&self.profile).unwrap_or_default();
+                            let member_list = group
+                                .members
+                                .iter()
+                                .map(|m| m.contact.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            self.push_sys(
+                                &format!(
+                                    "group '{}' created\nid={}\nmembers={}",
+                                    group.title, group.id, member_list
+                                ),
+                                "info",
+                            );
+                        }
+                        Err(e) => self.push_sys(&format!("group create failed: {}", e), "error"),
+                    }
+                    return false;
+                }
                 Some("group") => {
                     if parts.len() < 3 {
                         self.push_sys("usage: /group <id-or-title> <message>", "error");
@@ -1488,6 +1519,10 @@ fn chat_scroll_position(
     max_scroll.saturating_sub(scroll_offset_from_bottom.min(max_scroll))
 }
 
+fn group_create_usage_text() -> &'static str {
+    "/group-create <title> <member> [member...] — create group. Repeat members by adding more contact names."
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
@@ -1660,7 +1695,7 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_scroll_position, wrap_text};
+    use super::{chat_scroll_position, group_create_usage_text, wrap_text};
 
     #[test]
     fn chat_scroll_defaults_to_bottom() {
@@ -1676,6 +1711,12 @@ mod tests {
     fn chat_scroll_clamps_when_content_fits() {
         assert_eq!(chat_scroll_position(5, 20, 0), 0);
         assert_eq!(chat_scroll_position(5, 20, 10), 0);
+    }
+
+    #[test]
+    fn group_create_usage_is_visible_in_tui_help() {
+        assert!(group_create_usage_text().contains("/group-create <title> <member>"));
+        assert!(group_create_usage_text().contains("Repeat members"));
     }
 
     #[test]

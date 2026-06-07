@@ -229,6 +229,19 @@ class _SendMessageIntent extends Intent {
 
 // ── cli ─────────────────────────────────────────────────────────────────────
 
+List<String> groupCreateArgs({
+  required String profile,
+  required String title,
+  required List<String> members,
+}) {
+  final args = ['group', 'create', '--profile', profile, '--title', title.trim()];
+  for (final member in members.map((m) => m.trim()).where((m) => m.isNotEmpty)) {
+    args.addAll(['--member', member]);
+  }
+  args.add('--json');
+  return args;
+}
+
 class _Cli {
   _Cli();
 
@@ -400,6 +413,31 @@ class _Cli {
     }
     parsed.sort((a, b) => a.sidebarLabel.compareTo(b.sidebarLabel));
     return parsed;
+  }
+
+  Future<GroupInfo> createGroup({
+    required String title,
+    required List<String> members,
+  }) async {
+    final raw = await _run(groupCreateArgs(profile: profile, title: title, members: members));
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) {
+      throw Exception('group create JSON was not an object');
+    }
+    final parsedMembers = <String>[];
+    final rawMembers = decoded['members'];
+    if (rawMembers is List) {
+      for (final member in rawMembers) {
+        if (member is Map && member['contact'] != null) {
+          parsedMembers.add(member['contact'].toString());
+        }
+      }
+    }
+    return GroupInfo(
+      id: decoded['id'].toString(),
+      title: decoded['title'].toString(),
+      members: parsedMembers,
+    );
   }
 
   Future<_History> history({String? contact, String? group, int limit = 80}) async {
@@ -968,7 +1006,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       switch (cmd) {
         case 'help':
           _showInfo('Slash commands',
-              '/send <contact> <msg>\n/group <id-or-title> <msg>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
+              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group <id-or-title> <msg>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
           return;
         case 'send':
           if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
@@ -976,6 +1014,17 @@ class _ChatScreenState extends State<_ChatScreen> {
           final msg = raw.split(RegExp(r'\s+')).skip(2).join(' ');
           await _cli.send(to: contact, message: msg);
           await _load();
+          return;
+        case 'group-create':
+          if (parts.length < 3) {
+            throw Exception('usage: /group-create <title> <member> [member...]');
+          }
+          final group = await _cli.createGroup(
+            title: parts[1],
+            members: parts.skip(2).toList(),
+          );
+          await _load();
+          _showInfo('Group created', group.details);
           return;
         case 'group':
           if (parts.length < 3) throw Exception('usage: /group <id-or-title> <message>');
@@ -1174,6 +1223,101 @@ class _ChatScreenState extends State<_ChatScreen> {
       onion.dispose();
       pubkey.dispose();
       x25519.dispose();
+    }
+  }
+
+  Future<void> _showCreateGroupDialog() async {
+    final title = TextEditingController();
+    final selected = <String>{};
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (_) => StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            backgroundColor: _surface,
+            title: const Text('Create group', style: TextStyle(color: _text)),
+            content: SizedBox(
+              width: 520,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: title,
+                    decoration: const InputDecoration(labelText: 'Group title'),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text('Members', style: TextStyle(color: _textDim, fontSize: 12)),
+                  const SizedBox(height: 6),
+                  if (_contacts.isEmpty)
+                    const Text('No contacts yet. Add contacts first.',
+                        style: TextStyle(color: _textDim, fontSize: 12))
+                  else
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 260),
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: _contacts
+                            .map((contact) => CheckboxListTile(
+                                  value: selected.contains(contact.name),
+                                  dense: true,
+                                  title: Text(contact.name),
+                                  subtitle: Text(contact.securityLabel),
+                                  onChanged: (checked) {
+                                    setDialogState(() {
+                                      if (checked == true) {
+                                        selected.add(contact.name);
+                                      } else {
+                                        selected.remove(contact.name);
+                                      }
+                                    });
+                                  },
+                                ))
+                            .toList(),
+                      ),
+                    ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Groups fan out one encrypted message per member. There is no shared group ratchet yet.',
+                    style: TextStyle(color: _textDim, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel')),
+              FilledButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Create')),
+            ],
+          ),
+        ),
+      );
+      if (ok != true) return;
+      final groupTitle = title.text.trim();
+      if (groupTitle.isEmpty) throw Exception('group title is required');
+      if (selected.isEmpty) throw Exception('select at least one group member');
+      final group = await _cli.createGroup(
+        title: groupTitle,
+        members: selected.toList()..sort(),
+      );
+      await _load();
+      for (final loaded in _groups.where((g) => g.id == group.id)) {
+        final h = await _historyVisibleFor(null, group: loaded.id);
+        setState(() {
+          _sel = null;
+          _selGroup = loaded;
+          _msgs = _mergePending(h.msgs);
+        });
+        break;
+      }
+      _showInfo('Group created', group.details);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      title.dispose();
     }
   }
 
@@ -1403,6 +1547,15 @@ class _ChatScreenState extends State<_ChatScreen> {
                 },
               ),
               ListTile(
+                leading: const Icon(Icons.group_add),
+                title: const Text('Create group'),
+                subtitle: const Text('Pick contacts and make a local fan-out group'),
+                onTap: () {
+                  Navigator.pop(context);
+                  unawaited(_showCreateGroupDialog());
+                },
+              ),
+              ListTile(
                 leading: const Icon(Icons.ios_share),
                 title: const Text('Share my contact'),
                 subtitle: Text(_listenerStatus),
@@ -1523,16 +1676,19 @@ class _ChatScreenState extends State<_ChatScreen> {
             padding: const EdgeInsets.fromLTRB(16, 14, 14, 10),
             child: Row(
               children: [
-                const Text(
-                  'Messages',
-                  style: TextStyle(
-                    color: _text,
-                    fontSize: 17,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.2,
+                const Expanded(
+                  child: Text(
+                    'Messages',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: _text,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.2,
+                    ),
                   ),
                 ),
-                const Spacer(),
                 SizedBox(
                   width: 34,
                   child: IconButton(
@@ -1545,6 +1701,20 @@ class _ChatScreenState extends State<_ChatScreen> {
                     icon: const Icon(Icons.person_add_alt_1, size: 19),
                     onPressed: _showAddContactDialog,
                     tooltip: 'Add contact',
+                  ),
+                ),
+                SizedBox(
+                  width: 34,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    style: IconButton.styleFrom(
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    icon: const Icon(Icons.group_add, size: 19),
+                    onPressed: _showCreateGroupDialog,
+                    tooltip: 'Create group',
                   ),
                 ),
                 SizedBox(
@@ -1601,7 +1771,7 @@ class _ChatScreenState extends State<_ChatScreen> {
                         child: Padding(
                           padding: const EdgeInsets.all(24),
                           child: Text(
-                            'No contacts yet.\nUse + or /add <name> <onion> <ed25519> <x25519>.',
+                            'No contacts yet.\nUse + or /add <name> <onion> <ed25519> <x25519>.\nCreate groups with the group-add button or /group-create.',
                             textAlign: TextAlign.center,
                             style: TextStyle(
                                 color: _textDim, fontSize: 12, height: 1.6),

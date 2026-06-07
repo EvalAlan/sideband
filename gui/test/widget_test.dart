@@ -51,6 +51,14 @@ void main() {
     ), isFalse);
   });
 
+
+  test('group create args include title and repeated members', () {
+    expect(
+      groupCreateArgs(profile: '/tmp/p', title: 'Ops', members: const ['alice', 'bob']),
+      ['group', 'create', '--profile', '/tmp/p', '--title', 'Ops', '--member', 'alice', '--member', 'bob', '--json'],
+    );
+  });
+
   testWidgets('app boot does not crash', (WidgetTester tester) async {
     await tester.pumpWidget(const SidebandApp());
     await tester.pump(const Duration(milliseconds: 500));
