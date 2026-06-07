@@ -3,6 +3,7 @@ Name=Sideband
 Comment=Tor-based decentralized messenger
 Exec=sideband_gui
 Icon=sideband_gui
+StartupWMClass=com.evalalan.sideband
 Type=Application
 Categories=Network;InstantMessaging;Security;
 StartupNotify=true

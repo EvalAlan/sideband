@@ -7,21 +7,51 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
-static void set_window_icon(GtkWindow* window) {
-  const char* icon_path = "data/flutter_assets/assets/icon_256x256.png";
+static GdkPixbuf* load_icon_from_path(const char* path, int size) {
+  if (!path || !g_file_test(path, G_FILE_TEST_EXISTS)) return nullptr;
   g_autoptr(GError) error = nullptr;
-  g_autoptr(GdkPixbuf) icon = gdk_pixbuf_new_from_file_at_scale(
-      icon_path, 256, 256, TRUE, &error);
-  if (icon) {
-    gtk_window_set_icon(window, icon);
-    GList* icons = nullptr;
-    icons = g_list_append(icons, gdk_pixbuf_copy(icon));
-    g_autoptr(GdkPixbuf) small =
-        gdk_pixbuf_scale_simple(icon, 64, 64, GDK_INTERP_BILINEAR);
-    if (small) icons = g_list_append(icons, small);
-    gtk_window_set_default_icon_list(icons);
-    g_list_free_full(icons, g_object_unref);
+  return gdk_pixbuf_new_from_file_at_scale(path, size, size, TRUE, &error);
+}
+
+static GdkPixbuf* load_window_icon(int size) {
+  // Flutter bundles assets next to the executable at:
+  //   <bundle>/data/flutter_assets/assets/icon_256x256.png
+  // The previous relative cwd lookup silently failed when launched from a
+  // desktop file/AppImage, leaving GTK to show the generic X icon.
+  g_autofree gchar* exe = g_file_read_link("/proc/self/exe", nullptr);
+  if (exe) {
+    g_autofree gchar* exe_dir = g_path_get_dirname(exe);
+    g_autofree gchar* bundled = g_build_filename(
+        exe_dir, "data", "flutter_assets", "assets", "icon_256x256.png",
+        nullptr);
+    if (GdkPixbuf* icon = load_icon_from_path(bundled, size)) return icon;
   }
+
+  // Fallback for unusual dev launches from the bundle directory.
+  if (GdkPixbuf* icon =
+          load_icon_from_path("data/flutter_assets/assets/icon_256x256.png", size)) {
+    return icon;
+  }
+
+  // Final fallback for source-tree launches.
+  return load_icon_from_path("assets/icon_256x256.png", size);
+}
+
+static void set_window_icon(GtkWindow* window) {
+  gtk_window_set_default_icon_name("sideband_gui");
+  gtk_window_set_icon_name(window, "sideband_gui");
+
+  g_autoptr(GdkPixbuf) icon = load_window_icon(256);
+  if (!icon) return;
+
+  gtk_window_set_icon(window, icon);
+  GList* icons = nullptr;
+  icons = g_list_append(icons, gdk_pixbuf_copy(icon));
+  g_autoptr(GdkPixbuf) small =
+      gdk_pixbuf_scale_simple(icon, 64, 64, GDK_INTERP_BILINEAR);
+  if (small) icons = g_list_append(icons, small);
+  gtk_window_set_default_icon_list(icons);
+  g_list_free_full(icons, g_object_unref);
 }
 
 struct _MyApplication {

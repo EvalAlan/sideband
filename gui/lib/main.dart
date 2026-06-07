@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:window_manager/window_manager.dart';
 
 // ── palette ────────────────────────────────────────────────────────────────
 
@@ -87,7 +88,23 @@ InputBorder _inputBorder(Color c) => OutlineInputBorder(
 
 // ── app ─────────────────────────────────────────────────────────────────────
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isLinux || Platform.isWindows || Platform.isMacOS) {
+    await windowManager.ensureInitialized();
+    const options = WindowOptions(
+      title: 'Sideband',
+      size: Size(1280, 800),
+      minimumSize: Size(760, 520),
+      center: true,
+      skipTaskbar: false,
+    );
+    windowManager.waitUntilReadyToShow(options, () async {
+      await windowManager.show();
+      await windowManager.focus();
+      await windowManager.setSkipTaskbar(false);
+    });
+  }
   runApp(const SidebandApp());
 }
 
@@ -626,6 +643,8 @@ class _ChatScreenState extends State<_ChatScreen> {
   final _notifiedMessageIds = <int>{};
   String? _notificationText;
   Timer? _notificationTimer;
+  bool _showInAppNotifications = true;
+  bool _showSystemNotifications = true;
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -1052,11 +1071,56 @@ class _ChatScreenState extends State<_ChatScreen> {
     } else {
       text = '${msgs.length} new messages';
     }
-    setState(() => _notificationText = text);
-    _notificationTimer?.cancel();
-    _notificationTimer = Timer(const Duration(seconds: 6), () {
-      if (mounted) setState(() => _notificationText = null);
-    });
+    if (_showInAppNotifications) {
+      setState(() => _notificationText = text);
+      _notificationTimer?.cancel();
+      _notificationTimer = Timer(const Duration(seconds: 6), () {
+        if (mounted) setState(() => _notificationText = null);
+      });
+    }
+    if (_showSystemNotifications) {
+      unawaited(_showSystemNotification(text));
+    }
+  }
+
+  Future<void> _showSystemNotification(String text) async {
+    if (!Platform.isLinux) return;
+    try {
+      final args = <String>[
+        '--app-name=Sideband',
+        '--icon=${_notificationIconPath()}',
+        'Sideband',
+        text,
+      ];
+      await Process.run('notify-send', args);
+    } catch (_) {
+      // Desktop notifications are best-effort. Keep the in-app banner as fallback.
+    }
+  }
+
+  String _notificationIconPath() {
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      final bundled = File('$exeDir/data/flutter_assets/assets/icon_256x256.png');
+      if (bundled.existsSync()) return bundled.path;
+    } catch (_) {}
+    final sourceTree = File('assets/icon_256x256.png');
+    if (sourceTree.existsSync()) return sourceTree.path;
+    return 'sideband_gui';
+  }
+
+  Future<void> _minimizeToTaskbar() async {
+    if (!(Platform.isLinux || Platform.isWindows || Platform.isMacOS)) return;
+    await windowManager.setSkipTaskbar(false);
+    await windowManager.minimize();
+  }
+
+  Future<void> _showWindow() async {
+    if (!(Platform.isLinux || Platform.isWindows || Platform.isMacOS)) return;
+    await windowManager.setSkipTaskbar(false);
+    await windowManager.show();
+    await windowManager.restore();
+    await windowManager.focus();
   }
 
   Widget _notificationBanner() {
@@ -1915,96 +1979,140 @@ class _ChatScreenState extends State<_ChatScreen> {
   Future<void> _showSettings() async {
     await showDialog<void>(
       context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: _surface,
-        title: const Text('Settings', style: TextStyle(color: _text)),
-        content: SizedBox(
-          width: 560,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.badge_outlined),
-                title: const Text('Display name'),
-                subtitle: const Text('Set the name shared with contacts'),
-                onTap: () {
-                  Navigator.pop(context);
-                  unawaited(_changeDisplayName());
-                },
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          backgroundColor: _surface,
+          title: const Text('Settings', style: TextStyle(color: _text)),
+          content: SizedBox(
+            width: 560,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile(
+                    secondary: const Icon(Icons.notifications_active_outlined),
+                    title: const Text('Desktop notifications'),
+                    subtitle: const Text('Use the system notification daemon for new messages'),
+                    value: _showSystemNotifications,
+                    onChanged: (value) {
+                      setState(() => _showSystemNotifications = value);
+                      setDialogState(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    secondary: const Icon(Icons.mark_unread_chat_alt_outlined),
+                    title: const Text('In-app notification banner'),
+                    subtitle: const Text('Show the top banner inside Sideband'),
+                    value: _showInAppNotifications,
+                    onChanged: (value) {
+                      setState(() => _showInAppNotifications = value);
+                      setDialogState(() {});
+                    },
+                  ),
+                  const Divider(height: 20),
+                  ListTile(
+                    leading: const Icon(Icons.open_in_full),
+                    title: const Text('Show Sideband'),
+                    subtitle: const Text('Restore and focus the app window'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_showWindow());
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.minimize),
+                    title: const Text('Minimize to taskbar'),
+                    subtitle: const Text('Keep Sideband running but get it out of the way'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_minimizeToTaskbar());
+                    },
+                  ),
+                  const Divider(height: 20),
+                  ListTile(
+                    leading: const Icon(Icons.badge_outlined),
+                    title: const Text('Display name'),
+                    subtitle: const Text('Set the name shared with contacts'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_changeDisplayName());
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.person_add_alt_1),
+                    title: const Text('Add contact'),
+                    subtitle: const Text('Paste a shared /add command by hand'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_showAddContactDialog());
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.group_add),
+                    title: const Text('Create group'),
+                    subtitle: const Text('Pick contacts and make a local fan-out group'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_showCreateGroupDialog());
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.ios_share),
+                    title: const Text('Share my contact'),
+                    subtitle: Text(_listenerStatus),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_showShareDialog());
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.fingerprint),
+                    title: const Text('Show identity'),
+                    subtitle: const Text('Public keys and profile identity'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_runSlashCommand('/whoami'));
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.info_outline),
+                    title: const Text('Runtime status'),
+                    subtitle: Text('${_cli.profile} • ${_contacts.length} contacts'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_runSlashCommand('/status'));
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.delete_sweep_outlined),
+                    title: const Text('Delete all history'),
+                    subtitle: const Text('Contacts stay. Messages go away.'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_clearAllHistory());
+                    },
+                  ),
+                  if (!_listenerRunning)
+                    ListTile(
+                      leading: const Icon(Icons.power_settings_new),
+                      title: const Text('Start listener'),
+                      subtitle: const Text('Bring the onion service back up'),
+                      onTap: () {
+                        Navigator.pop(dialogContext);
+                        unawaited(_startListener());
+                      },
+                    ),
+                ],
               ),
-              ListTile(
-                leading: const Icon(Icons.person_add_alt_1),
-                title: const Text('Add contact'),
-                subtitle: const Text('Paste a shared /add command by hand'),
-                onTap: () {
-                  Navigator.pop(context);
-                  unawaited(_showAddContactDialog());
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.group_add),
-                title: const Text('Create group'),
-                subtitle: const Text('Pick contacts and make a local fan-out group'),
-                onTap: () {
-                  Navigator.pop(context);
-                  unawaited(_showCreateGroupDialog());
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.ios_share),
-                title: const Text('Share my contact'),
-                subtitle: Text(_listenerStatus),
-                onTap: () {
-                  Navigator.pop(context);
-                  unawaited(_showShareDialog());
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.fingerprint),
-                title: const Text('Show identity'),
-                subtitle: const Text('Public keys and profile identity'),
-                onTap: () {
-                  Navigator.pop(context);
-                  unawaited(_runSlashCommand('/whoami'));
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.info_outline),
-                title: const Text('Runtime status'),
-                subtitle: Text('${_cli.profile} • ${_contacts.length} contacts'),
-                onTap: () {
-                  Navigator.pop(context);
-                  unawaited(_runSlashCommand('/status'));
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.delete_sweep_outlined),
-                title: const Text('Delete all history'),
-                subtitle: const Text('Contacts stay. Messages go away.'),
-                onTap: () {
-                  Navigator.pop(context);
-                  unawaited(_clearAllHistory());
-                },
-              ),
-              if (!_listenerRunning)
-                ListTile(
-                  leading: const Icon(Icons.power_settings_new),
-                  title: const Text('Start listener'),
-                  subtitle: const Text('Bring the onion service back up'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    unawaited(_startListener());
-                  },
-                ),
-            ],
+            ),
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Close'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-        ],
       ),
     );
   }
