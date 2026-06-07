@@ -146,8 +146,7 @@ APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --executable "${APPDIR}/usr/bin/sideband_gui.bin" \
     --executable "${APPDIR}/usr/bin/sideband" \
     --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
-    --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg" \
-    --plugin gtk
+    --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg"
 
 # Step 7: Package with appimagetool (avoids linuxdeploy's bundled strip)
 log "Packaging AppImage..."
