@@ -38,9 +38,6 @@ static GdkPixbuf* load_window_icon(int size) {
 }
 
 static void set_window_icon(GtkWindow* window) {
-  gtk_window_set_default_icon_name("sideband_gui");
-  gtk_window_set_icon_name(window, "sideband_gui");
-
   g_autoptr(GdkPixbuf) icon = load_window_icon(256);
   if (!icon) return;
 
