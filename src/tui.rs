@@ -80,6 +80,7 @@ struct DisplayMessage {
     _timestamp_ms: u128,
     status: String,
     pending: bool,
+    conversation_id: Option<String>,
 }
 
 impl App {
@@ -538,6 +539,7 @@ impl App {
                 _timestamp_ms: 0,
                 status: "failed (no contact)".into(),
                 pending: false,
+                conversation_id: None,
             });
             self.input.clear();
             return false;
@@ -565,6 +567,7 @@ impl App {
                 _timestamp_ms: 0,
                 status: status.into(),
                 pending: false,
+                conversation_id: None,
             });
         }
         const MAX_MESSAGES: usize = 500;
@@ -625,6 +628,7 @@ impl App {
             _timestamp_ms: timestamp_ms,
             status: status.into(),
             pending: false,
+            conversation_id: None,
         });
         self.messages_recv += 1;
     }
@@ -632,16 +636,14 @@ impl App {
     fn record_inbound_group_message(
         &mut self,
         group_id: String,
-        group_title: String,
+        _group_title: String,
         contact: String,
         body: String,
         timestamp_ms: u128,
         verified: bool,
     ) {
-        if !self.groups.iter().any(|group| group.id == group_id) {
-            if let Ok(groups) = crate::load_groups(&self.profile) {
-                self.groups = groups;
-            }
+        if let Ok(groups) = crate::load_groups(&self.profile) {
+            self.groups = groups;
         }
         if self.selected_group_id().as_deref() != Some(group_id.as_str()) {
             self.unread_groups.insert(group_id.clone());
@@ -649,11 +651,12 @@ impl App {
         let status = if verified { "verified" } else { "UNVERIFIED" };
         self.messages.push(DisplayMessage {
             direction: "in".into(),
-            contact: group_title,
-            body: format!("{contact}: {body}"),
+            contact,
+            body,
             _timestamp_ms: timestamp_ms,
             status: status.into(),
             pending: false,
+            conversation_id: Some(group_id),
         });
         self.messages_recv += 1;
     }
@@ -718,15 +721,20 @@ impl App {
             _timestamp_ms: ts,
             status: "sending".into(),
             pending: true,
+            conversation_id: None,
         });
     }
 
     fn do_send_group(&mut self, group: &str, message: &str) {
-        let label = self
+        let resolved_group = self
             .groups
             .iter()
-            .find(|g| g.id == group || g.title == group)
+            .find(|g| g.id == group || g.title == group);
+        let label = resolved_group
             .map(|g| g.title.clone())
+            .unwrap_or_else(|| group.to_string());
+        let conversation_id = resolved_group
+            .map(|g| g.id.clone())
             .unwrap_or_else(|| group.to_string());
         let _ = self.send_tx.try_send(SendCommand {
             contact: label.clone(),
@@ -739,11 +747,12 @@ impl App {
             .unwrap_or(0);
         self.messages.push(DisplayMessage {
             direction: "out".into(),
-            contact: label,
+            contact: self.profile_name.clone(),
             body: message.to_string(),
             _timestamp_ms: ts,
             status: "sending".into(),
             pending: true,
+            conversation_id: Some(conversation_id),
         });
     }
 
@@ -763,13 +772,11 @@ impl App {
             _timestamp_ms: ts,
             status: "sending".into(),
             pending: true,
+            conversation_id: None,
         });
     }
 
     fn show_group_history(&mut self, group: &str) {
-        let group_title = crate::resolve_group(&self.profile, group)
-            .map(|group| group.title)
-            .unwrap_or_else(|_| group.to_string());
         match crate::load_group_history(&self.profile, group, 20) {
             Ok(rows) => {
                 if rows.is_empty() {
@@ -779,18 +786,19 @@ impl App {
                         let status_label = crate::DeliveryStatus::from_i64(r.status)
                             .map(|s| s.label())
                             .unwrap_or("?");
-                        let body = if r.direction == "in" {
-                            format!("{}: {}", r.contact, r.body)
+                        let contact = if r.direction == "out" && r.contact == "You" {
+                            self.profile_name.clone()
                         } else {
-                            r.body
+                            r.contact
                         };
                         self.messages.push(DisplayMessage {
                             direction: r.direction,
-                            contact: group_title.clone(),
-                            body,
+                            contact,
+                            body: r.body,
                             _timestamp_ms: r.timestamp_ms as u128,
                             status: status_label.into(),
                             pending: false,
+                            conversation_id: Some(group.to_string()),
                         });
                     }
                 }
@@ -810,6 +818,7 @@ impl App {
                         _timestamp_ms: 0,
                         status: "info".into(),
                         pending: false,
+                        conversation_id: None,
                     });
                 } else {
                     for r in rows.into_iter().rev() {
@@ -823,6 +832,7 @@ impl App {
                             _timestamp_ms: r.timestamp_ms as u128,
                             status: status_label.into(),
                             pending: false,
+                            conversation_id: None,
                         });
                     }
                 }
@@ -835,6 +845,7 @@ impl App {
                     _timestamp_ms: 0,
                     status: "error".into(),
                     pending: false,
+                    conversation_id: None,
                 });
             }
         }
@@ -897,6 +908,7 @@ impl App {
                             _timestamp_ms: timestamp_ms,
                             status: status_label,
                             pending: false,
+                            conversation_id: None,
                         });
                     }
                     if status == crate::DeliveryStatus::Sent {
@@ -922,6 +934,7 @@ impl App {
                             _timestamp_ms: 0,
                             status: "⚠".to_string(),
                             pending: false,
+                            conversation_id: None,
                         });
                     }
                     self.status = text;
@@ -1277,7 +1290,7 @@ fn sidebar_items(contacts: &[String], groups: &[crate::GroupInfo]) -> Vec<String
         items.extend(
             groups
                 .iter()
-                .map(|g| format!("👥 {} ({})", g.title, g.members.len())),
+                .map(|g| format!("👥 {} ({})", g.title, g.members.len() + 1)),
         );
     }
     items
@@ -1295,7 +1308,7 @@ mod group_sidebar_tests {
 
         assert!(items.iter().any(|item| item == "Contacts"));
         assert!(items.iter().any(|item| item == "Groups"));
-        assert!(items.iter().any(|item| item == "👥 Ops (1)"));
+        assert!(items.iter().any(|item| item == "👥 Ops (2)"));
     }
 
     #[test]
@@ -1323,6 +1336,65 @@ mod group_sidebar_tests {
         terminal
             .draw(|f| draw_footer(f, f.area(), &app))
             .expect("footer render should not panic for selected group");
+    }
+
+    #[test]
+    fn inbound_group_message_keeps_sender_separate_from_body() {
+        let (tui_tx, tui_rx) = mpsc::channel::<TuiEvent>(1);
+        let (send_tx, _send_rx) = mpsc::channel::<SendCommand>(1);
+        let (file_tx, _file_rx) = mpsc::channel::<FileCommand>(1);
+        drop(tui_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            tui_rx,
+            send_tx,
+            file_tx,
+            vec!["alice".to_string(), "bob".to_string()],
+            quit_tx,
+        );
+        app.groups = vec![test_group("g1", "Homies")];
+
+        app.record_inbound_group_message(
+            "g1".to_string(),
+            "Homies".to_string(),
+            "alice".to_string(),
+            "Word".to_string(),
+            1,
+            true,
+        );
+
+        let message = app.messages.last().unwrap();
+        assert_eq!(message.contact, "alice");
+        assert_eq!(message.body, "Word");
+        assert_eq!(message.conversation_id.as_deref(), Some("g1"));
+    }
+
+    #[test]
+    fn group_send_by_title_tracks_group_id_for_filtering() {
+        let (tui_tx, tui_rx) = mpsc::channel::<TuiEvent>(1);
+        let (send_tx, _send_rx) = mpsc::channel::<SendCommand>(1);
+        let (file_tx, _file_rx) = mpsc::channel::<FileCommand>(1);
+        drop(tui_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            tui_rx,
+            send_tx,
+            file_tx,
+            vec!["alice".to_string(), "bob".to_string()],
+            quit_tx,
+        );
+        app.groups = vec![test_group("g1", "Homies")];
+
+        app.do_send_group("Homies", "Yo");
+
+        let message = app.messages.last().unwrap();
+        assert_eq!(message.contact, app.profile_name);
+        assert_eq!(message.body, "Yo");
+        assert_eq!(message.conversation_id.as_deref(), Some("g1"));
     }
 
     fn test_group(id: &str, title: &str) -> crate::GroupInfo {
@@ -1611,6 +1683,23 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+fn name_color(name: &str) -> Color {
+    const COLORS: [Color; 8] = [
+        Color::Cyan,
+        Color::Magenta,
+        Color::Yellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightYellow,
+        Color::LightCyan,
+        Color::White,
+    ];
+    let hash = name.bytes().fold(0usize, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(b as usize)
+    });
+    COLORS[hash % COLORS.len()]
+}
+
 fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
     let selected = app.selected_contact_name();
     let selected_group = app.selected_group_id().and_then(|id| {
@@ -1631,7 +1720,10 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
                 Some(name) => m.contact == *name,
                 None => selected_group
                     .as_ref()
-                    .map(|g| m.contact == *g)
+                    .map(|g| {
+                        m.conversation_id.as_deref() == app.selected_group_id().as_deref()
+                            || m.contact == *g
+                    })
                     .unwrap_or(true),
             }
         })
@@ -1667,7 +1759,10 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
                 String::new()
             };
 
-            let display_contact = if m.direction == "out" {
+            let is_group_view = selected_group.is_some();
+            let display_contact = if is_group_view {
+                m.contact.as_str()
+            } else if m.direction == "out" {
                 app.profile_name.as_str()
             } else {
                 m.contact.as_str()
@@ -1689,7 +1784,13 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
                         vec![
                             Span::styled(
                                 prefix.clone(),
-                                Style::default().fg(dir_color).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(if is_group_view {
+                                        name_color(display_contact)
+                                    } else {
+                                        dir_color
+                                    })
+                                    .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw(chunk),
                         ]

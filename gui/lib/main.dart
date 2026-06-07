@@ -170,7 +170,8 @@ class GroupInfo {
   final List<String> members;
 
   String get sidebarLabel => title.trim().isEmpty ? id : title;
-  String get memberSummary => members.length == 1 ? '1 member' : '${members.length} members';
+  int get participantCount => members.length + 1;
+  String get memberSummary => participantCount == 1 ? '1 member' : '$participantCount members';
   String get details => '$sidebarLabel\nid=$id\nmembers=${members.join(', ')}';
 }
 

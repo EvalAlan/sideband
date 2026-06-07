@@ -30,7 +30,7 @@ void main() {
     expect(contact.securityLabel, 'Static key');
   });
 
-  test('group label shows title and member count', () {
+  test('group label shows title and participant count including self', () {
     const group = GroupInfo(
       id: 'g1',
       title: 'Ops',
@@ -38,7 +38,8 @@ void main() {
     );
 
     expect(group.sidebarLabel, 'Ops');
-    expect(group.memberSummary, '2 members');
+    expect(group.participantCount, 3);
+    expect(group.memberSummary, '3 members');
   });
 
 
