@@ -41,14 +41,7 @@ cd "${SCRIPT_DIR}"
 # Step 3: Install tools
 mkdir -p "${HOME}/.local/bin"
 
-LINUXDEPLOY="${HOME}/.local/bin/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
-if [[ ! -x "${LINUXDEPLOY}" ]]; then
-    log "Downloading linuxdeploy..."
-    wget -q -O "${LINUXDEPLOY}" \
-        "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
-    chmod +x "${LINUXDEPLOY}"
-fi
-
+# Download appimagetool first (needed to patch linuxdeploy)
 APPIMAGETOOL="${HOME}/.local/bin/appimagetool-${APPIMAGE_ARCH}.AppImage"
 if [[ ! -x "${APPIMAGETOOL}" ]]; then
     log "Downloading appimagetool..."
@@ -57,6 +50,36 @@ if [[ ! -x "${APPIMAGETOOL}" ]]; then
     chmod +x "${APPIMAGETOOL}"
 fi
 export PATH="${HOME}/.local/bin:${PATH}"
+
+# Download linuxdeploy
+LINUXDEPLOY="${HOME}/.local/bin/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
+if [[ ! -x "${LINUXDEPLOY}" ]]; then
+    log "Downloading linuxdeploy..."
+    wget -q -O "${LINUXDEPLOY}" \
+        "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
+    chmod +x "${LINUXDEPLOY}"
+fi
+
+# Patch linuxdeploy's bundled strip to be a no-op.
+# linuxdeploy uses its own bundled strip binary (from its extracted AppImage)
+# which is too old to handle .relr.dyn ELF sections on newer distros.
+# Replacing it with /usr/bin/true makes all strip calls harmless.
+LINUXDEPLOY_PATCHED="${HOME}/.local/bin/linuxdeploy-patched-${APPIMAGE_ARCH}.AppImage"
+if [[ ! -x "${LINUXDEPLOY_PATCHED}" ]]; then
+    log "Patching linuxdeploy bundled strip..."
+    LINUXDEPLOY_EXTRACT="$(mktemp -d)"
+    cd "${LINUXDEPLOY_EXTRACT}"
+    "${LINUXDEPLOY}" --appimage-extract >/dev/null 2>&1
+    SQUASHFS_ROOT="squashfs-root"
+    if [[ -f "${SQUASHFS_ROOT}/usr/bin/strip" ]]; then
+        cp /usr/bin/true "${SQUASHFS_ROOT}/usr/bin/strip"
+    fi
+    # Re-pack using appimagetool
+    APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGETOOL}" "${SQUASHFS_ROOT}" "${LINUXDEPLOY_PATCHED}"
+    chmod +x "${LINUXDEPLOY_PATCHED}"
+    rm -rf "${LINUXDEPLOY_EXTRACT}"
+fi
+LINUXDEPLOY="${LINUXDEPLOY_PATCHED}"
 
 # Step 4: Generate icons
 ICON_SVG="${SCRIPT_DIR}/linux/icons/sideband_gui.svg"
