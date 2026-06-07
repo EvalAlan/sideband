@@ -134,14 +134,6 @@ chmod +x "${APPDIR}/usr/bin/sideband_gui"
 DESKTOP_ID="com.evalalan.sideband.desktop"
 cp "${SCRIPT_DIR}/linux/sideband_gui.desktop" "${APPDIR}/usr/share/applications/${DESKTOP_ID}"
 
-# AppImage desktop integration tools and KDE Plasma task managers often inspect
-# the AppDir root, not just usr/share. Keep the root desktop/icon identity in
-# sync with the freedesktop application ID so WM_CLASS -> desktop -> Icon
-# resolves to the Sideband logo instead of a generic fallback/checkmark icon.
-cp "${APPDIR}/usr/share/applications/${DESKTOP_ID}" "${APPDIR}/${DESKTOP_ID}"
-cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/com.evalalan.sideband.png"
-cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/.DirIcon"
-
 cat > "${APPDIR}/usr/share/metainfo/sideband_gui.metainfo.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
@@ -177,6 +169,15 @@ if [[ -f "${APPDIR}/usr/lib/libtray_manager_plugin.so" ]] && \
     err "AppImage missing bundled AppIndicator library required by tray_manager"
     exit 1
 fi
+
+# AppImage desktop integration tools and KDE Plasma task managers often inspect
+# the AppDir root, not just usr/share. Keep the root desktop/icon identity in
+# sync with the freedesktop application ID so WM_CLASS -> desktop -> Icon
+# resolves to the Sideband logo instead of a generic fallback/checkmark icon.
+# Must run AFTER linuxdeploy so our files are not overwritten by its --icon-file step.
+cp "${APPDIR}/usr/share/applications/${DESKTOP_ID}" "${APPDIR}/${DESKTOP_ID}"
+cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/com.evalalan.sideband.png"
+cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/.DirIcon"
 
 cat > "${APPDIR}/AppRun" <<'APPRUN'
 #!/usr/bin/env bash
