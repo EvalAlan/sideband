@@ -539,12 +539,13 @@ class _Cli {
     final parsed = <ChatMsg>[];
     for (final item in decoded) {
       if (item is! Map) continue;
+      final conversationKind = (item['conversation_kind'] as String?) ?? '';
       parsed.add(ChatMsg(
         id: (item['id'] as num).toInt(),
         direction: item['direction'] as String,
         status: _statusLabel((item['status'] as num).toInt()),
         contact: item['contact'] as String,
-        group: (item['conversation_id'] as String?) ?? '',
+        group: conversationKind == 'group' ? (item['conversation_id'] as String?) ?? '' : '',
         text: item['body'] as String,
         tsMs: (item['timestamp_ms'] as num).toInt(),
       ));
@@ -2799,9 +2800,9 @@ class _ChatScreenState extends State<_ChatScreen> {
 
   Widget _unreadDot() {
     return Container(
-      width: 8,
-      height: 8,
-      margin: const EdgeInsets.only(right: 4),
+      width: 10,
+      height: 10,
+      margin: const EdgeInsets.only(right: 6),
       decoration: const BoxDecoration(
         color: Colors.redAccent,
         shape: BoxShape.circle,
