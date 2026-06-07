@@ -38,10 +38,12 @@ static GdkPixbuf* load_window_icon(int size) {
 }
 
 static void set_window_icon(GtkWindow* window) {
+  // Load the icon from the Flutter asset bundle.
   g_autoptr(GdkPixbuf) icon = load_window_icon(256);
   if (!icon) return;
 
   gtk_window_set_icon(window, icon);
+
   GList* icons = nullptr;
   icons = g_list_append(icons, gdk_pixbuf_copy(icon));
   g_autoptr(GdkPixbuf) small =

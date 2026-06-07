@@ -94,13 +94,20 @@ log "Generating icons..."
 rm -rf "${APPDIR}"
 for size in 16 32 48 64 128 256 512; do
     mkdir -p "${ICON_DIR}/${size}x${size}/apps"
-    if command -v magick   >/dev/null 2>&1; then magick   "${ICON_SVG}" -resize "${size}x${size}" "${ICON_DIR}/${size}x${size}/apps/sideband_gui.png"
-    elif command -v convert >/dev/null 2>&1; then convert "${ICON_SVG}" -resize "${size}x${size}" "${ICON_DIR}/${size}x${size}/apps/sideband_gui.png"
-    elif command -v inkscape >/dev/null 2>&1; then inkscape "${ICON_SVG}" --export-type=png --export-width="${size}" --export-height="${size}" --export-filename="${ICON_DIR}/${size}x${size}/apps/sideband_gui.png"
-    else warn "No icon tools found"; break; fi
+    DEST="${ICON_DIR}/${size}x${size}/apps/com.evalalan.sideband.png"
+    if command -v magick   >/dev/null 2>/dev/null; then
+      magick "${ICON_SVG}" -resize "${size}x${size}" "${DEST}"
+    elif command -v convert >/dev/null 2>/dev/null; then
+      convert "${ICON_SVG}" -resize "${size}x${size}" "${DEST}"
+    elif command -v inkscape >/dev/null 2>/dev/null; then
+      inkscape "${ICON_SVG}" --export-type=png --export-width="${size}" --export-height="${size}" --export-filename="${DEST}"
+    else
+      warn "No ImageMagick/convert/inkscape — skipping icon generation for ${size}x${size}"
+      break
+    fi
 done
 mkdir -p "${ICON_DIR}/scalable/apps"
-cp "${ICON_SVG}" "${ICON_DIR}/scalable/apps/sideband_gui.svg"
+cp "${ICON_SVG}" "${ICON_DIR}/scalable/apps/com.evalalan.sideband.svg"
 
 # Step 5: Create AppDir
 log "Creating AppDir..."
@@ -151,7 +158,7 @@ APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --executable "${APPDIR}/usr/bin/sideband_gui.bin" \
     --executable "${APPDIR}/usr/bin/sideband" \
     --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
-    --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg"
+    --icon-file "${ICON_DIR}/scalable/apps/com.evalalan.sideband.svg"
 
 if [[ -f "${APPDIR}/usr/lib/libtray_manager_plugin.so" ]] && \
    [[ ! -e "${APPDIR}/usr/lib/libayatana-appindicator3.so.1" ]] && \
