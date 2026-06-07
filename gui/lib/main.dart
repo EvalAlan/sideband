@@ -243,6 +243,48 @@ List<String> groupCreateArgs({
   return args;
 }
 
+List<String> groupDeleteArgs({required String profile, required String group}) => [
+      'group',
+      'delete',
+      '--profile',
+      profile,
+      '--group',
+      group.trim(),
+    ];
+
+List<String> groupRenameArgs({
+  required String profile,
+  required String group,
+  required String title,
+}) => [
+      'group',
+      'rename',
+      '--profile',
+      profile,
+      '--group',
+      group.trim(),
+      '--title',
+      title.trim(),
+      '--json',
+    ];
+
+List<String> groupMemberMutationArgs({
+  required String profile,
+  required String action,
+  required String group,
+  required String member,
+}) => [
+      'group',
+      action,
+      '--profile',
+      profile,
+      '--group',
+      group.trim(),
+      '--member',
+      member.trim(),
+      '--json',
+    ];
+
 class _Cli {
   _Cli();
 
@@ -350,9 +392,34 @@ class _Cli {
         name,
       ]);
 
-  Future<String> clearHistory({String? contact}) {
+  Future<String> deleteGroup(String group) =>
+      _run(groupDeleteArgs(profile: profile, group: group));
+
+  Future<GroupInfo> renameGroup({required String group, required String title}) =>
+      _parseGroupFromArgs(
+          groupRenameArgs(profile: profile, group: group, title: title),
+          context: 'group rename');
+
+  Future<GroupInfo> addGroupMember({required String group, required String member}) =>
+      _parseGroupFromArgs(
+          groupMemberMutationArgs(
+              profile: profile, action: 'member-add', group: group, member: member),
+          context: 'group member add');
+
+  Future<GroupInfo> removeGroupMember({required String group, required String member}) =>
+      _parseGroupFromArgs(
+          groupMemberMutationArgs(
+              profile: profile,
+              action: 'member-remove',
+              group: group,
+              member: member),
+          context: 'group member remove');
+
+  Future<String> clearHistory({String? contact, String? group}) {
     final args = ['history', '--profile', profile, '--clear'];
-    if (contact != null && contact.trim().isNotEmpty) {
+    if (group != null && group.trim().isNotEmpty) {
+      args.addAll(['--group', group.trim()]);
+    } else if (contact != null && contact.trim().isNotEmpty) {
       args.addAll(['--contact', contact.trim()]);
     }
     return _run(args);
@@ -421,9 +488,18 @@ class _Cli {
     required List<String> members,
   }) async {
     final raw = await _run(groupCreateArgs(profile: profile, title: title, members: members));
+    return _parseGroup(raw, context: 'group create');
+  }
+
+  Future<GroupInfo> _parseGroupFromArgs(List<String> args, {required String context}) async {
+    final raw = await _run(args);
+    return _parseGroup(raw, context: context);
+  }
+
+  GroupInfo _parseGroup(String raw, {required String context}) {
     final decoded = jsonDecode(raw);
     if (decoded is! Map) {
-      throw Exception('group create JSON was not an object');
+      throw Exception('$context JSON was not an object');
     }
     final parsedMembers = <String>[];
     final rawMembers = decoded['members'];
@@ -1007,7 +1083,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       switch (cmd) {
         case 'help':
           _showInfo('Slash commands',
-              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group <id-or-title> <msg>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
+              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group-delete <id-or-title>\n/group-rename <id-or-title> <new-title>\n/group-add <id-or-title> <member>\n/group-remove <id-or-title> <member>\n/group <id-or-title> <msg>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
           return;
         case 'send':
           if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
@@ -1026,6 +1102,40 @@ class _ChatScreenState extends State<_ChatScreen> {
           );
           await _load();
           _showInfo('Group created', group.details);
+          return;
+        case 'group-delete':
+          if (parts.length != 2) throw Exception('usage: /group-delete <id-or-title>');
+          _showInfo('Group deleted', await _cli.deleteGroup(parts[1]));
+          await _load();
+          if (_selGroup?.id == parts[1] || _selGroup?.title == parts[1]) {
+            setState(() {
+              _selGroup = null;
+              _msgs = const [];
+            });
+          }
+          return;
+        case 'group-rename':
+          if (parts.length < 3) {
+            throw Exception('usage: /group-rename <id-or-title> <new-title>');
+          }
+          final group = await _cli.renameGroup(
+            group: parts[1],
+            title: raw.split(RegExp(r'\s+')).skip(2).join(' '),
+          );
+          await _load();
+          _showInfo('Group renamed', group.details);
+          return;
+        case 'group-add':
+          if (parts.length != 3) throw Exception('usage: /group-add <id-or-title> <member>');
+          final added = await _cli.addGroupMember(group: parts[1], member: parts[2]);
+          await _load();
+          _showInfo('Member added', added.details);
+          return;
+        case 'group-remove':
+          if (parts.length != 3) throw Exception('usage: /group-remove <id-or-title> <member>');
+          final removed = await _cli.removeGroupMember(group: parts[1], member: parts[2]);
+          await _load();
+          _showInfo('Member removed', removed.details);
           return;
         case 'group':
           if (parts.length < 3) throw Exception('usage: /group <id-or-title> <message>');
@@ -1355,6 +1465,174 @@ class _ChatScreenState extends State<_ChatScreen> {
       await _load();
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _clearGroupHistoryFor(GroupInfo group) async {
+    if (!await _confirm(
+        'Delete group history', 'Delete all message history for ${group.title}?')) {
+      return;
+    }
+    try {
+      _showInfo('History deleted', await _cli.clearHistory(group: group.id));
+      await _loadGroupHistory(group.id);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _deleteGroup(GroupInfo group) async {
+    if (!await _confirm('Delete group',
+        'Delete ${group.title} and its local message history?')) {
+      return;
+    }
+    try {
+      _showInfo('Group deleted', await _cli.deleteGroup(group.id));
+      await _load();
+      if (_selGroup?.id == group.id) {
+        setState(() {
+          _selGroup = null;
+          _msgs = const [];
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _showEditGroupDialog(GroupInfo group) async {
+    final title = TextEditingController(text: group.title);
+    final selected = group.members.toSet();
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (_) => StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            backgroundColor: _surface,
+            title: Text('Manage ${group.title}', style: const TextStyle(color: _text)),
+            content: SizedBox(
+              width: 520,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: title,
+                    decoration: const InputDecoration(labelText: 'Group title'),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text('Members', style: TextStyle(color: _textDim, fontSize: 12)),
+                  const SizedBox(height: 6),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 260),
+                    child: ListView(
+                      shrinkWrap: true,
+                      children: _contacts
+                          .map((contact) => CheckboxListTile(
+                                value: selected.contains(contact.name),
+                                dense: true,
+                                title: Text(contact.name),
+                                subtitle: Text(contact.securityLabel),
+                                onChanged: (checked) {
+                                  setDialogState(() {
+                                    if (checked == true) {
+                                      selected.add(contact.name);
+                                    } else {
+                                      selected.remove(contact.name);
+                                    }
+                                  });
+                                },
+                              ))
+                          .toList(),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Membership changes affect local fan-out for future sends. They do not delete old messages or enforce remote removals.',
+                    style: TextStyle(color: _textDim, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel')),
+              FilledButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Save')),
+            ],
+          ),
+        ),
+      );
+      if (ok != true) return;
+      final newTitle = title.text.trim();
+      if (newTitle.isEmpty) throw Exception('group title is required');
+      if (selected.isEmpty) throw Exception('select at least one group member');
+      if (newTitle != group.title) {
+        await _cli.renameGroup(group: group.id, title: newTitle);
+      }
+      final wanted = selected.toSet();
+      final current = group.members.toSet();
+      for (final member in wanted.difference(current)) {
+        await _cli.addGroupMember(group: group.id, member: member);
+      }
+      for (final member in current.difference(wanted)) {
+        await _cli.removeGroupMember(group: group.id, member: member);
+      }
+      await _load();
+      GroupInfo? updated;
+      for (final candidate in _groups.where((g) => g.id == group.id)) {
+        updated = candidate;
+        break;
+      }
+      if (updated != null) {
+        setState(() => _selGroup = updated);
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      title.dispose();
+    }
+  }
+
+  Future<void> _showGroupMenu(GroupInfo group, Offset position) async {
+    final action = await showMenu<String>(
+      context: context,
+      position:
+          RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
+      color: _surface,
+      items: const [
+        PopupMenuItem(value: 'history', child: Text('Show history')),
+        PopupMenuItem(value: 'clear-history', child: Text('Delete history')),
+        PopupMenuDivider(),
+        PopupMenuItem(value: 'edit', child: Text('Manage group')),
+        PopupMenuItem(value: 'delete', child: Text('Delete group')),
+        PopupMenuDivider(),
+        PopupMenuItem(value: 'details', child: Text('Group details')),
+      ],
+    );
+    if (action == null) return;
+    await _handleGroupAction(group, action);
+  }
+
+  Future<void> _handleGroupAction(GroupInfo group, String action) async {
+    switch (action) {
+      case 'history':
+        await _runSlashCommand('/history-group ${group.id}');
+        return;
+      case 'clear-history':
+        await _clearGroupHistoryFor(group);
+        return;
+      case 'edit':
+        await _showEditGroupDialog(group);
+        return;
+      case 'delete':
+        await _deleteGroup(group);
+        return;
+      case 'details':
+        _showInfo('Group details', group.details);
+        return;
     }
   }
 
@@ -1795,7 +2073,10 @@ class _ChatScreenState extends State<_ChatScreen> {
                           );
                         }
                         final g = _groups[i - _contacts.length - 1];
-                        return ListTile(
+                        return GestureDetector(
+                          onSecondaryTapDown: (details) =>
+                              _showGroupMenu(g, details.globalPosition),
+                          child: ListTile(
                           leading: const CircleAvatar(
                             radius: 17,
                             backgroundColor: _surface2,
@@ -1812,10 +2093,20 @@ class _ChatScreenState extends State<_ChatScreen> {
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(fontSize: 10.5, color: _textDim)),
-                          trailing: IconButton(
-                            icon: const Icon(Icons.info_outline, size: 17),
-                            tooltip: 'Group details',
-                            onPressed: () => _showInfo('Group details', g.details),
+                          trailing: PopupMenuButton<String>(
+                            icon: const Icon(Icons.more_vert, size: 17),
+                            tooltip: 'Group menu',
+                            color: _surface,
+                            onSelected: (action) async => _handleGroupAction(g, action),
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(value: 'history', child: Text('Show history')),
+                              PopupMenuItem(value: 'clear-history', child: Text('Delete history')),
+                              PopupMenuDivider(),
+                              PopupMenuItem(value: 'edit', child: Text('Manage group')),
+                              PopupMenuItem(value: 'delete', child: Text('Delete group')),
+                              PopupMenuDivider(),
+                              PopupMenuItem(value: 'details', child: Text('Group details')),
+                            ],
                           ),
                           selected: _selGroup?.id == g.id,
                           onTap: () async {
@@ -1827,6 +2118,7 @@ class _ChatScreenState extends State<_ChatScreen> {
                             });
                             _scrollToBottom();
                           },
+                          ),
                         );
                       }
                       final c = _contacts[i];

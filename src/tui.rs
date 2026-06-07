@@ -185,6 +185,87 @@ impl App {
                     }
                     return false;
                 }
+                Some("group-delete") => {
+                    let Some(group_ref) = parts.get(1).copied() else {
+                        self.push_sys("usage: /group-delete <id-or-title>", "error");
+                        return false;
+                    };
+                    match crate::delete_group(&self.profile, group_ref) {
+                        Ok(group) => {
+                            self.groups = crate::load_groups(&self.profile).unwrap_or_default();
+                            self.unread_groups.remove(&group.id);
+                            if self
+                                .selected_group_id()
+                                .map(|selected| selected == group.id)
+                                .unwrap_or(false)
+                            {
+                                self.selected_contact = 0;
+                            }
+                            self.push_sys(
+                                &format!("group '{}' deleted ({})", group.title, group.id),
+                                "info",
+                            );
+                        }
+                        Err(e) => self.push_sys(&format!("group delete failed: {}", e), "error"),
+                    }
+                    return false;
+                }
+                Some("group-rename") => {
+                    if parts.len() < 3 {
+                        self.push_sys("usage: /group-rename <id-or-title> <new-title>", "error");
+                        return false;
+                    }
+                    let group_ref = parts[1];
+                    let title = parts[2..].join(" ");
+                    match crate::rename_group(&self.profile, group_ref, &title) {
+                        Ok(group) => {
+                            self.groups = crate::load_groups(&self.profile).unwrap_or_default();
+                            self.push_sys(
+                                &format!("group renamed to '{}' ({})", group.title, group.id),
+                                "info",
+                            );
+                        }
+                        Err(e) => self.push_sys(&format!("group rename failed: {}", e), "error"),
+                    }
+                    return false;
+                }
+                Some("group-add") => {
+                    if parts.len() != 3 {
+                        self.push_sys("usage: /group-add <id-or-title> <member>", "error");
+                        return false;
+                    }
+                    match crate::add_group_member(&self.profile, parts[1], parts[2]) {
+                        Ok(group) => {
+                            self.groups = crate::load_groups(&self.profile).unwrap_or_default();
+                            self.push_sys(
+                                &format!("member '{}' added to group '{}'", parts[2], group.title),
+                                "info",
+                            );
+                        }
+                        Err(e) => self.push_sys(&format!("group add failed: {}", e), "error"),
+                    }
+                    return false;
+                }
+                Some("group-remove") => {
+                    if parts.len() != 3 {
+                        self.push_sys("usage: /group-remove <id-or-title> <member>", "error");
+                        return false;
+                    }
+                    match crate::remove_group_member(&self.profile, parts[1], parts[2]) {
+                        Ok(group) => {
+                            self.groups = crate::load_groups(&self.profile).unwrap_or_default();
+                            self.push_sys(
+                                &format!(
+                                    "member '{}' removed from group '{}'",
+                                    parts[2], group.title
+                                ),
+                                "info",
+                            );
+                        }
+                        Err(e) => self.push_sys(&format!("group remove failed: {}", e), "error"),
+                    }
+                    return false;
+                }
                 Some("group") => {
                     if parts.len() < 3 {
                         self.push_sys("usage: /group <id-or-title> <message>", "error");
@@ -246,7 +327,7 @@ impl App {
                 }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/group-create <title> <member> [member...] — create group\n/group-delete <id-or-title> — delete group\n/group-rename <id-or-title> <new-title> — rename group\n/group-add <id-or-title> <member> — add group member\n/group-remove <id-or-title> <member> — remove group member\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
                         "help",
                     );
                     return false;
@@ -1639,7 +1720,7 @@ fn chat_scroll_position(
 }
 
 fn group_create_usage_text() -> &'static str {
-    "/group-create <title> <member> [member...] — create group. Repeat members by adding more contact names."
+    "/group-create <title> <member> [member...] — create group. Repeat members by adding more contact names.\n/group-delete <id-or-title> — delete group.\n/group-rename <id-or-title> <new-title> — rename group.\n/group-add <id-or-title> <member> — add a member.\n/group-remove <id-or-title> <member> — remove a member."
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {

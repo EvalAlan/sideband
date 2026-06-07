@@ -223,6 +223,52 @@ enum GroupAction {
         #[arg(long = "static")]
         force_static: bool,
     },
+    Delete {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Group id or exact title.
+        #[arg(long)]
+        group: String,
+    },
+    Rename {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Group id or exact title.
+        #[arg(long)]
+        group: String,
+        /// New human-readable group title.
+        #[arg(long)]
+        title: String,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    MemberAdd {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Group id or exact title.
+        #[arg(long)]
+        group: String,
+        /// Contact name to add.
+        #[arg(long)]
+        member: String,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    MemberRemove {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Group id or exact title.
+        #[arg(long)]
+        group: String,
+        /// Contact name to remove.
+        #[arg(long)]
+        member: String,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,6 +1432,88 @@ pub(crate) fn resolve_group(profile: &Path, group_ref: &str) -> Result<GroupInfo
     }
 }
 
+pub(crate) fn rename_group(profile: &Path, group_ref: &str, title: &str) -> Result<GroupInfo> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(anyhow!("group title is required"));
+    }
+    let group = resolve_group(profile, group_ref)?;
+    let now = now_ms_i64()?;
+    let conn = init_db(profile)?;
+    conn.execute(
+        "UPDATE groups SET title = ?1, updated_at_ms = ?2 WHERE id = ?3",
+        params![title, now, group.id],
+    )?;
+    resolve_group(profile, &group.id)
+}
+
+pub(crate) fn delete_group(profile: &Path, group_ref: &str) -> Result<GroupInfo> {
+    let group = resolve_group(profile, group_ref)?;
+    let conn = init_db(profile)?;
+    conn.execute(
+        "DELETE FROM messages WHERE conversation_kind = 'group' AND conversation_id = ?1",
+        params![group.id],
+    )?;
+    conn.execute(
+        "DELETE FROM group_members WHERE group_id = ?1",
+        params![group.id],
+    )?;
+    conn.execute("DELETE FROM groups WHERE id = ?1", params![group.id])?;
+    Ok(group)
+}
+
+pub(crate) fn add_group_member(profile: &Path, group_ref: &str, member: &str) -> Result<GroupInfo> {
+    let member = member.trim();
+    if member.is_empty() {
+        return Err(anyhow!("group member is required"));
+    }
+    let contacts = load_contacts(profile)?;
+    if !contacts.contains_key(member) {
+        return Err(anyhow!("unknown group member '{member}'"));
+    }
+    let group = resolve_group(profile, group_ref)?;
+    let now = now_ms_i64()?;
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO group_members (group_id, contact, role, added_at_ms) VALUES (?1, ?2, 'member', ?3)",
+        params![group.id, member, now],
+    )?;
+    conn.execute(
+        "UPDATE groups SET updated_at_ms = ?1 WHERE id = ?2",
+        params![now, group.id],
+    )?;
+    resolve_group(profile, &group.id)
+}
+
+pub(crate) fn remove_group_member(
+    profile: &Path,
+    group_ref: &str,
+    member: &str,
+) -> Result<GroupInfo> {
+    let member = member.trim();
+    if member.is_empty() {
+        return Err(anyhow!("group member is required"));
+    }
+    let group = resolve_group(profile, group_ref)?;
+    if !group.members.iter().any(|m| m.contact == member) {
+        return Err(anyhow!("group member '{member}' not found"));
+    }
+    if group.members.len() <= 1 {
+        return Err(anyhow!("group requires at least one member"));
+    }
+    let now = now_ms_i64()?;
+    let conn = init_db(profile)?;
+    conn.execute(
+        "DELETE FROM group_members WHERE group_id = ?1 AND contact = ?2",
+        params![group.id, member],
+    )?;
+    conn.execute(
+        "UPDATE groups SET updated_at_ms = ?1 WHERE id = ?2",
+        params![now, group.id],
+    )?;
+    resolve_group(profile, &group.id)
+}
+
 pub(crate) fn discover_or_update_group(
     profile: &Path,
     group_id: &str,
@@ -1751,6 +1879,61 @@ async fn main() -> Result<()> {
                     for failure in result.failures {
                         println!("failed {}: {}", failure.contact, failure.error);
                     }
+                }
+                Ok(())
+            }
+            GroupAction::Delete { profile, group } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let deleted = delete_group(&profile, &group)?;
+                println!("group '{}' deleted ({})", deleted.title, deleted.id);
+                Ok(())
+            }
+            GroupAction::Rename {
+                profile,
+                group,
+                title,
+                json,
+            } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let group = rename_group(&profile, &group, &title)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&group)?);
+                } else {
+                    println!("group '{}' renamed ({})", group.title, group.id);
+                }
+                Ok(())
+            }
+            GroupAction::MemberAdd {
+                profile,
+                group,
+                member,
+                json,
+            } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let group = add_group_member(&profile, &group, &member)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&group)?);
+                } else {
+                    println!("member '{}' added to group '{}'", member, group.title);
+                }
+                Ok(())
+            }
+            GroupAction::MemberRemove {
+                profile,
+                group,
+                member,
+                json,
+            } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let group = remove_group_member(&profile, &group, &member)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&group)?);
+                } else {
+                    println!("member '{}' removed from group '{}'", member, group.title);
                 }
                 Ok(())
             }
@@ -3416,6 +3599,81 @@ mod tests {
     fn group_create_rejects_unknown_member() {
         let dir = tempfile::tempdir().unwrap();
         let err = create_group(dir.path(), "Ops", &["ghost".into()]).unwrap_err();
+        assert!(err.to_string().contains("unknown group member"));
+    }
+
+    #[test]
+    fn group_management_renames_adds_removes_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+        contact_add(
+            dir.path(),
+            "bob",
+            "psrntpu56hilbftscupr6f4ujxb6kjn6n2qy4366sen4lqkqpspjezid.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+
+        let created = create_group(dir.path(), "Ops", &["alice".into()]).unwrap();
+        let renamed = rename_group(dir.path(), &created.id, "Homies").unwrap();
+        assert_eq!(renamed.title, "Homies");
+
+        let with_bob = add_group_member(dir.path(), "Homies", "bob").unwrap();
+        assert_eq!(with_bob.members.len(), 2);
+        assert!(with_bob.members.iter().any(|m| m.contact == "bob"));
+
+        let without_bob = remove_group_member(dir.path(), &created.id, "bob").unwrap();
+        assert_eq!(without_bob.members.len(), 1);
+        assert!(!without_bob.members.iter().any(|m| m.contact == "bob"));
+
+        let err = remove_group_member(dir.path(), &created.id, "alice").unwrap_err();
+        assert!(err.to_string().contains("at least one member"));
+
+        store_message_for_conversation(
+            dir.path(),
+            "out",
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            "old group row",
+            42,
+            DeliveryStatus::Sent,
+            "group",
+            &created.id,
+        )
+        .unwrap();
+
+        let deleted = delete_group(dir.path(), &created.id).unwrap();
+        assert_eq!(deleted.title, "Homies");
+        assert!(load_groups(dir.path()).unwrap().is_empty());
+        let rows = load_history(dir.path(), None, 10).unwrap();
+        assert!(rows.iter().all(|row| row.conversation_id != created.id));
+    }
+
+    #[test]
+    fn group_member_add_rejects_unknown_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+        let group = create_group(dir.path(), "Ops", &["alice".into()]).unwrap();
+        let err = add_group_member(dir.path(), &group.id, "ghost").unwrap_err();
         assert!(err.to_string().contains("unknown group member"));
     }
 

@@ -60,6 +60,22 @@ void main() {
     );
   });
 
+  test('group management args use backend group commands', () {
+    expect(
+      groupDeleteArgs(profile: '/tmp/p', group: 'Ops'),
+      ['group', 'delete', '--profile', '/tmp/p', '--group', 'Ops'],
+    );
+    expect(
+      groupRenameArgs(profile: '/tmp/p', group: 'g1', title: 'Homies'),
+      ['group', 'rename', '--profile', '/tmp/p', '--group', 'g1', '--title', 'Homies', '--json'],
+    );
+    expect(
+      groupMemberMutationArgs(
+          profile: '/tmp/p', action: 'member-add', group: 'g1', member: 'bob'),
+      ['group', 'member-add', '--profile', '/tmp/p', '--group', 'g1', '--member', 'bob', '--json'],
+    );
+  });
+
   testWidgets('app boot does not crash', (WidgetTester tester) async {
     await tester.pumpWidget(const SidebandApp());
     await tester.pump(const Duration(milliseconds: 500));
