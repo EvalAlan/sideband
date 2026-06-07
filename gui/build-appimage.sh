@@ -174,8 +174,11 @@ fi
 # the AppDir root, not just usr/share. Keep the root desktop/icon identity in
 # sync with the freedesktop application ID so WM_CLASS -> desktop -> Icon
 # resolves to the Sideband logo instead of a generic fallback/checkmark icon.
-# Must run AFTER linuxdeploy so our files are not overwritten by its --icon-file step.
-cp "${APPDIR}/usr/share/applications/${DESKTOP_ID}" "${APPDIR}/${DESKTOP_ID}"
+# Must run AFTER linuxdeploy; linuxdeploy already symlinks the root .desktop
+# and .DirIcon from the hicolor theme. Remove its .DirIcon (64x64 symlink) and
+# replace with a direct copy of the 256x256 icon so the taskbar gets the
+# high-res Sideband logo at AppDir root.
+rm -f "${APPDIR}/.DirIcon"
 cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/com.evalalan.sideband.png"
 cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/.DirIcon"
 
