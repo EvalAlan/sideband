@@ -1180,12 +1180,6 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     return 'sideband_gui';
   }
 
-  Future<void> _minimizeToTaskbar() async {
-    if (!(Platform.isLinux || Platform.isWindows || Platform.isMacOS)) return;
-    await windowManager.setSkipTaskbar(false);
-    await windowManager.minimize();
-  }
-
   Future<void> _showWindow() async {
     if (!(Platform.isLinux || Platform.isWindows || Platform.isMacOS)) return;
     await windowManager.setSkipTaskbar(false);
