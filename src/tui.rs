@@ -73,6 +73,7 @@ struct App {
     unread_groups: HashSet<String>,
 }
 
+#[derive(Debug)]
 struct DisplayMessage {
     direction: String,
     contact: String,
@@ -1478,6 +1479,69 @@ mod group_sidebar_tests {
         assert_eq!(message.conversation_id.as_deref(), Some("g1"));
     }
 
+    #[test]
+    fn group_outbound_does_not_leak_into_dm_history() {
+        let (tui_tx, tui_rx) = tokio::sync::mpsc::channel(1);
+        let (send_tx, _send_rx) = tokio::sync::mpsc::channel(1);
+        let (file_tx, _file_rx) = tokio::sync::mpsc::channel(1);
+        drop(tui_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            tui_rx,
+            send_tx,
+            file_tx,
+            vec!["alice".to_string(), "bob".to_string()],
+            quit_tx,
+        );
+        app.profile_name = "alan".to_string();
+        app.groups = vec![test_group("g1", "Homies")];
+
+        app.selected_contact = 0;
+        app.do_send_group("Homies", "Yo");
+        app.record_inbound_group_message(
+            "g1".to_string(),
+            "Homies".to_string(),
+            "alice".to_string(),
+            "Word".to_string(),
+            1,
+            true,
+        );
+
+        app.selected_contact = 0;
+        let alice_messages: Vec<&DisplayMessage> = app
+            .messages
+            .iter()
+            .filter(|m| {
+                m.direction != "sys"
+                    && app.selected_contact_name().as_deref() == Some(m.contact.as_str())
+                    && m.conversation_id.is_none()
+            })
+            .collect();
+        assert!(
+            alice_messages.is_empty(),
+            "group messages must not appear in alice DM history; got {:?}",
+            alice_messages
+        );
+
+        app.selected_contact = 1;
+        let bob_messages: Vec<&DisplayMessage> = app
+            .messages
+            .iter()
+            .filter(|m| {
+                m.direction != "sys"
+                    && app.selected_contact_name().as_deref() == Some(m.contact.as_str())
+                    && m.conversation_id.is_none()
+            })
+            .collect();
+        assert!(
+            bob_messages.is_empty(),
+            "group messages must not appear in bob DM history; got {:?}",
+            bob_messages
+        );
+    }
+
     fn test_group(id: &str, title: &str) -> crate::GroupInfo {
         crate::GroupInfo {
             id: id.to_string(),
@@ -1798,12 +1862,11 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
                 return true; // keep system/status lines visible
             }
             match &selected {
-                Some(name) => m.contact == *name,
+                Some(name) => m.contact == *name && m.conversation_id.is_none(),
                 None => selected_group
                     .as_ref()
-                    .map(|g| {
+                    .map(|_| {
                         m.conversation_id.as_deref() == app.selected_group_id().as_deref()
-                            || m.contact == *g
                     })
                     .unwrap_or(true),
             }

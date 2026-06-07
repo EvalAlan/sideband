@@ -193,6 +193,7 @@ class ChatMsg {
     required this.direction,
     required this.status,
     required this.contact,
+    required this.group,
     required this.text,
     required this.tsMs,
   });
@@ -201,6 +202,7 @@ class ChatMsg {
   final String direction;
   final String status;
   final String contact;
+  final String group;
   final String text;
   final int tsMs;
 
@@ -542,6 +544,7 @@ class _Cli {
         direction: item['direction'] as String,
         status: _statusLabel((item['status'] as num).toInt()),
         contact: item['contact'] as String,
+        group: (item['conversation_id'] as String?) ?? '',
         text: item['body'] as String,
         tsMs: (item['timestamp_ms'] as num).toInt(),
       ));
@@ -615,6 +618,9 @@ class _ChatScreenState extends State<_ChatScreen> {
 
   List<Contact> _contacts = [];
   List<GroupInfo> _groups = [];
+  final _unreadContacts = <String>{};
+  final _unreadGroups = <String>{};
+  final _refreshSeenIds = <int>{};
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -929,6 +935,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         s = null;
       }
       final h = await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((c) => c.name));
+      _seedSeenIds(h);
       setState(() {
         _contacts = c;
         _groups = g;
@@ -972,6 +979,7 @@ class _ChatScreenState extends State<_ChatScreen> {
     if (_sel == null && _selGroup == null) return;
     try {
       final h = await _historyVisibleFor(_sel?.name, group: _selGroup?.id);
+      await _checkUnread();
       setState(() {
         _msgs = _mergePending(h.msgs);
       });
@@ -979,6 +987,39 @@ class _ChatScreenState extends State<_ChatScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _checkUnread() async {
+    try {
+      final global = await _cli.history(limit: 200);
+      _seedSeenIds(global);
+      final currentContact = _sel?.name;
+      final currentGroup = _selGroup?.id;
+      int newUnread = 0;
+      for (final m in global.msgs) {
+        if (m.direction != 'in') continue;
+        if (_refreshSeenIds.contains(m.id)) continue;
+        final belongsHere = (currentGroup != null && m.group == currentGroup) ||
+            (currentGroup == null &&
+                currentContact != null &&
+                m.contact == currentContact &&
+                m.group.isEmpty);
+        if (belongsHere) {
+          _refreshSeenIds.add(m.id);
+          continue;
+        }
+        _refreshSeenIds.add(m.id);
+        newUnread++;
+        if (m.group.isNotEmpty) {
+          _unreadGroups.add(m.group!);
+        } else if (m.contact.isNotEmpty) {
+          _unreadContacts.add(m.contact);
+        }
+      }
+      if (newUnread > 0 && mounted) setState(() {});
+    } catch (_) {
+      // best-effort; never break the UI over unread accounting
     }
   }
 
@@ -1003,6 +1044,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         direction: 'out',
         status: 'sending',
         contact: c?.name ?? 'You',
+        group: g?.id ?? '',
         text: t,
         tsMs: now.millisecondsSinceEpoch);
     setState(() {
@@ -2093,19 +2135,36 @@ class _ChatScreenState extends State<_ChatScreen> {
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(fontSize: 10.5, color: _textDim)),
-                          trailing: PopupMenuButton<String>(
-                            icon: const Icon(Icons.more_vert, size: 17),
-                            tooltip: 'Group menu',
-                            color: _surface,
-                            onSelected: (action) async => _handleGroupAction(g, action),
-                            itemBuilder: (_) => const [
-                              PopupMenuItem(value: 'history', child: Text('Show history')),
-                              PopupMenuItem(value: 'clear-history', child: Text('Delete history')),
-                              PopupMenuDivider(),
-                              PopupMenuItem(value: 'edit', child: Text('Manage group')),
-                              PopupMenuItem(value: 'delete', child: Text('Delete group')),
-                              PopupMenuDivider(),
-                              PopupMenuItem(value: 'details', child: Text('Group details')),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (_unreadGroups.contains(g.id)) _unreadDot(),
+                              PopupMenuButton<String>(
+                                icon: const Icon(Icons.more_vert, size: 17),
+                                tooltip: 'Group menu',
+                                color: _surface,
+                                onSelected: (action) async =>
+                                    _handleGroupAction(g, action),
+                                itemBuilder: (_) => const [
+                                  PopupMenuItem(
+                                      value: 'history',
+                                      child: Text('Show history')),
+                                  PopupMenuItem(
+                                      value: 'clear-history',
+                                      child: Text('Delete history')),
+                                  PopupMenuDivider(),
+                                  PopupMenuItem(
+                                      value: 'edit',
+                                      child: Text('Manage group')),
+                                  PopupMenuItem(
+                                      value: 'delete',
+                                      child: Text('Delete group')),
+                                  PopupMenuDivider(),
+                                  PopupMenuItem(
+                                      value: 'details',
+                                      child: Text('Group details')),
+                                ],
+                              ),
                             ],
                           ),
                           selected: _selGroup?.id == g.id,
@@ -2115,6 +2174,7 @@ class _ChatScreenState extends State<_ChatScreen> {
                               _sel = null;
                               _selGroup = g;
                               _msgs = _mergePending(h.msgs);
+                              _unreadGroups.remove(g.id);
                             });
                             _scrollToBottom();
                           },
@@ -2185,50 +2245,62 @@ class _ChatScreenState extends State<_ChatScreen> {
                               ),
                             ],
                           ),
-                          trailing: PopupMenuButton<String>(
-                            tooltip: 'Contact menu',
-                            icon: const Icon(Icons.more_vert, size: 17),
-                            color: _surface,
-                            onSelected: (action) async {
-                              switch (action) {
-                                case 'history':
-                                  await _runSlashCommand('/history ${c.name}');
-                                  return;
-                                case 'clear-history':
-                                  await _clearHistoryFor(c);
-                                  return;
-                                case 'edit':
-                                  await _showEditContactDialog(c);
-                                  return;
-                                case 'delete':
-                                  await _deleteContact(c);
-                                  return;
-                                case 'details':
-                                  _showInfo('Contact details',
-                                      '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
-                                  return;
-                              }
-                            },
-                            itemBuilder: (_) => const [
-                              PopupMenuItem(
-                                  value: 'history', child: Text('Show history')),
-                              PopupMenuItem(
-                                  value: 'clear-history',
-                                  child: Text('Delete history')),
-                              PopupMenuDivider(),
-                              PopupMenuItem(
-                                  value: 'edit', child: Text('Edit contact')),
-                              PopupMenuItem(
-                                  value: 'delete', child: Text('Delete contact')),
-                              PopupMenuDivider(),
-                              PopupMenuItem(
-                                  value: 'details', child: Text('Contact details')),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (_unreadContacts.contains(c.name)) _unreadDot(),
+                              PopupMenuButton<String>(
+                                tooltip: 'Contact menu',
+                                icon: const Icon(Icons.more_vert, size: 17),
+                                color: _surface,
+                                onSelected: (action) async {
+                                  switch (action) {
+                                    case 'history':
+                                      await _runSlashCommand(
+                                          '/history ${c.name}');
+                                      return;
+                                    case 'clear-history':
+                                      await _clearHistoryFor(c);
+                                      return;
+                                    case 'edit':
+                                      await _showEditContactDialog(c);
+                                      return;
+                                    case 'delete':
+                                      await _deleteContact(c);
+                                      return;
+                                    case 'details':
+                                      _showInfo('Contact details',
+                                          '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
+                                      return;
+                                  }
+                                },
+                                itemBuilder: (_) => const [
+                                  PopupMenuItem(
+                                      value: 'history',
+                                      child: Text('Show history')),
+                                  PopupMenuItem(
+                                      value: 'clear-history',
+                                      child: Text('Delete history')),
+                                  PopupMenuDivider(),
+                                  PopupMenuItem(
+                                      value: 'edit',
+                                      child: Text('Edit contact')),
+                                  PopupMenuItem(
+                                      value: 'delete',
+                                      child: Text('Delete contact')),
+                                  PopupMenuDivider(),
+                                  PopupMenuItem(
+                                      value: 'details',
+                                      child: Text('Contact details')),
+                                ],
+                              ),
                             ],
                           ),
                           onTap: () async {
                             setState(() {
                               _sel = c;
                               _selGroup = null;
+                              _unreadContacts.remove(c.name);
                             });
                             await _refresh();
                           },
@@ -2634,6 +2706,24 @@ class _ChatScreenState extends State<_ChatScreen> {
                 : const Icon(Icons.send_rounded, size: 17),
           ),
         ],
+      ),
+    );
+  }
+
+  void _seedSeenIds(_History h) {
+    _refreshSeenIds.addAll(h.msgs.map((m) => m.id));
+  }
+
+  // ── unread indicator ──────────────────────────────────────────────────────
+
+  Widget _unreadDot() {
+    return Container(
+      width: 8,
+      height: 8,
+      margin: const EdgeInsets.only(right: 4),
+      decoration: const BoxDecoration(
+        color: Colors.redAccent,
+        shape: BoxShape.circle,
       ),
     );
   }

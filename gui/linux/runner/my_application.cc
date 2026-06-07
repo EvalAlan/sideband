@@ -7,6 +7,23 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
+static void set_window_icon(GtkWindow* window) {
+  const char* icon_path = "data/flutter_assets/packages/sideband_gui/assets/icon_256x256.png";
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GdkPixbuf) icon = gdk_pixbuf_new_from_file_at_scale(
+      icon_path, 256, 256, TRUE, &error);
+  if (icon) {
+    gtk_window_set_icon(window, icon);
+    GList* icons = nullptr;
+    icons = g_list_append(icons, gdk_pixbuf_copy(icon));
+    g_autoptr(GdkPixbuf) small =
+        gdk_pixbuf_scale_simple(icon, 64, 64, GDK_INTERP_BILINEAR);
+    if (small) icons = g_list_append(icons, small);
+    gtk_window_set_default_icon_list(icons);
+    g_list_free_full(icons, g_object_unref);
+  }
+}
+
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
@@ -31,6 +48,8 @@ static void my_application_activate(GApplication* application) {
   gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(view));
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
+
+  set_window_icon(window);
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
   gtk_widget_show(GTK_WIDGET(view));
