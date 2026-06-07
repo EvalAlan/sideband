@@ -7,78 +7,191 @@ import 'package:flutter/services.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
-// ── palette ────────────────────────────────────────────────────────────────
+// ── theme definitions ───────────────────────────────────────────────────────
 
-const _teal = Color(0xFF26D9C8);
-const _bg = Color(0xFF0E1117);
-const _surface = Color(0xFF161B22);
-const _surface2 = Color(0xFF1C2333);
-const _border = Color(0xFF21262D);
-const _text = Color(0xFFE6EDF3);
-const _textDim = Color(0xFF7D8590);
-const _bubbleOut = Color(0xFF0D2847);
-const _bubbleIn = Color(0xFF1C2128);
-const _errorBg = Color(0xFF3D0F0F);
-const _errorFg = Color(0xFFFF7B72);
+class ThemeDef {
+  const ThemeDef({
+    required this.name,
+    required this.primary,
+    required this.bg,
+    required this.surface,
+    required this.surface2,
+    required this.border,
+    required this.text,
+    required this.textDim,
+    required this.bubbleOut,
+    required this.bubbleIn,
+    required this.errorBg,
+    required this.errorFg,
+    required this.selectedTile,
+  });
 
-// ── theme ───────────────────────────────────────────────────────────────────
+  final String name;
+  final Color primary;
+  final Color bg;
+  final Color surface;
+  final Color surface2;
+  final Color border;
+  final Color text;
+  final Color textDim;
+  final Color bubbleOut;
+  final Color bubbleIn;
+  final Color errorBg;
+  final Color errorFg;
+  final Color selectedTile;
+}
 
-ThemeData _theme() => ThemeData(
+const _themes = <String, ThemeDef>{
+  'Teal': ThemeDef(
+    name: 'Teal',
+    primary: Color(0xFF26D9C8),
+    bg: Color(0xFF0E1117),
+    surface: Color(0xFF161B22),
+    surface2: Color(0xFF1C2333),
+    border: Color(0xFF21262D),
+    text: Color(0xFFE6EDF3),
+    textDim: Color(0xFF7D8590),
+    bubbleOut: Color(0xFF0D2847),
+    bubbleIn: Color(0xFF1C2128),
+    errorBg: Color(0xFF3D0F0F),
+    errorFg: Color(0xFFFF7B72),
+    selectedTile: Color(0xFF0D1F2D),
+  ),
+  'Purple': ThemeDef(
+    name: 'Purple',
+    primary: Color(0xFFBC8CFF),
+    bg: Color(0xFF0D0B12),
+    surface: Color(0xFF161220),
+    surface2: Color(0xFF1E1830),
+    border: Color(0xFF2A2240),
+    text: Color(0xFFE8E0F8),
+    textDim: Color(0xFF7E70A0),
+    bubbleOut: Color(0xFF1A0D30),
+    bubbleIn: Color(0xFF1E1828),
+    errorBg: Color(0xFF3D0F0F),
+    errorFg: Color(0xFFFF7B72),
+    selectedTile: Color(0xFF1A1030),
+  ),
+  'Orange': ThemeDef(
+    name: 'Orange',
+    primary: Color(0xFFFF8C42),
+    bg: Color(0xFF100D0A),
+    surface: Color(0xFF1A1510),
+    surface2: Color(0xFF241C14),
+    border: Color(0xFF2E2418),
+    text: Color(0xFFF0E8DC),
+    textDim: Color(0xFF908070),
+    bubbleOut: Color(0xFF2A1508),
+    bubbleIn: Color(0xFF1E1810),
+    errorBg: Color(0xFF3D0F0F),
+    errorFg: Color(0xFFFF7B72),
+    selectedTile: Color(0xFF2A1A0C),
+  ),
+  'Rose': ThemeDef(
+    name: 'Rose',
+    primary: Color(0xFFFF6B9D),
+    bg: Color(0xFF100A0E),
+    surface: Color(0xFF1A1018),
+    surface2: Color(0xFF241620),
+    border: Color(0xFF2E1A28),
+    text: Color(0xFFF0DCE8),
+    textDim: Color(0xFF907088),
+    bubbleOut: Color(0xFF2A0A18),
+    bubbleIn: Color(0xFF1E1018),
+    errorBg: Color(0xFF3D0F0F),
+    errorFg: Color(0xFFFF7B72),
+    selectedTile: Color(0xFF2A1020),
+  ),
+  'Blue': ThemeDef(
+    name: 'Blue',
+    primary: Color(0xFF58A6FF),
+    bg: Color(0xFF0A0E14),
+    surface: Color(0xFF101822),
+    surface2: Color(0xFF162030),
+    border: Color(0xFF1E2A38),
+    text: Color(0xFFD8E4F0),
+    textDim: Color(0xFF687890),
+    bubbleOut: Color(0xFF081428),
+    bubbleIn: Color(0xFF101820),
+    errorBg: Color(0xFF3D0F0F),
+    errorFg: Color(0xFFFF7B72),
+    selectedTile: Color(0xFF0C1828),
+  ),
+  'Green': ThemeDef(
+    name: 'Green',
+    primary: Color(0xFF3FB950),
+    bg: Color(0xFF0A100C),
+    surface: Color(0xFF101A12),
+    surface2: Color(0xFF16241A),
+    border: Color(0xFF1E2E20),
+    text: Color(0xFFDCF0E0),
+    textDim: Color(0xFF709078),
+    bubbleOut: Color(0xFF082010),
+    bubbleIn: Color(0xFF101A12),
+    errorBg: Color(0xFF3D0F0F),
+    errorFg: Color(0xFFFF7B72),
+    selectedTile: Color(0xFF0C1E10),
+  ),
+};
+
+ThemeDef _themeDef(String name) => _themes[name] ?? _themes['Teal']!;
+
+ThemeData _buildTheme(ThemeDef t) => ThemeData(
       useMaterial3: true,
       brightness: Brightness.dark,
-      colorScheme: const ColorScheme.dark(
-        primary: _teal,
-        surface: _surface,
-        error: _errorFg,
+      colorScheme: ColorScheme.dark(
+        primary: t.primary,
+        surface: t.surface,
+        error: t.errorFg,
       ),
-      scaffoldBackgroundColor: _bg,
-      dividerColor: _border,
-      hintColor: _textDim,
-      appBarTheme: const AppBarTheme(
-        backgroundColor: _surface,
+      scaffoldBackgroundColor: t.bg,
+      dividerColor: t.border,
+      hintColor: t.textDim,
+      appBarTheme: AppBarTheme(
+        backgroundColor: t.surface,
         elevation: 0,
         centerTitle: false,
       ),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
-        fillColor: _surface2,
-        border: _inputBorder(_border),
-        enabledBorder: _inputBorder(_border),
-        focusedBorder: _inputBorder(_teal),
-        hintStyle: const TextStyle(color: _textDim, fontSize: 14),
+        fillColor: t.surface2,
+        border: _inputBorder(t.border),
+        enabledBorder: _inputBorder(t.border),
+        focusedBorder: _inputBorder(t.primary),
+        hintStyle: TextStyle(color: t.textDim, fontSize: 14),
         contentPadding:
             const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       ),
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
-          backgroundColor: _teal,
-          foregroundColor: _bg,
+          backgroundColor: t.primary,
+          foregroundColor: t.bg,
           padding: const EdgeInsets.all(14),
           shape:
               RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         ),
       ),
-      listTileTheme: const ListTileThemeData(
-        selectedTileColor: Color(0xFF0D1F2D),
-        selectedColor: _teal,
-        iconColor: _textDim,
-        textColor: _text,
+      listTileTheme: ListTileThemeData(
+        selectedTileColor: t.selectedTile,
+        selectedColor: t.primary,
+        iconColor: t.textDim,
+        textColor: t.text,
         dense: true,
-        contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
       ),
       iconButtonTheme: IconButtonThemeData(
-        style: IconButton.styleFrom(foregroundColor: _textDim),
+        style: IconButton.styleFrom(foregroundColor: t.textDim),
       ),
-      textTheme: const TextTheme(
+      textTheme: TextTheme(
         titleLarge: TextStyle(
-          color: _text,
+          color: t.text,
           fontSize: 15,
           fontWeight: FontWeight.w600,
           letterSpacing: 0.1,
         ),
-        bodyLarge: TextStyle(color: _text, fontSize: 14, height: 1.4),
-        bodyMedium: TextStyle(color: _text, fontSize: 13, height: 1.4),
-        bodySmall: TextStyle(color: _textDim, fontSize: 11),
+        bodyLarge: TextStyle(color: t.text, fontSize: 14, height: 1.4),
+        bodyMedium: TextStyle(color: t.text, fontSize: 13, height: 1.4),
+        bodySmall: TextStyle(color: t.textDim, fontSize: 11),
       ),
     );
 
@@ -124,15 +237,26 @@ Future<void> _initTray() async {
   }
 }
 
-class SidebandApp extends StatelessWidget {
+class SidebandApp extends StatefulWidget {
   const SidebandApp({super.key});
+
+  @override
+  State<SidebandApp> createState() => _SidebandAppState();
+}
+
+class _SidebandAppState extends State<SidebandApp> {
+  String _themeName = 'Teal';
+
+  void _setTheme(String name) {
+    setState(() => _themeName = name);
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Sideband',
-      theme: _theme(),
-      home: const _ChatScreen(),
+      theme: _buildTheme(_themeDef(_themeName)),
+      home: _ChatScreen(onThemeChanged: _setTheme),
       debugShowCheckedModeBanner: false,
     );
   }
@@ -639,7 +763,8 @@ class _QrPainter extends CustomPainter {
 // ── screen ──────────────────────────────────────────────────────────────────
 
 class _ChatScreen extends StatefulWidget {
-  const _ChatScreen();
+  const _ChatScreen({required this.onThemeChanged});
+  final void Function(String) onThemeChanged;
 
   @override
   State<_ChatScreen> createState() => _ChatScreenState();
@@ -677,6 +802,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   String? _error;
   DateTime? _lastSendStartedAt;
   late final Timer _poll;
+  String _selectedTheme = 'Teal';
+
+  ThemeDef get _t => _themeDef(_selectedTheme);
 
   @override
   void initState() {
@@ -955,10 +1083,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Color _securityColor(Contact c) => c.ratchetActive
-      ? _teal
+      ? _t.primary
       : c.staticKeyActive
           ? const Color(0xFF9CDCFE)
-          : _textDim;
+          : _t.textDim;
 
   IconData _securityIcon(Contact c) => c.ratchetActive
       ? Icons.lock_rounded
@@ -1279,11 +1407,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     showDialog<void>(
       context: context,
       builder: (_) => AlertDialog(
-        backgroundColor: _surface,
-        title: Text(title, style: const TextStyle(color: _text)),
+        backgroundColor: _t.surface,
+        title: Text(title, style: TextStyle(color: _t.text)),
         content: SingleChildScrollView(
           child: SelectableText(body,
-              style: const TextStyle(color: _text, fontSize: 12, height: 1.35)),
+              style: TextStyle(color: _t.text, fontSize: 12, height: 1.35)),
         ),
         actions: [
           TextButton(
@@ -1299,9 +1427,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     return await showDialog<bool>(
           context: context,
           builder: (_) => AlertDialog(
-            backgroundColor: _surface,
-            title: Text(title, style: const TextStyle(color: _text)),
-            content: Text(body, style: const TextStyle(color: _textDim)),
+            backgroundColor: _t.surface,
+            title: Text(title, style: TextStyle(color: _t.text)),
+            content: Text(body, style: TextStyle(color: _t.textDim)),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, false),
@@ -1513,9 +1641,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       final ok = await showDialog<bool>(
         context: context,
         builder: (_) => AlertDialog(
-          backgroundColor: _surface,
+          backgroundColor: _t.surface,
           title: Text(editing ? 'Edit contact' : 'Add contact',
-              style: const TextStyle(color: _text)),
+              style: TextStyle(color: _t.text)),
           content: SizedBox(
             width: 520,
             child: Column(
@@ -1590,8 +1718,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         context: context,
         builder: (_) => StatefulBuilder(
           builder: (context, setDialogState) => AlertDialog(
-            backgroundColor: _surface,
-            title: const Text('Create group', style: TextStyle(color: _text)),
+            backgroundColor: _t.surface,
+            title: Text('Create group', style: TextStyle(color: _t.text)),
             content: SizedBox(
               width: 520,
               child: Column(
@@ -1603,11 +1731,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     decoration: const InputDecoration(labelText: 'Group title'),
                   ),
                   const SizedBox(height: 12),
-                  const Text('Members', style: TextStyle(color: _textDim, fontSize: 12)),
+                  Text('Members', style: TextStyle(color: _t.textDim, fontSize: 12)),
                   const SizedBox(height: 6),
                   if (_contacts.isEmpty)
                     const Text('No contacts yet. Add contacts first.',
-                        style: TextStyle(color: _textDim, fontSize: 12))
+                        style: TextStyle(color: _t.textDim, fontSize: 12))
                   else
                     ConstrainedBox(
                       constraints: const BoxConstraints(maxHeight: 260),
@@ -1635,7 +1763,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   const SizedBox(height: 8),
                   const Text(
                     'Groups fan out one encrypted message per member. There is no shared group ratchet yet.',
-                    style: TextStyle(color: _textDim, fontSize: 11),
+                    style: TextStyle(color: _t.textDim, fontSize: 11),
                   ),
                 ],
               ),
@@ -1753,8 +1881,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         context: context,
         builder: (_) => StatefulBuilder(
           builder: (context, setDialogState) => AlertDialog(
-            backgroundColor: _surface,
-            title: Text('Manage ${group.title}', style: const TextStyle(color: _text)),
+            backgroundColor: _t.surface,
+            title: Text('Manage ${group.title}', style: TextStyle(color: _t.text)),
             content: SizedBox(
               width: 520,
               child: Column(
@@ -1766,7 +1894,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     decoration: const InputDecoration(labelText: 'Group title'),
                   ),
                   const SizedBox(height: 12),
-                  const Text('Members', style: TextStyle(color: _textDim, fontSize: 12)),
+                  Text('Members', style: TextStyle(color: _t.textDim, fontSize: 12)),
                   const SizedBox(height: 6),
                   ConstrainedBox(
                     constraints: const BoxConstraints(maxHeight: 260),
@@ -1794,7 +1922,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   const SizedBox(height: 8),
                   const Text(
                     'Membership changes affect local fan-out for future sends. They do not delete old messages or enforce remote removals.',
-                    style: TextStyle(color: _textDim, fontSize: 11),
+                    style: TextStyle(color: _t.textDim, fontSize: 11),
                   ),
                 ],
               ),
@@ -1846,7 +1974,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       context: context,
       position:
           RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
-      color: _surface,
+      color: _t.surface,
       items: const [
         PopupMenuItem(value: 'history', child: Text('Show history')),
         PopupMenuItem(value: 'clear-history', child: Text('Delete history')),
@@ -1886,7 +2014,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       context: context,
       position:
           RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
-      color: _surface,
+      color: _t.surface,
       items: const [
         PopupMenuItem(value: 'history', child: Text('Show history')),
         PopupMenuItem(value: 'clear-history', child: Text('Delete history')),
@@ -1925,8 +2053,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       final ok = await showDialog<bool>(
         context: context,
         builder: (_) => AlertDialog(
-          backgroundColor: _surface,
-          title: const Text('Display name', style: TextStyle(color: _text)),
+          backgroundColor: _t.surface,
+          title: Text('Display name', style: TextStyle(color: _t.text)),
           content: TextField(
             controller: controller,
             decoration: const InputDecoration(labelText: 'Name'),
@@ -1972,8 +2100,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       await showDialog<void>(
         context: context,
         builder: (_) => AlertDialog(
-          backgroundColor: _surface,
-          title: const Text('Share contact', style: TextStyle(color: _text)),
+          backgroundColor: _t.surface,
+          title: Text('Share contact', style: TextStyle(color: _t.text)),
           content: SizedBox(
             width: 520,
             child: Column(
@@ -1995,13 +2123,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 const Text(
                   'Scan this QR code to add this contact, or copy the command below.',
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: _textDim),
+                  style: TextStyle(color: _t.textDim),
                 ),
                 const SizedBox(height: 12),
                 SelectableText(
                   share.command,
                   style: const TextStyle(
-                    color: _text,
+                    color: _t.text,
                     fontFamily: 'monospace',
                     fontSize: 12,
                   ),
@@ -2046,8 +2174,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       context: context,
       builder: (dialogContext) => StatefulBuilder(
         builder: (dialogContext, setDialogState) => AlertDialog(
-          backgroundColor: _surface,
-          title: const Text('Settings', style: TextStyle(color: _text)),
+          backgroundColor: _t.surface,
+          title: Text('Settings', style: TextStyle(color: _t.text)),
           content: SizedBox(
             width: 560,
             child: SingleChildScrollView(
@@ -2082,6 +2210,15 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     onChanged: (value) {
                       setState(() => _showAudibleNotifications = value);
                       setDialogState(() {});
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.palette_outlined),
+                    title: const Text('Theme'),
+                    subtitle: Text(_selectedTheme),
+                    onTap: () async {
+                      Navigator.pop(dialogContext);
+                      unawaited(_showThemePicker());
                     },
                   ),
                   const Divider(height: 20),
@@ -2192,6 +2329,45 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     );
   }
 
+  Future<void> _showThemePicker() async {
+    final chosen = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: _t.surface,
+        title: Text('Theme', style: TextStyle(color: _t.text)),
+        content: SizedBox(
+          width: 320,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: _themes.keys.map((name) {
+              final td = _themes[name]!;
+              return ListTile(
+                leading: CircleAvatar(
+                  radius: 12,
+                  backgroundColor: td.primary,
+                ),
+                title: Text(name, style: TextStyle(color: _t.text)),
+                selected: _selectedTheme == name,
+                selectedTileColor: _t.selectedTile,
+                onTap: () => Navigator.pop(dialogContext, name),
+              );
+            }).toList(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (chosen != null && chosen != _selectedTheme) {
+      setState(() => _selectedTheme = chosen);
+      widget.onThemeChanged(chosen);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -2205,7 +2381,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 // GTK can hand Flutter a 1x1 surface before the first real frame.
                 // Rendering the full layout there just trips Flex overflow asserts.
                 if (constraints.maxWidth < 80 || constraints.maxHeight < 80) {
-                  return const ColoredBox(color: _bg);
+                  return ColoredBox(color: _t.bg);
                 }
 
                 if (_loading) {
@@ -2217,14 +2393,14 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                           width: 28,
                           height: 28,
                           child: CircularProgressIndicator(
-                              strokeWidth: 2.5, color: _teal),
+                              strokeWidth: 2.5, color: _t.primary),
                         ),
                         const SizedBox(height: 16),
                         Text('Connecting…',
                             style: Theme.of(context)
                                 .textTheme
                                 .bodyMedium
-                                ?.copyWith(color: _textDim)),
+                                ?.copyWith(color: _t.textDim)),
                       ],
                     ),
                   );
@@ -2237,7 +2413,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 return Row(
                   children: [
                     SizedBox(width: 320, child: _sidebar()),
-                    Container(width: 1, color: _border),
+                    Container(width: 1, color: _t.border),
                     Expanded(child: _sel == null && _selGroup == null ? _empty() : _chat()),
                   ],
                 );
@@ -2253,7 +2429,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Widget _sidebar() {
     return Container(
-      color: _surface,
+      color: _t.surface,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -2268,7 +2444,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      color: _text,
+                      color: _t.text,
                       fontSize: 17,
                       fontWeight: FontWeight.w700,
                       letterSpacing: 0.2,
@@ -2360,7 +2536,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                             'No contacts yet.\nUse + or /add <name> <onion> <ed25519> <x25519>.\nCreate groups with the group-add button or /group-create.',
                             textAlign: TextAlign.center,
                             style: TextStyle(
-                                color: _textDim, fontSize: 12, height: 1.6),
+                                color: _t.textDim, fontSize: 12, height: 1.6),
                           ),
                         ),
                       )
@@ -2374,7 +2550,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                             padding: EdgeInsets.fromLTRB(14, 14, 14, 6),
                             child: Text('Groups',
                                 style: TextStyle(
-                                    color: _teal,
+                                    color: _t.primary,
                                     fontSize: 12,
                                     fontWeight: FontWeight.w700)),
                           );
@@ -2386,8 +2562,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                           child: ListTile(
                           leading: const CircleAvatar(
                             radius: 17,
-                            backgroundColor: _surface2,
-                            child: Icon(Icons.groups, size: 17, color: _teal),
+                            backgroundColor: _t.surface2,
+                            child: Icon(Icons.groups, size: 17, color: _t.primary),
                           ),
                           title: Text(g.sidebarLabel,
                               maxLines: 1,
@@ -2395,11 +2571,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                               style: const TextStyle(
                                   fontSize: 13.5,
                                   fontWeight: FontWeight.w500,
-                                  color: _text)),
+                                  color: _t.text)),
                           subtitle: Text(g.memberSummary,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 10.5, color: _textDim)),
+                              style: TextStyle(fontSize: 10.5, color: _t.textDim)),
                           trailing: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -2407,7 +2583,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                               PopupMenuButton<String>(
                                 icon: const Icon(Icons.more_vert, size: 17),
                                 tooltip: 'Group menu',
-                                color: _surface,
+                                color: _t.surface,
                                 onSelected: (action) async =>
                                     _handleGroupAction(g, action),
                                 itemBuilder: (_) => const [
@@ -2472,7 +2648,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                                       fontSize: 13.5,
                                       fontWeight:
                                           on ? FontWeight.w600 : FontWeight.w500,
-                                      color: on ? _teal : _text,
+                                      color: on ? _t.primary : _t.text,
                                     )),
                               ),
                               const SizedBox(width: 6),
@@ -2490,7 +2666,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                                 c.shortOnion,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: TextStyle(fontSize: 10.5, color: _textDim),
+                                style: TextStyle(fontSize: 10.5, color: _t.textDim),
                               ),
                               const SizedBox(height: 1),
                               Row(
@@ -2517,7 +2693,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                               PopupMenuButton<String>(
                                 tooltip: 'Contact menu',
                                 icon: const Icon(Icons.more_vert, size: 17),
-                                color: _surface,
+                                color: _t.surface,
                                 onSelected: (action) async {
                                   switch (action) {
                                     case 'history':
@@ -2578,7 +2754,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           Container(
             padding: const EdgeInsets.all(10),
             decoration: const BoxDecoration(
-              border: Border(top: BorderSide(color: _border, width: 1)),
+              border: Border(top: BorderSide(color: _t.border, width: 1)),
             ),
             child: Row(
               children: [
@@ -2586,7 +2762,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   width: 7,
                   height: 7,
                   decoration: BoxDecoration(
-                      color: _listenerRunning ? _teal : _errorFg,
+                      color: _listenerRunning ? _t.primary : _t.errorFg,
                       shape: BoxShape.circle),
                 ),
                 const SizedBox(width: 6),
@@ -2599,13 +2775,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                         _listenerStatus,
                         style: TextStyle(
                             fontSize: 10,
-                            color: _listenerRunning ? _teal : _errorFg),
+                            color: _listenerRunning ? _t.primary : _t.errorFg),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
                       Text(
                         _cli.profile,
-                        style: const TextStyle(fontSize: 10, color: _textDim),
+                        style: TextStyle(fontSize: 10, color: _t.textDim),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
@@ -2635,9 +2811,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         width: double.infinity,
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
-          color: _errorBg,
+          color: _t.errorBg,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: _errorFg.withAlpha(90)),
+          border: Border.all(color: _t.errorFg.withAlpha(90)),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -2645,17 +2821,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           children: [
             Row(
               children: [
-                Icon(Icons.warning_amber_rounded, size: 16, color: _errorFg),
+                Icon(Icons.warning_amber_rounded, size: 16, color: _t.errorFg),
                 const SizedBox(width: 6),
                 Text('Backend error',
                     style: TextStyle(
-                        color: _errorFg,
+                        color: _t.errorFg,
                         fontSize: 12,
                         fontWeight: FontWeight.w700)),
               ],
             ),
             const SizedBox(height: 8),
-            Text(_error!, style: TextStyle(color: _errorFg, fontSize: 11.5)),
+            Text(_error!, style: TextStyle(color: _t.errorFg, fontSize: 11.5)),
             const SizedBox(height: 12),
             OutlinedButton.icon(
               onPressed: _load,
@@ -2673,10 +2849,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.send_rounded, size: 42, color: _textDim.withAlpha(50)),
+          Icon(Icons.send_rounded, size: 42, color: _t.textDim.withAlpha(50)),
           const SizedBox(height: 14),
           Text('Select a contact',
-              style: TextStyle(color: _textDim, fontSize: 14)),
+              style: TextStyle(color: _t.textDim, fontSize: 14)),
         ],
       ),
     );
@@ -2686,14 +2862,14 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Widget _chat() {
     return Container(
-      color: _bg,
+      color: _t.bg,
       child: Column(
         children: [
           _chatHeader(),
-          Container(height: 1, color: _border),
+          Container(height: 1, color: _t.border),
           if (_error != null) _errorBanner(),
           Expanded(child: _msgList()),
-          Container(height: 1, color: _border),
+          Container(height: 1, color: _t.border),
           _inputArea(),
         ],
       ),
@@ -2706,13 +2882,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final title = c?.name ?? g!.sidebarLabel;
     final subtitle = c?.securityLabel ?? 'Group fan-out to ${g!.memberSummary}';
     return Container(
-      color: _surface,
+      color: _t.surface,
       padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
       child: Row(
         children: [
           CircleAvatar(
             radius: 16,
-            backgroundColor: c?.avatarColor ?? _teal.withAlpha(110),
+            backgroundColor: c?.avatarColor ?? _t.primary.withAlpha(110),
             child: Text(c?.initial ?? 'G',
                 style: const TextStyle(
                     color: Colors.white,
@@ -2726,7 +2902,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               children: [
                 Text(title,
                     style: const TextStyle(
-                        color: _text,
+                        color: _t.text,
                         fontSize: 14.5,
                         fontWeight: FontWeight.w700)),
                 const SizedBox(height: 1),
@@ -2734,11 +2910,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   message: c?.securityDescription ?? 'Group messages are sent separately to each member using their contact crypto.',
                   child: Row(
                     children: [
-                      Icon(c == null ? Icons.groups_rounded : _securityIcon(c), size: 11, color: c == null ? _teal : _securityColor(c)),
+                      Icon(c == null ? Icons.groups_rounded : _securityIcon(c), size: 11, color: c == null ? _t.primary : _securityColor(c)),
                       const SizedBox(width: 4),
                       Text(subtitle,
                           style: TextStyle(
-                              fontSize: 10.5, color: c == null ? _teal : _securityColor(c))),
+                              fontSize: 10.5, color: c == null ? _t.primary : _securityColor(c))),
                     ],
                   ),
                 ),
@@ -2765,7 +2941,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               width: 7,
               height: 7,
               decoration: BoxDecoration(
-                color: _listenerRunning ? _teal : _errorFg,
+                color: _listenerRunning ? _t.primary : _t.errorFg,
                 shape: BoxShape.circle,
               ),
             ),
@@ -2780,17 +2956,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       onTap: () => setState(() => _error = null),
       child: Container(
         width: double.infinity,
-        color: _errorBg,
+        color: _t.errorBg,
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
         child: Row(
           children: [
-            Icon(Icons.error_outline, size: 14, color: _errorFg),
+            Icon(Icons.error_outline, size: 14, color: _t.errorFg),
             const SizedBox(width: 6),
             Expanded(
               child: Text(_error!,
-                  style: TextStyle(color: _errorFg, fontSize: 11.5)),
+                  style: TextStyle(color: _t.errorFg, fontSize: 11.5)),
             ),
-            Icon(Icons.close, size: 13, color: _errorFg),
+            Icon(Icons.close, size: 13, color: _t.errorFg),
           ],
         ),
       ),
@@ -2803,7 +2979,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     if (_msgs.isEmpty) {
       return Center(
           child: Text('No messages yet',
-              style: TextStyle(color: _textDim, fontSize: 13)));
+              style: TextStyle(color: _t.textDim, fontSize: 13)));
     }
     return ListView.builder(
       controller: _scroll,
@@ -2831,17 +3007,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       padding: const EdgeInsets.symmetric(vertical: 10),
       child: Row(
         children: [
-          Expanded(child: Container(height: 1, color: _border)),
+          Expanded(child: Container(height: 1, color: _t.border)),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Text(label,
                 style: const TextStyle(
                     fontSize: 10.5,
-                    color: _textDim,
+                    color: _t.textDim,
                     fontWeight: FontWeight.w600,
                     letterSpacing: 0.3)),
           ),
-          Expanded(child: Container(height: 1, color: _border)),
+          Expanded(child: Container(height: 1, color: _t.border)),
         ],
       ),
     );
@@ -2858,7 +3034,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
         margin: const EdgeInsets.only(bottom: 1),
         decoration: BoxDecoration(
-          color: right ? _bubbleOut : _bubbleIn,
+          color: right ? _t.bubbleOut : _t.bubbleIn,
           borderRadius: BorderRadius.only(
             topLeft: const Radius.circular(14),
             topRight: const Radius.circular(14),
@@ -2872,21 +3048,21 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             if (showGroupSender) ...[
               Text(right ? 'You' : m.contact,
                   style: TextStyle(
-                      color: right ? _teal : _textDim,
+                      color: right ? _t.primary : _t.textDim,
                       fontSize: 11,
                       fontWeight: FontWeight.w700)),
               const SizedBox(height: 3),
             ],
             Text(m.text,
                 style:
-                    const TextStyle(color: _text, fontSize: 14, height: 1.35)),
+                    TextStyle(color: _t.text, fontSize: 14, height: 1.35)),
             const SizedBox(height: 3),
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(_hm(m.ts),
                     style: TextStyle(
-                        fontSize: 10, color: _textDim.withAlpha(153))),
+                        fontSize: 10, color: _t.textDim.withAlpha(153))),
                 if (right) ...[
                   const SizedBox(width: 4),
                   _statusIcon(m),
@@ -2905,23 +3081,23 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         width: 9,
         height: 9,
         child: CircularProgressIndicator(
-            strokeWidth: 1.5, color: _textDim.withAlpha(120)),
+            strokeWidth: 1.5, color: _t.textDim.withAlpha(120)),
       );
     }
     if (m.failed) {
-      return const Icon(Icons.error_outline, size: 12, color: _errorFg);
+      return Icon(Icons.error_outline, size: 12, color: _t.errorFg);
     }
     if (m.status == 'delivered') {
-      return Icon(Icons.done_all, size: 13, color: _teal.withAlpha(180));
+      return Icon(Icons.done_all, size: 13, color: _t.primary.withAlpha(180));
     }
-    return Icon(Icons.done, size: 13, color: _teal.withAlpha(160));
+    return Icon(Icons.done, size: 13, color: _t.primary.withAlpha(160));
   }
 
   // ── input ────────────────────────────────────────────────────────────────
 
   Widget _inputArea() {
     return Container(
-      color: _surface,
+      color: _t.surface,
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
@@ -2946,7 +3122,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   minLines: 1,
                   maxLines: 4,
                   keyboardType: TextInputType.multiline,
-                  style: const TextStyle(fontSize: 14, color: _text),
+                  style: TextStyle(fontSize: 14, color: _t.text),
                   decoration: const InputDecoration(
                       hintText: 'Message or /help for commands…'),
                   textInputAction: TextInputAction.newline,
@@ -2966,7 +3142,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     width: 16,
                     height: 16,
                     child: CircularProgressIndicator(
-                        strokeWidth: 2, color: _bg.withAlpha(140)),
+                        strokeWidth: 2, color: _t.bg.withAlpha(140)),
                   )
                 : const Icon(Icons.send_rounded, size: 17),
           ),
