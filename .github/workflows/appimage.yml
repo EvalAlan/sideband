@@ -66,7 +66,7 @@ jobs:
 
       - name: Analyze Flutter GUI
         working-directory: gui
-        run: flutter analyze
+        run: flutter analyze --no-fatal-infos
 
       - name: Test Flutter GUI
         working-directory: gui

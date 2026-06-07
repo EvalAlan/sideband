@@ -126,14 +126,16 @@ exec "${HERE}/sideband_gui.bin" "$@"
 WRAPPER
 chmod +x "${APPDIR}/usr/bin/sideband_gui"
 
-# Copy desktop file
-cp "${SCRIPT_DIR}/linux/sideband_gui.desktop" "${APPDIR}/usr/share/applications/sideband_gui.desktop"
+# Copy desktop file. Use a desktop ID matching the GTK application ID so
+# Linux shells can associate the running window with the installed icon.
+DESKTOP_ID="com.evalalan.sideband.desktop"
+cp "${SCRIPT_DIR}/linux/sideband_gui.desktop" "${APPDIR}/usr/share/applications/${DESKTOP_ID}"
 
 # Create AppStream metainfo
 cat > "${APPDIR}/usr/share/metainfo/sideband_gui.metainfo.xml" <<'METAINFO'
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>sideband_gui</id>
+  <id>com.evalalan.sideband</id>
   <name>Sideband</name>
   <summary>Tor-based decentralized messenger</summary>
   <description>
@@ -156,7 +158,7 @@ cat > "${APPDIR}/usr/share/metainfo/sideband_gui.metainfo.xml" <<'METAINFO'
     <category>Security</category>
   </categories>
   <icon type="stock">sideband_gui</icon>
-  <launchable type="desktop-id">sideband_gui.desktop</launchable>
+  <launchable type="desktop-id">com.evalalan.sideband.desktop</launchable>
   <provides>
     <binary>sideband_gui</binary>
   </provides>
@@ -173,7 +175,7 @@ APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --appdir "${APPDIR}" \
     --executable "${APPDIR}/usr/bin/sideband_gui.bin" \
     --executable "${APPDIR}/usr/bin/sideband" \
-    --desktop-file "${APPDIR}/usr/share/applications/sideband_gui.desktop" \
+    --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
     --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg" \
     --output appimage
 
