@@ -100,6 +100,7 @@ impl TorTransport {
             .onion_address()
             .context("onion service has no address — key may not be ready")?;
         let onion = onion_hsid.display_unredacted().to_string();
+        std::env::set_var("SIDEBAND_REPLY_ONION", &onion);
         if let Some(status_tx) = &self.status_tx {
             let _ = status_tx
                 .send(TuiEvent::StatusUpdate(format!("onion={onion}")))

@@ -93,7 +93,13 @@ fn expand_home(path: &Path) -> PathBuf {
 
 #[derive(Debug, Subcommand)]
 enum CommandKind {
-    Init(ProfileArg),
+    Init {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Non-interactive display name for GUI/app first-run setup.
+        #[arg(long)]
+        name: Option<String>,
+    },
     Identity(ProfileArg),
     Share {
         #[command(flatten)]
@@ -329,6 +335,12 @@ pub(crate) struct ChatMessage {
     v: u32,
     r#type: String,
     from: String,
+    #[serde(default)]
+    sender_name: String,
+    #[serde(default)]
+    sender_onion: String,
+    #[serde(default)]
+    sender_x25519_pubkey_b64: String,
     timestamp_ms: u128,
     body: String,
     sig_b64: String,
@@ -943,6 +955,11 @@ async fn send_typed_message(
 ) -> Result<()> {
     let key = load_signing_key(profile)?;
     let our_ed25519_pub = B64.encode(key.verifying_key().to_bytes());
+    let sender_name = load_display_name(profile).unwrap_or_else(|_| String::new());
+    let sender_x25519_pubkey_b64 = load_x25519_public(profile)
+        .map(|pk| B64.encode(pk.as_bytes()))
+        .unwrap_or_default();
+    let sender_onion = std::env::var("SIDEBAND_REPLY_ONION").unwrap_or_default();
     let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
 
     let ratchet_path = RatchetState::path(profile, std::path::Path::new(contact_name));
@@ -961,6 +978,9 @@ async fn send_typed_message(
             v: 3,
             r#type: message_type.into(),
             from: our_ed25519_pub.clone(),
+            sender_name: sender_name.clone(),
+            sender_onion: sender_onion.clone(),
+            sender_x25519_pubkey_b64: sender_x25519_pubkey_b64.clone(),
             timestamp_ms,
             body: plaintext.to_string(),
             sig_b64: String::new(),
@@ -977,6 +997,9 @@ async fn send_typed_message(
             v: 2,
             r#type: message_type.into(),
             from: our_ed25519_pub.clone(),
+            sender_name: sender_name.clone(),
+            sender_onion: sender_onion.clone(),
+            sender_x25519_pubkey_b64: sender_x25519_pubkey_b64.clone(),
             timestamp_ms,
             body: plaintext.to_string(),
             sig_b64: String::new(),
@@ -1744,9 +1767,21 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        CommandKind::Init(args) => {
-            let profile = args.path()?;
-            run_wizard(&profile)
+        CommandKind::Init { profile, name } => {
+            let profile = profile.path()?;
+            match name {
+                Some(name) => {
+                    if identity_path(&profile).exists() {
+                        println!("profile already exists: {}", profile.display());
+                        Ok(())
+                    } else {
+                        init_profile_with_name(&profile, &name)?;
+                        println!("profile initialized as: {}", load_display_name(&profile)?);
+                        Ok(())
+                    }
+                }
+                None => run_wizard(&profile),
+            }
         }
         CommandKind::Identity(args) => {
             let profile = args.path()?;
@@ -2301,13 +2336,7 @@ fn save_contacts(profile: &Path, contacts: &ContactsMap) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn contact_add(
-    profile: &Path,
-    name: &str,
-    onion: &str,
-    pubkey_b64: &str,
-    x25519_pubkey_b64: &str,
-) -> Result<()> {
+fn validate_contact_fields(onion: &str, pubkey_b64: &str, x25519_pubkey_b64: &str) -> Result<()> {
     onion
         .parse::<tor_hsservice::HsId>()
         .map_err(|e| anyhow!("invalid v3 onion address '{}': {}", onion, e))?;
@@ -2326,6 +2355,17 @@ pub(crate) fn contact_add(
             raw_x.len()
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn contact_add(
+    profile: &Path,
+    name: &str,
+    onion: &str,
+    pubkey_b64: &str,
+    x25519_pubkey_b64: &str,
+) -> Result<()> {
+    validate_contact_fields(onion, pubkey_b64, x25519_pubkey_b64)?;
 
     let mut contacts = load_contacts(profile)?;
     contacts.insert(
@@ -2340,6 +2380,50 @@ pub(crate) fn contact_add(
     save_contacts(profile, &contacts)?;
     println!("contact '{name}' added");
     Ok(())
+}
+
+fn unique_autodiscovered_contact_name(contacts: &ContactsMap, wanted: &str, pubkey_b64: &str) -> String {
+    let base = wanted
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    let base = if base.is_empty() { "verified-peer" } else { base.as_str() };
+    if !contacts.contains_key(base) {
+        return base.to_string();
+    }
+    if contacts
+        .get(base)
+        .map(|contact| contact.pubkey_b64 == pubkey_b64)
+        .unwrap_or(false)
+    {
+        return base.to_string();
+    }
+    let suffix: String = pubkey_b64.chars().take(8).collect();
+    format!("{base}-{suffix}")
+}
+
+fn save_autodiscovered_contact(profile: &Path, msg: &ChatMessage) -> Result<Option<String>> {
+    if msg.sender_onion.trim().is_empty() || msg.sender_x25519_pubkey_b64.trim().is_empty() {
+        return Ok(None);
+    }
+    validate_contact_fields(&msg.sender_onion, &msg.from, &msg.sender_x25519_pubkey_b64)?;
+    let mut contacts = load_contacts(profile)?;
+    if let Some(existing) = contacts.values().find(|c| c.pubkey_b64 == msg.from) {
+        return Ok(Some(existing.name.clone()));
+    }
+    let name = unique_autodiscovered_contact_name(&contacts, &msg.sender_name, &msg.from);
+    contacts.insert(
+        name.clone(),
+        ContactFile {
+            name: name.clone(),
+            onion: msg.sender_onion.clone(),
+            pubkey_b64: msg.from.clone(),
+            x25519_pubkey_b64: Some(msg.sender_x25519_pubkey_b64.clone()),
+        },
+    );
+    save_contacts(profile, &contacts)?;
+    Ok(Some(name))
 }
 
 pub(crate) fn contact_delete(profile: &Path, name: &str) -> Result<bool> {
@@ -2399,6 +2483,12 @@ fn payload_to_sign(msg: &ChatMessage) -> Result<String> {
         #[serde(rename = "type")]
         msg_type: String,
         from: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sender_name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sender_onion: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sender_x25519_pubkey_b64: String,
         timestamp_ms: u128,
         body: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2408,6 +2498,9 @@ fn payload_to_sign(msg: &ChatMessage) -> Result<String> {
         v: msg.v,
         msg_type: msg.r#type.clone(),
         from: msg.from.clone(),
+        sender_name: msg.sender_name.clone(),
+        sender_onion: msg.sender_onion.clone(),
+        sender_x25519_pubkey_b64: msg.sender_x25519_pubkey_b64.clone(),
         timestamp_ms: msg.timestamp_ms,
         body: msg.body.clone(),
         ratchet_header_b64: msg.ratchet_header_b64.clone(),
@@ -2983,18 +3076,23 @@ pub(crate) fn decrypt_and_verify(
         let verified = verify_message(msg, contacts).unwrap_or(false);
         return Ok((msg.body.clone(), verified));
     }
-    // v2: static X25519 decrypt.
-    let contact = contacts
-        .values()
-        .find(|c| c.pubkey_b64 == msg.from)
+    // v2: static X25519 decrypt. If the sender is not in contacts yet, use
+    // the signed self-description carried on the envelope to decrypt, verify,
+    // then add the contact. This is local trust-on-first-contact, not magic PKI.
+    let known_contact = contacts.values().find(|c| c.pubkey_b64 == msg.from);
+    let candidate_x25519 = known_contact
+        .and_then(|c| c.x25519_pubkey_b64.as_deref())
+        .or_else(|| {
+            if msg.sender_onion.trim().is_empty() {
+                None
+            } else {
+                Some(msg.sender_x25519_pubkey_b64.as_str())
+            }
+        })
         .with_context(|| format!("unknown sender pubkey: {}", msg.from))?;
     let our_secret = load_x25519_secret(our_profile)?;
-    let x25519_b64 = contact
-        .x25519_pubkey_b64
-        .as_deref()
-        .ok_or_else(|| anyhow!("sender has no x25519 key"))?;
     let raw = B64
-        .decode(x25519_b64)
+        .decode(candidate_x25519)
         .context("decode sender x25519 pubkey")?;
     let arr: [u8; 32] = raw
         .as_slice()
@@ -3004,8 +3102,30 @@ pub(crate) fn decrypt_and_verify(
     let shared_key = derive_shared_key(&our_secret, &their_public)?;
     let plaintext = decrypt_body(&shared_key, &msg.enc_body)?;
     msg.body = plaintext.clone();
-    let verified = verify_message(msg, contacts).unwrap_or(false);
+    let verified = verify_message(msg, contacts).unwrap_or(false)
+        || verify_message_with_sender_metadata(msg).unwrap_or(false);
+    if verified && known_contact.is_none() {
+        let _ = save_autodiscovered_contact(our_profile, msg)?;
+    }
     Ok((plaintext, verified))
+}
+
+fn verify_message_with_sender_metadata(msg: &ChatMessage) -> Result<bool> {
+    if msg.sender_onion.trim().is_empty() || msg.sender_x25519_pubkey_b64.trim().is_empty() {
+        return Ok(false);
+    }
+    validate_contact_fields(&msg.sender_onion, &msg.from, &msg.sender_x25519_pubkey_b64)?;
+    let mut contacts = ContactsMap::new();
+    contacts.insert(
+        "candidate".to_string(),
+        ContactFile {
+            name: "candidate".to_string(),
+            onion: msg.sender_onion.clone(),
+            pubkey_b64: msg.from.clone(),
+            x25519_pubkey_b64: Some(msg.sender_x25519_pubkey_b64.clone()),
+        },
+    );
+    verify_message(msg, &contacts)
 }
 
 fn verify_message(msg: &ChatMessage, contacts: &ContactsMap) -> Result<bool> {
@@ -3301,6 +3421,11 @@ pub(crate) async fn send_in_conversation(
     // Build message: try v3 (Double Ratchet) first, fall back to v2 (static X25519).
     let plaintext = message.to_string();
     let our_ed25519_pub = B64.encode(key.verifying_key().to_bytes());
+    let sender_name = load_display_name(profile).unwrap_or_else(|_| String::new());
+    let sender_x25519_pubkey_b64 = load_x25519_public(profile)
+        .map(|pk| B64.encode(pk.as_bytes()))
+        .unwrap_or_default();
+    let sender_onion = std::env::var("SIDEBAND_REPLY_ONION").unwrap_or_default();
     let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
 
     // Check if we have a ratchet state for this contact.
@@ -3320,6 +3445,9 @@ pub(crate) async fn send_in_conversation(
             v: 3,
             r#type: "chat_message".into(),
             from: our_ed25519_pub.clone(),
+            sender_name: sender_name.clone(),
+            sender_onion: sender_onion.clone(),
+            sender_x25519_pubkey_b64: sender_x25519_pubkey_b64.clone(),
             timestamp_ms,
             body: plaintext.clone(),
             sig_b64: String::new(),
@@ -3337,6 +3465,9 @@ pub(crate) async fn send_in_conversation(
             v: 2,
             r#type: "chat_message".into(),
             from: our_ed25519_pub.clone(),
+            sender_name: sender_name.clone(),
+            sender_onion: sender_onion.clone(),
+            sender_x25519_pubkey_b64: sender_x25519_pubkey_b64.clone(),
             timestamp_ms,
             body: plaintext.clone(),
             sig_b64: String::new(),
@@ -3534,6 +3665,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_profile(dir.path()).unwrap();
         assert!(set_display_name(dir.path(), "   ").is_err());
+    }
+
+    #[test]
+    fn inbound_signed_metadata_autodiscovers_contact() {
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        init_profile_with_name(alice_dir.path(), "Alice").unwrap();
+        init_profile_with_name(bob_dir.path(), "Bob").unwrap();
+
+        let alice_key = load_signing_key(alice_dir.path()).unwrap();
+        let alice_pub = B64.encode(alice_key.verifying_key().to_bytes());
+        let alice_x_secret = load_x25519_secret(alice_dir.path()).unwrap();
+        let alice_x_pub = load_x25519_public(alice_dir.path()).unwrap();
+        let bob_x_pub = load_x25519_public(bob_dir.path()).unwrap();
+        let shared = derive_shared_key(&alice_x_secret, &bob_x_pub).unwrap();
+
+        let mut msg = ChatMessage {
+            v: 2,
+            r#type: "msg".to_string(),
+            from: alice_pub.clone(),
+            sender_name: "Alice".to_string(),
+            sender_onion: "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion".to_string(),
+            sender_x25519_pubkey_b64: B64.encode(alice_x_pub.as_bytes()),
+            timestamp_ms: 123,
+            body: "hello first-contact".to_string(),
+            sig_b64: String::new(),
+            enc_body: String::new(),
+            ratchet_header_b64: String::new(),
+            ratchet_nonce_hex: String::new(),
+            ratchet_ct_hex: String::new(),
+        };
+        sign_message(&alice_key, &mut msg).unwrap();
+        msg.enc_body = encrypt_body(&shared, "hello first-contact").unwrap();
+        msg.body.clear();
+
+        let contacts = load_contacts(bob_dir.path()).unwrap();
+        assert!(contacts.is_empty());
+        let (plaintext, verified) = decrypt_and_verify(&mut msg, bob_dir.path(), &contacts).unwrap();
+        assert_eq!(plaintext, "hello first-contact");
+        assert!(verified);
+
+        let contacts = load_contacts(bob_dir.path()).unwrap();
+        let alice = contacts.get("Alice").expect("autodiscovered contact missing");
+        assert_eq!(alice.pubkey_b64, alice_pub);
+        assert_eq!(alice.x25519_pubkey_b64.as_deref(), Some(msg.sender_x25519_pubkey_b64.as_str()));
     }
 
     // -- contacts CRUD --
@@ -3796,6 +3972,9 @@ mod tests {
             v: 1,
             r#type: "chat_message".into(),
             from: B64.encode(vk.to_bytes()),
+            sender_name: String::new(),
+            sender_onion: String::new(),
+            sender_x25519_pubkey_b64: String::new(),
             timestamp_ms: 1_700_000_000_000_u128,
             body: "test".into(),
             sig_b64: String::new(),
@@ -3831,6 +4010,9 @@ mod tests {
             v: 1,
             r#type: "chat_message".into(),
             from: B64.encode(vk.to_bytes()),
+            sender_name: String::new(),
+            sender_onion: String::new(),
+            sender_x25519_pubkey_b64: String::new(),
             timestamp_ms: 1_700_000_000_000_u128,
             body: "original".into(),
             sig_b64: String::new(),
@@ -3866,6 +4048,9 @@ mod tests {
             v: 1,
             r#type: "chat_message".into(),
             from: B64.encode(vk.to_bytes()),
+            sender_name: String::new(),
+            sender_onion: String::new(),
+            sender_x25519_pubkey_b64: String::new(),
             timestamp_ms: 123,
             body: "hi".into(),
             sig_b64: String::new(),
@@ -3888,6 +4073,9 @@ mod tests {
             v: 1,
             r#type: "chat_message".into(),
             from: "AAAA".into(),
+            sender_name: String::new(),
+            sender_onion: String::new(),
+            sender_x25519_pubkey_b64: String::new(),
             timestamp_ms: 0,
             body: "x".into(),
             sig_b64: "SOMESIG".into(),
@@ -4157,6 +4345,9 @@ fn first_v3_message_auto_initializes_receiver_ratchet() {
         v: 3,
         r#type: "chat_message".into(),
         from: alice_ed,
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms,
         body: plaintext.into(),
         sig_b64: String::new(),
@@ -4227,6 +4418,9 @@ fn receiver_can_send_first_reply_after_ratchet_restart() {
         v: 3,
         r#type: "chat_message".into(),
         from: alice_ed.clone(),
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms,
         body: first_plaintext.into(),
         sig_b64: String::new(),
@@ -4266,6 +4460,9 @@ fn receiver_can_send_first_reply_after_ratchet_restart() {
         v: 3,
         r#type: "chat_message".into(),
         from: bob_ed,
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms: reply_ts,
         body: reply_plaintext.into(),
         sig_b64: String::new(),
@@ -4306,6 +4503,9 @@ fn receiver_can_send_first_reply_after_ratchet_restart() {
         v: 3,
         r#type: "chat_message".into(),
         from: alice_ed,
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms: followup_ts,
         body: followup_plaintext.into(),
         sig_b64: String::new(),
@@ -4373,6 +4573,9 @@ fn both_sides_can_send_after_restart_before_receiving_peer_message() {
         v: 3,
         r#type: "chat_message".into(),
         from: alice_ed.clone(),
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms: 1,
         body: "initial".into(),
         sig_b64: String::new(),
@@ -4418,6 +4621,9 @@ fn both_sides_can_send_after_restart_before_receiving_peer_message() {
         v: 3,
         r#type: "chat_message".into(),
         from: alice_ed.clone(),
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms: 2,
         body: "alice concurrent".into(),
         sig_b64: String::new(),
@@ -4432,6 +4638,9 @@ fn both_sides_can_send_after_restart_before_receiving_peer_message() {
         v: 3,
         r#type: "chat_message".into(),
         from: bob_ed.clone(),
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms: 3,
         body: "bob concurrent".into(),
         sig_b64: String::new(),
@@ -4509,6 +4718,9 @@ fn duplicate_old_ratchet_message_does_not_poison_state() {
         v: 3,
         r#type: "chat_message".into(),
         from: alice_ed.clone(),
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms: 1,
         body: "first".into(),
         sig_b64: String::new(),
@@ -4540,6 +4752,9 @@ fn duplicate_old_ratchet_message_does_not_poison_state() {
         v: 3,
         r#type: "chat_message".into(),
         from: bob_ed.clone(),
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms: 2,
         body: "reply".into(),
         sig_b64: String::new(),
@@ -4580,6 +4795,9 @@ fn duplicate_old_ratchet_message_does_not_poison_state() {
         v: 3,
         r#type: "chat_message".into(),
         from: alice_ed,
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms: 3,
         body: "after duplicate".into(),
         sig_b64: String::new(),
@@ -4653,6 +4871,9 @@ fn inbound_v3_recovers_from_simultaneous_manual_ratchet_init() {
         v: 3,
         r#type: "chat_message".into(),
         from: bob_ed,
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms,
         body: plaintext.into(),
         sig_b64: String::new(),
@@ -4927,6 +5148,9 @@ fn build_v2_wire(alice_dir: &std::path::Path, bob_dir: &std::path::Path, message
         v: 2,
         r#type: "chat_message".into(),
         from: alice_ed,
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms,
         body: message.to_string(),
         sig_b64: String::new(),
@@ -4998,6 +5222,9 @@ fn int_v3_ratchet_message_e2e_stores_in_sqlite() {
         v: 3,
         r#type: "chat_message".into(),
         from: alice_ed.clone(),
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms,
         body: plaintext.into(),
         sig_b64: String::new(),
@@ -5057,6 +5284,9 @@ fn int_v2_unknown_sender_fails_decrypt() {
         v: 2,
         r#type: "chat_message".into(),
         from: eve_ed,
+        sender_name: String::new(),
+        sender_onion: String::new(),
+        sender_x25519_pubkey_b64: String::new(),
         timestamp_ms,
         body: "from eve".into(),
         sig_b64: String::new(),

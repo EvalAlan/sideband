@@ -504,6 +504,11 @@ class _Cli {
     return p;
   }
 
+  bool identityConfigured() => File('${expandedProfilePath()}/identity.toml').existsSync();
+
+  Future<String> initProfile(String name) =>
+      _run(['init', '--profile', profile, '--name', name]);
+
   bool _ratchetActive(String contactName) {
     if (contactName.trim().isEmpty) return false;
     return File('${expandedProfilePath()}/ratchet/$contactName.bin').existsSync();
@@ -826,7 +831,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   bool _sending = false;
   String? _error;
   DateTime? _lastSendStartedAt;
-  late final Timer _poll;
+  Timer? _poll;
   String _selectedTheme = 'Teal';
 
   ThemeDef get _t => _themeDef(_selectedTheme);
@@ -836,11 +841,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   void initState() {
     super.initState();
     trayManager.addListener(this);
-    _listenerLogFile = File('${_cli.profile}/gui-listener.log');
-    _startListener();
-    _load();
-    _poll = Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
+    _listenerLogFile = File('${_cli.expandedProfilePath()}/gui-listener.log');
     _initWindowListeners();
+    WidgetsBinding.instance.addPostFrameCallback((_) => unawaited(_bootstrap()));
   }
 
   void _initWindowListeners() {
@@ -849,11 +852,67 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     windowManager.addListener(_windowHandler);
   }
 
+  Future<void> _bootstrap() async {
+    try {
+      if (!_cli.identityConfigured()) {
+        final name = await _promptDisplayName();
+        if (name == null || name.trim().isEmpty) {
+          if (mounted) {
+            setState(() {
+              _loading = false;
+              _error = 'Profile setup cancelled';
+            });
+          }
+          return;
+        }
+        await _cli.initProfile(name.trim());
+      }
+      await _startListener();
+      await _load();
+      _poll ??= Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = '$e';
+        });
+      }
+    }
+  }
+
+  Future<String?> _promptDisplayName() async {
+    final controller = TextEditingController();
+    try {
+      return showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => AlertDialog(
+          backgroundColor: _t.surface,
+          title: Text('Set up Sideband', style: TextStyle(color: _t.text)),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Display name'),
+            onSubmitted: (v) => Navigator.pop(context, v.trim()),
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: Text('Create profile'),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      controller.dispose();
+    }
+  }
+
   @override
   void dispose() {
     trayManager.removeListener(this);
     windowManager.removeListener(_windowHandler);
-    _poll.cancel();
+    _poll?.cancel();
     _notificationTimer?.cancel();
     _listener?.kill(ProcessSignal.sigterm);
     _input.dispose();
@@ -1214,9 +1273,31 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<void> _refresh() async {
-    if (_sel == null && _selGroup == null) return;
     try {
-      final h = await _historyVisibleFor(_sel?.name, group: _selGroup?.id);
+      final c = await _cli.contacts();
+      final g = await _cli.groups();
+      var s = _sel;
+      var sg = _selGroup;
+      if (sg != null) {
+        final idx = g.indexWhere((x) => x.id == sg!.id);
+        sg = idx >= 0 ? g[idx] : null;
+      }
+      if (sg == null && s != null) {
+        final idx = c.indexWhere((x) => x.name == s!.name);
+        s = idx >= 0 ? c[idx] : null;
+      }
+      _contacts = c;
+      _groups = g;
+      _sel = s;
+      _selGroup = sg;
+
+      if (s == null && sg == null) {
+        await _checkUnread();
+        if (mounted) setState(() {});
+        return;
+      }
+
+      final h = await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((c) => c.name));
       await _checkUnread();
       setState(() {
         _msgs = _mergePending(h.msgs);
@@ -2442,14 +2523,14 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 }
 
                 if (constraints.maxWidth < 720) {
-                  return _sel == null && _selGroup == null ? _sidebar() : _chat();
+                  return _sel == null && _selGroup == null ? _emptyChat() : _chat();
                 }
 
                 return Row(
                   children: [
                     SizedBox(width: 320, child: _sidebar()),
                     Container(width: 1, color: _t.border),
-                    Expanded(child: _sel == null && _selGroup == null ? _empty() : _chat()),
+                    Expanded(child: _sel == null && _selGroup == null ? _emptyChat() : _chat()),
                   ],
                 );
               },
@@ -2879,15 +2960,30 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     );
   }
 
-  Widget _empty() {
-    return Center(
+  Widget _emptyChat() {
+    return Container(
+      color: _t.bg,
       child: Column(
-        mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.send_rounded, size: 42, color: _t.textDim.withAlpha(50)),
-          SizedBox(height: 14),
-          Text('Select a contact',
-              style: TextStyle(color: _t.textDim, fontSize: 14)),
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.send_rounded, size: 42, color: _t.textDim.withAlpha(50)),
+                  SizedBox(height: 14),
+                  Text('No conversation selected',
+                      style: TextStyle(color: _t.textDim, fontSize: 14)),
+                  SizedBox(height: 6),
+                  Text('Use slash commands below, for example /add or /help.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: _t.textDim, fontSize: 12)),
+                ],
+              ),
+            ),
+          ),
+          Container(height: 1, color: _t.border),
+          _inputArea(),
         ],
       ),
     );
