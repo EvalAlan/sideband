@@ -165,30 +165,33 @@ cat > "${APPDIR}/usr/share/metainfo/sideband_gui.metainfo.xml" <<'METAINFO'
 </component>
 METAINFO
 
-# Step 5: Run linuxdeploy
 log "Running linuxdeploy..."
-mkdir -p "${OUTPUT_DIR}"
+    mkdir -p "${OUTPUT_DIR}"
 
-cd "${SCRIPT_DIR}"
+    cd "${SCRIPT_DIR}"
 
-APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
-    --appdir "${APPDIR}" \
-    --executable "${APPDIR}/usr/bin/sideband_gui.bin" \
-    --executable "${APPDIR}/usr/bin/sideband" \
-    --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
-    --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg" \
-    --output appimage \
-    --no-strip
+    # Workaround: linuxdeploy bundles an old strip that chokes on .relr.dyn
+    # sections in newer glibc distros. Override STRIP with a no-op so it
+    # skips stripping entirely. The AppImage works fine without stripping.
+    export STRIP=true
 
-# Find and move the generated AppImage
-APPIMAGE=$(find "${SCRIPT_DIR}" -maxdepth 1 -name "*.AppImage" -type f | head -1)
-if [[ -n "${APPIMAGE}" ]]; then
-    mv "${APPIMAGE}" "${OUTPUT_DIR}/"
-    log "AppImage created: ${OUTPUT_DIR}/$(basename "${APPIMAGE}")"
-    ls -lh "${OUTPUT_DIR}"/*.AppImage
-else
-    err "AppImage not found after build"
-    exit 1
-fi
+    APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
+        --appdir "${APPDIR}" \
+        --executable "${APPDIR}/usr/bin/sideband_gui.bin" \
+        --executable "${APPDIR}/usr/bin/sideband" \
+        --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
+        --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg" \
+        --output appimage
+
+    # Find and move the generated AppImage
+    APPIMAGE=$(find "${SCRIPT_DIR}" -maxdepth 1 -name "*.AppImage" -type f | head -1)
+    if [[ -n "${APPIMAGE}" ]]; then
+        mv "${APPIMAGE}" "${OUTPUT_DIR}/"
+        log "AppImage created: ${OUTPUT_DIR}/$(basename "${APPIMAGE}")"
+        ls -lh "${OUTPUT_DIR}"/*.AppImage
+    else
+        err "AppImage not found after build"
+        exit 1
+    fi
 
 log "Done!"
