@@ -2418,7 +2418,9 @@ class _ChatScreenState extends State<_ChatScreen> {
           IconButton(
             icon: const Icon(Icons.delete_sweep_outlined, size: 18),
             tooltip: 'Delete history',
-            onPressed: c == null ? null : () => _clearHistoryFor(c),
+            onPressed: c == null
+                ? (_selGroup == null ? null : () => _clearGroupHistoryFor(_selGroup!))
+                : () => _clearHistoryFor(c),
           ),
           Tooltip(
             message: _listenerStatus,
