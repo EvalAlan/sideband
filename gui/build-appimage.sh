@@ -110,9 +110,9 @@ chmod +x "${APPDIR}/usr/bin/sideband"
 cat > "${APPDIR}/usr/bin/sideband_gui" <<'WRAPPER'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-APPDIR="$(dirname "${HERE}")"
-export LD_LIBRARY_PATH="${APPDIR}/lib:${HERE}/lib:${LD_LIBRARY_PATH:-}"
-export XDG_DATA_DIRS="${APPDIR}/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+ROOT="$(dirname "$(dirname "${HERE}")")"
+export LD_LIBRARY_PATH="${ROOT}/usr/lib:${ROOT}/usr/bin/lib:${LD_LIBRARY_PATH:-}"
+export XDG_DATA_DIRS="${ROOT}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 exec "${HERE}/sideband_gui.bin" "$@"
 WRAPPER
 chmod +x "${APPDIR}/usr/bin/sideband_gui"
@@ -153,6 +153,21 @@ if [[ -f "${APPDIR}/usr/lib/libtray_manager_plugin.so" ]] && \
    [[ ! -e "${APPDIR}/usr/lib/libayatana-appindicator3.so.1" ]] && \
    [[ ! -e "${APPDIR}/usr/lib/libappindicator3.so.1" ]]; then
     err "AppImage missing bundled AppIndicator library required by tray_manager"
+    exit 1
+fi
+
+cat > "${APPDIR}/AppRun" <<'APPRUN'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="${APPDIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}"
+export LD_LIBRARY_PATH="${ROOT}/usr/lib:${ROOT}/usr/bin/lib:${LD_LIBRARY_PATH:-}"
+export XDG_DATA_DIRS="${ROOT}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+exec "${ROOT}/usr/bin/sideband_gui.bin" "$@"
+APPRUN
+chmod +x "${APPDIR}/AppRun"
+
+if ! grep -q 'usr/lib' "${APPDIR}/AppRun"; then
+    err "AppRun does not include bundled usr/lib in LD_LIBRARY_PATH"
     exit 1
 fi
 
