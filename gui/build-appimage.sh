@@ -177,7 +177,8 @@ APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --executable "${APPDIR}/usr/bin/sideband" \
     --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
     --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg" \
-    --output appimage
+    --output appimage \
+    --no-strip
 
 # Find and move the generated AppImage
 APPIMAGE=$(find "${SCRIPT_DIR}" -maxdepth 1 -name "*.AppImage" -type f | head -1)
