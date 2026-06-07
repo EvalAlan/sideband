@@ -131,6 +131,14 @@ chmod +x "${APPDIR}/usr/bin/sideband_gui"
 DESKTOP_ID="com.evalalan.sideband.desktop"
 cp "${SCRIPT_DIR}/linux/sideband_gui.desktop" "${APPDIR}/usr/share/applications/${DESKTOP_ID}"
 
+# AppImage desktop integration tools and KDE Plasma task managers often inspect
+# the AppDir root, not just usr/share. Keep the root desktop/icon identity in
+# sync with the freedesktop application ID so WM_CLASS -> desktop -> Icon
+# resolves to the Sideband logo instead of a generic fallback/checkmark icon.
+cp "${APPDIR}/usr/share/applications/${DESKTOP_ID}" "${APPDIR}/${DESKTOP_ID}"
+cp "${ICON_DIR}/scalable/apps/com.evalalan.sideband.svg" "${APPDIR}/com.evalalan.sideband.svg"
+cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/.DirIcon"
+
 cat > "${APPDIR}/usr/share/metainfo/sideband_gui.metainfo.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
@@ -179,6 +187,23 @@ chmod +x "${APPDIR}/AppRun"
 
 if ! grep -q 'usr/lib' "${APPDIR}/AppRun"; then
     err "AppRun does not include bundled usr/lib in LD_LIBRARY_PATH"
+    exit 1
+fi
+
+if ! grep -q '^Icon=com.evalalan.sideband$' "${APPDIR}/${DESKTOP_ID}"; then
+    err "Root desktop file does not reference com.evalalan.sideband icon"
+    exit 1
+fi
+if [[ ! -f "${APPDIR}/com.evalalan.sideband.svg" ]]; then
+    err "Root AppImage icon missing: com.evalalan.sideband.svg"
+    exit 1
+fi
+if [[ ! -f "${APPDIR}/.DirIcon" ]]; then
+    err "Root AppImage .DirIcon missing"
+    exit 1
+fi
+if [[ ! -f "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" ]]; then
+    err "hicolor 256x256 application icon missing"
     exit 1
 fi
 
