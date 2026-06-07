@@ -110,8 +110,9 @@ chmod +x "${APPDIR}/usr/bin/sideband"
 cat > "${APPDIR}/usr/bin/sideband_gui" <<'WRAPPER'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-export LD_LIBRARY_PATH="${HERE}/lib:${LD_LIBRARY_PATH:-}"
-export XDG_DATA_DIRS="${HERE}/../share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+APPDIR="$(dirname "${HERE}")"
+export LD_LIBRARY_PATH="${APPDIR}/lib:${HERE}/lib:${LD_LIBRARY_PATH:-}"
+export XDG_DATA_DIRS="${APPDIR}/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 exec "${HERE}/sideband_gui.bin" "$@"
 WRAPPER
 chmod +x "${APPDIR}/usr/bin/sideband_gui"
@@ -147,6 +148,11 @@ APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --executable "${APPDIR}/usr/bin/sideband" \
     --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
     --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg"
+
+if [[ -f "${APPDIR}/usr/lib/libtray_manager_plugin.so" ]] && [[ ! -e "${APPDIR}/usr/lib/libayatana-appindicator3.so.1" ]]; then
+    err "AppImage missing bundled libayatana-appindicator3.so.1 required by tray_manager"
+    exit 1
+fi
 
 # Step 7: Package with appimagetool (avoids linuxdeploy's bundled strip)
 log "Packaging AppImage..."
