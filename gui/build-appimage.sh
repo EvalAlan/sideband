@@ -86,9 +86,13 @@ fi
 LINUXDEPLOY="${LINUXDEPLOY_PATCHED}"
 
 # Step 4: Generate icons
-ICON_SVG="${SCRIPT_DIR}/linux/icons/sideband_gui.svg"
+# Use the same Sideband logo asset that the tray icon and GTK window icon use.
+# Do not use linux/icons/sideband_gui.svg here: that legacy SVG is the old
+# teal checkmark-in-circle icon and makes Plasma's taskbar look wrong even
+# when WM_CLASS/.desktop resolution is working correctly.
+ICON_SOURCE="${SCRIPT_DIR}/assets/icon_512x512.png"
 ICON_DIR="${APPDIR}/usr/share/icons/hicolor"
-[[ ! -f "${ICON_SVG}" ]] && { err "Icon SVG not found"; exit 1; }
+[[ ! -f "${ICON_SOURCE}" ]] && { err "Icon source not found: ${ICON_SOURCE}"; exit 1; }
 
 log "Generating icons..."
 rm -rf "${APPDIR}"
@@ -96,18 +100,17 @@ for size in 16 32 48 64 128 256 512; do
     mkdir -p "${ICON_DIR}/${size}x${size}/apps"
     DEST="${ICON_DIR}/${size}x${size}/apps/com.evalalan.sideband.png"
     if command -v magick   >/dev/null 2>/dev/null; then
-      magick "${ICON_SVG}" -resize "${size}x${size}" "${DEST}"
+      magick "${ICON_SOURCE}" -resize "${size}x${size}" "${DEST}"
     elif command -v convert >/dev/null 2>/dev/null; then
-      convert "${ICON_SVG}" -resize "${size}x${size}" "${DEST}"
+      convert "${ICON_SOURCE}" -resize "${size}x${size}" "${DEST}"
     elif command -v inkscape >/dev/null 2>/dev/null; then
-      inkscape "${ICON_SVG}" --export-type=png --export-width="${size}" --export-height="${size}" --export-filename="${DEST}"
+      warn "inkscape cannot resize PNG icon source directly; skipping icon generation"
+      break
     else
       warn "No ImageMagick/convert/inkscape — skipping icon generation for ${size}x${size}"
       break
     fi
 done
-mkdir -p "${ICON_DIR}/scalable/apps"
-cp "${ICON_SVG}" "${ICON_DIR}/scalable/apps/com.evalalan.sideband.svg"
 
 # Step 5: Create AppDir
 log "Creating AppDir..."
@@ -136,7 +139,7 @@ cp "${SCRIPT_DIR}/linux/sideband_gui.desktop" "${APPDIR}/usr/share/applications/
 # sync with the freedesktop application ID so WM_CLASS -> desktop -> Icon
 # resolves to the Sideband logo instead of a generic fallback/checkmark icon.
 cp "${APPDIR}/usr/share/applications/${DESKTOP_ID}" "${APPDIR}/${DESKTOP_ID}"
-cp "${ICON_DIR}/scalable/apps/com.evalalan.sideband.svg" "${APPDIR}/com.evalalan.sideband.svg"
+cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/com.evalalan.sideband.png"
 cp "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png" "${APPDIR}/.DirIcon"
 
 cat > "${APPDIR}/usr/share/metainfo/sideband_gui.metainfo.xml" <<'XML'
@@ -166,7 +169,7 @@ APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --executable "${APPDIR}/usr/bin/sideband_gui.bin" \
     --executable "${APPDIR}/usr/bin/sideband" \
     --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
-    --icon-file "${ICON_DIR}/scalable/apps/com.evalalan.sideband.svg"
+    --icon-file "${ICON_DIR}/256x256/apps/com.evalalan.sideband.png"
 
 if [[ -f "${APPDIR}/usr/lib/libtray_manager_plugin.so" ]] && \
    [[ ! -e "${APPDIR}/usr/lib/libayatana-appindicator3.so.1" ]] && \
@@ -194,8 +197,8 @@ if ! grep -q '^Icon=com.evalalan.sideband$' "${APPDIR}/${DESKTOP_ID}"; then
     err "Root desktop file does not reference com.evalalan.sideband icon"
     exit 1
 fi
-if [[ ! -f "${APPDIR}/com.evalalan.sideband.svg" ]]; then
-    err "Root AppImage icon missing: com.evalalan.sideband.svg"
+if [[ ! -f "${APPDIR}/com.evalalan.sideband.png" ]]; then
+    err "Root AppImage icon missing: com.evalalan.sideband.png"
     exit 1
 fi
 if [[ ! -f "${APPDIR}/.DirIcon" ]]; then
