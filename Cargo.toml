@@ -3,11 +3,6 @@ name = "sideband"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-name = "sideband"
-crate-type = ["cdylib", "rlib"]
-path = "src/lib.rs"
-
 [[bin]]
 name = "sideband"
 path = "src/main.rs"
