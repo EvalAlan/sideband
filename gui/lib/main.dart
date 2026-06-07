@@ -998,7 +998,6 @@ class _ChatScreenState extends State<_ChatScreen> {
   Future<void> _checkUnread() async {
     try {
       final global = await _cli.history(limit: 200);
-      _seedSeenIds(global);
       final currentContact = _sel?.name;
       final currentGroup = _selGroup?.id;
       int newUnread = 0;
