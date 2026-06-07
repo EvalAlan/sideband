@@ -960,6 +960,12 @@ class _ChatScreenState extends State<_ChatScreen> {
         s = null;
       }
       final h = await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((c) => c.name));
+      final global = await _cli.history(limit: 200);
+      // Startup bootstrap must mark the global transcript as already seen.
+      // Seeding only the selected conversation makes old messages in other
+      // chats look "new" on the first poll after launch. Do this here, once,
+      // not inside _checkUnread(), or real new messages get swallowed.
+      _seedSeenIds(global);
       _seedSeenIds(h);
       setState(() {
         _contacts = c;
