@@ -2560,7 +2560,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                           onSecondaryTapDown: (details) =>
                               _showGroupMenu(g, details.globalPosition),
                           child: ListTile(
-                          leading: const CircleAvatar(
+                          leading: CircleAvatar(
                             radius: 17,
                             backgroundColor: _t.surface2,
                             child: Icon(Icons.groups, size: 17, color: _t.primary),
@@ -2753,7 +2753,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           // footer
           Container(
             padding: const EdgeInsets.all(10),
-            decoration: const BoxDecoration(
+            decoration: BoxDecoration(
               border: Border(top: BorderSide(color: _t.border, width: 1)),
             ),
             child: Row(
