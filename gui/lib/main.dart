@@ -623,6 +623,8 @@ class _ChatScreenState extends State<_ChatScreen> {
   final _unreadGroups = <String>{};
   final _refreshSeenIds = <int>{};
   final _notifiedMessageIds = <int>{};
+  String? _notificationText;
+  Timer? _notificationTimer;
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -651,6 +653,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   @override
   void dispose() {
     _poll.cancel();
+    _notificationTimer?.cancel();
     _listener?.kill(ProcessSignal.sigterm);
     _input.dispose();
     _scroll.dispose();
@@ -1036,37 +1039,53 @@ class _ChatScreenState extends State<_ChatScreen> {
     for (final m in msgs) {
       _notifiedMessageIds.add(m.id);
     }
+    final String text;
     if (msgs.length == 1) {
-      _showSingleNotification(msgs.first);
+      final m = msgs.first;
+      final sender = m.contact.isNotEmpty ? m.contact : 'Unknown';
+      final groupName =
+          m.group.isNotEmpty ? _groupNameForId(m.group) : '';
+      final prefix = groupName.isNotEmpty ? ' in $groupName' : '';
+      final preview =
+          m.text.length > 80 ? '${m.text.substring(0, 80)}…' : m.text;
+      text = 'New message from $sender$prefix: $preview';
     } else {
-      _showBatchNotification(msgs);
+      text = '${msgs.length} new messages';
     }
+    setState(() => _notificationText = text);
+    _notificationTimer?.cancel();
+    _notificationTimer = Timer(const Duration(seconds: 6), () {
+      if (mounted) setState(() => _notificationText = null);
+    });
   }
 
-  void _showSingleNotification(ChatMsg m) {
-    final sender = m.contact.isNotEmpty ? m.contact : 'Unknown';
-    final groupName =
-        m.group.isNotEmpty ? _groupNameForId(m.group) : '';
-    final prefix = groupName.isNotEmpty ? ' in $groupName' : '';
-    final preview =
-        m.text.length > 60 ? '${m.text.substring(0, 60)}…' : m.text;
-    _snack('$sender$prefix: $preview', label: sender);
-  }
-
-  void _showBatchNotification(List<ChatMsg> msgs) {
-    final n = msgs.length;
-    _snack('$n new messages', label: '$n new');
-  }
-
-  void _snack(String text, {String? label}) {
-    final ctx = scaffoldKey.currentContext;
-    if (ctx == null) return;
-    ScaffoldMessenger.of(ctx).showSnackBar(
-      SnackBar(
-        content: Text(text, maxLines: 2, overflow: TextOverflow.ellipsis),
-        duration: const Duration(seconds: 4),
-        behavior: SnackBarBehavior.floating,
-        margin: const EdgeInsets.only(left: 220, right: 16, bottom: 16),
+  Widget _notificationBanner() {
+    if (_notificationText == null) return const SizedBox.shrink();
+    return Material(
+      color: const Color(0xFF2A3A4A),
+      elevation: 4,
+      child: InkWell(
+        onTap: () => setState(() => _notificationText = null),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(
+            children: [
+              const Icon(Icons.mail_outline, color: Color(0xFF26D9C8), size: 18),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  _notificationText!,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                ),
+              ),
+              const SizedBox(width: 8),
+              const Icon(Icons.close, color: Colors.white54, size: 16),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1994,48 +2013,55 @@ class _ChatScreenState extends State<_ChatScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       key: scaffoldKey,
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          // GTK can hand Flutter a 1x1 surface before the first real frame.
-          // Rendering the full layout there just trips Flex overflow asserts.
-          if (constraints.maxWidth < 80 || constraints.maxHeight < 80) {
-            return const ColoredBox(color: _bg);
-          }
+      body: Column(
+        children: [
+          _notificationBanner(),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // GTK can hand Flutter a 1x1 surface before the first real frame.
+                // Rendering the full layout there just trips Flex overflow asserts.
+                if (constraints.maxWidth < 80 || constraints.maxHeight < 80) {
+                  return const ColoredBox(color: _bg);
+                }
 
-          if (_loading) {
-            return Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const SizedBox(
-                    width: 28,
-                    height: 28,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 2.5, color: _teal),
-                  ),
-                  const SizedBox(height: 16),
-                  Text('Connecting…',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: _textDim)),
-                ],
-              ),
-            );
-          }
+                if (_loading) {
+                  return Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const SizedBox(
+                          width: 28,
+                          height: 28,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2.5, color: _teal),
+                        ),
+                        const SizedBox(height: 16),
+                        Text('Connecting…',
+                            style: Theme.of(context)
+                                .textTheme
+                                .bodyMedium
+                                ?.copyWith(color: _textDim)),
+                      ],
+                    ),
+                  );
+                }
 
-          if (constraints.maxWidth < 720) {
-            return _sel == null && _selGroup == null ? _sidebar() : _chat();
-          }
+                if (constraints.maxWidth < 720) {
+                  return _sel == null && _selGroup == null ? _sidebar() : _chat();
+                }
 
-          return Row(
-            children: [
-              SizedBox(width: 320, child: _sidebar()),
-              Container(width: 1, color: _border),
-              Expanded(child: _sel == null && _selGroup == null ? _empty() : _chat()),
-            ],
-          );
-        },
+                return Row(
+                  children: [
+                    SizedBox(width: 320, child: _sidebar()),
+                    Container(width: 1, color: _border),
+                    Expanded(child: _sel == null && _selGroup == null ? _empty() : _chat()),
+                  ],
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
