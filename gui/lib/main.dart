@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 // ── palette ────────────────────────────────────────────────────────────────
@@ -104,8 +105,23 @@ Future<void> main() async {
       await windowManager.focus();
       await windowManager.setSkipTaskbar(false);
     });
+    await _initTray();
   }
   runApp(const SidebandApp());
+}
+
+Future<void> _initTray() async {
+  try {
+    await trayManager.setIcon('assets/icon_256x256.png');
+    final menu = Menu(items: [
+      MenuItem(key: 'show_window', label: 'Show Sideband'),
+      MenuItem.separator(),
+      MenuItem(key: 'exit_app', label: 'Exit'),
+    ]);
+    await trayManager.setContextMenu(menu);
+  } catch (_) {
+    // Tray is best-effort; some Wayland compositors don't support it.
+  }
 }
 
 class SidebandApp extends StatelessWidget {
@@ -629,7 +645,7 @@ class _ChatScreen extends StatefulWidget {
   State<_ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<_ChatScreen> {
+class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   final _cli = _Cli();
   final _input = TextEditingController();
   final _scroll = ScrollController();
@@ -645,6 +661,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   Timer? _notificationTimer;
   bool _showInAppNotifications = true;
   bool _showSystemNotifications = true;
+  bool _showAudibleNotifications = true;
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -664,6 +681,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   @override
   void initState() {
     super.initState();
+    trayManager.addListener(this);
     _listenerLogFile = File('${_cli.profile}/gui-listener.log');
     _startListener();
     _load();
@@ -672,12 +690,39 @@ class _ChatScreenState extends State<_ChatScreen> {
 
   @override
   void dispose() {
+    trayManager.removeListener(this);
     _poll.cancel();
     _notificationTimer?.cancel();
     _listener?.kill(ProcessSignal.sigterm);
     _input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  @override
+  void onTrayIconMouseDown() {
+    trayManager.popUpContextMenu();
+  }
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) {
+    if (menuItem.key == 'show_window') {
+      unawaited(_showWindow());
+    } else if (menuItem.key == 'exit_app') {
+      unawaited(_exitApp());
+    }
+  }
+
+  Future<void> _exitApp() async {
+    await windowManager.hide();
+    await windowManager.setSkipTaskbar(true);
+    exit(0);
+  }
+
+  Future<void> _minimizeToTray() async {
+    if (!(Platform.isLinux || Platform.isWindows || Platform.isMacOS)) return;
+    await windowManager.hide();
+    await windowManager.setSkipTaskbar(true);
   }
 
   Future<void> _appendListenerLog(String stream, String chunk) async {
@@ -1086,6 +1131,26 @@ class _ChatScreenState extends State<_ChatScreen> {
     }
     if (_showSystemNotifications) {
       unawaited(_showSystemNotification(text));
+    }
+    if (_showAudibleNotifications) {
+      unawaited(_playNotificationSound());
+    }
+  }
+
+  Future<void> _playNotificationSound() async {
+    if (!Platform.isLinux) return;
+    // Try canberra-gtk-play first (lightweight, standard on GNOME/XFCE),
+    // then paplay with a built-in fallback sound.
+    try {
+      await Process.run('canberra-gtk-play', ['--id', 'message-new-instant']);
+      return;
+    } catch (_) {}
+    try {
+      // Use a simple ALSA/PulseAudio beep via paplay and a temp WAV.
+      // Generate a short sine beep if no default sound is available.
+      await Process.run('paplay', ['/usr/share/sounds/freedesktop/stereo/message-new-instant.oga']);
+    } catch (_) {
+      // Sound is best-effort; never break the UI over a missing sound backend.
     }
   }
 
@@ -1998,7 +2063,7 @@ class _ChatScreenState extends State<_ChatScreen> {
                   SwitchListTile(
                     secondary: const Icon(Icons.notifications_active_outlined),
                     title: const Text('Desktop notifications'),
-                    subtitle: const Text('Use the system notification daemon for new messages'),
+                    subtitle: const Text('System notification daemon popups'),
                     value: _showSystemNotifications,
                     onChanged: (value) {
                       setState(() => _showSystemNotifications = value);
@@ -2015,6 +2080,16 @@ class _ChatScreenState extends State<_ChatScreen> {
                       setDialogState(() {});
                     },
                   ),
+                  SwitchListTile(
+                    secondary: const Icon(Icons.volume_up_outlined),
+                    title: const Text('Notification sound'),
+                    subtitle: const Text('Play a sound on new messages'),
+                    value: _showAudibleNotifications,
+                    onChanged: (value) {
+                      setState(() => _showAudibleNotifications = value);
+                      setDialogState(() {});
+                    },
+                  ),
                   const Divider(height: 20),
                   ListTile(
                     leading: const Icon(Icons.open_in_full),
@@ -2026,12 +2101,12 @@ class _ChatScreenState extends State<_ChatScreen> {
                     },
                   ),
                   ListTile(
-                    leading: const Icon(Icons.minimize),
-                    title: const Text('Minimize to taskbar'),
-                    subtitle: const Text('Keep Sideband running but get it out of the way'),
+                    leading: const Icon(Icons.vertical_align_bottom),
+                    title: const Text('Minimize to tray'),
+                    subtitle: const Text('Hide to system tray instead of taskbar'),
                     onTap: () {
                       Navigator.pop(dialogContext);
-                      unawaited(_minimizeToTaskbar());
+                      unawaited(_minimizeToTray());
                     },
                   ),
                   const Divider(height: 20),

@@ -1153,6 +1153,23 @@ fn init_db(profile: &Path) -> Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_kind, conversation_id)",
         [],
     )?;
+    // Migration: prune duplicate outbound group message rows left over from
+    // the old per-member fanout that stored one row per recipient instead of
+    // one row per sent message.  Keep the row whose contact is 'You' (the
+    // canonical self-label); if none match, keep the lowest id.
+    conn.execute(
+        "DELETE FROM messages
+         WHERE id NOT IN (
+             SELECT MIN(id) FROM messages
+             WHERE direction = 'out'
+               AND conversation_kind = 'group'
+               AND contact != ''
+             GROUP BY conversation_id, timestamp_ms
+         )
+         AND direction = 'out'
+         AND conversation_kind = 'group'",
+        [],
+    )?;
     Ok(conn)
 }
 
