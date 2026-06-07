@@ -615,12 +615,14 @@ class _ChatScreenState extends State<_ChatScreen> {
   final _cli = _Cli();
   final _input = TextEditingController();
   final _scroll = ScrollController();
+  final scaffoldKey = GlobalKey<ScaffoldState>();
 
   List<Contact> _contacts = [];
   List<GroupInfo> _groups = [];
   final _unreadContacts = <String>{};
   final _unreadGroups = <String>{};
   final _refreshSeenIds = <int>{};
+  final _notifiedMessageIds = <int>{};
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -997,6 +999,7 @@ class _ChatScreenState extends State<_ChatScreen> {
       final currentContact = _sel?.name;
       final currentGroup = _selGroup?.id;
       int newUnread = 0;
+      final List<ChatMsg> notifyMsgs = [];
       for (final m in global.msgs) {
         if (m.direction != 'in') continue;
         if (_refreshSeenIds.contains(m.id)) continue;
@@ -1016,11 +1019,63 @@ class _ChatScreenState extends State<_ChatScreen> {
         } else if (m.contact.isNotEmpty) {
           _unreadContacts.add(m.contact);
         }
+        if (!_notifiedMessageIds.contains(m.id)) {
+          notifyMsgs.add(m);
+        }
       }
       if (newUnread > 0 && mounted) setState(() {});
+      if (notifyMsgs.isNotEmpty && mounted) {
+        _showNotifications(notifyMsgs);
+      }
     } catch (_) {
       // best-effort; never break the UI over unread accounting
     }
+  }
+
+  void _showNotifications(List<ChatMsg> msgs) {
+    for (final m in msgs) {
+      _notifiedMessageIds.add(m.id);
+    }
+    if (msgs.length == 1) {
+      _showSingleNotification(msgs.first);
+    } else {
+      _showBatchNotification(msgs);
+    }
+  }
+
+  void _showSingleNotification(ChatMsg m) {
+    final sender = m.contact.isNotEmpty ? m.contact : 'Unknown';
+    final groupName =
+        m.group.isNotEmpty ? _groupNameForId(m.group) : '';
+    final prefix = groupName.isNotEmpty ? ' in $groupName' : '';
+    final preview =
+        m.text.length > 60 ? '${m.text.substring(0, 60)}…' : m.text;
+    _snack('$sender$prefix: $preview', label: sender);
+  }
+
+  void _showBatchNotification(List<ChatMsg> msgs) {
+    final n = msgs.length;
+    _snack('$n new messages', label: '$n new');
+  }
+
+  void _snack(String text, {String? label}) {
+    final ctx = scaffoldKey.currentContext;
+    if (ctx == null) return;
+    ScaffoldMessenger.of(ctx).showSnackBar(
+      SnackBar(
+        content: Text(text, maxLines: 2, overflow: TextOverflow.ellipsis),
+        duration: const Duration(seconds: 4),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.only(left: 220, right: 16, bottom: 16),
+      ),
+    );
+  }
+
+  String _groupNameForId(String id) {
+    for (final g in _groups) {
+      if (g.id == id) return g.sidebarLabel;
+    }
+    return id;
   }
 
   Future<void> _send() async {
@@ -1938,6 +1993,7 @@ class _ChatScreenState extends State<_ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      key: scaffoldKey,
       body: LayoutBuilder(
         builder: (context, constraints) {
           // GTK can hand Flutter a 1x1 surface before the first real frame.
