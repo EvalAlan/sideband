@@ -1193,6 +1193,45 @@ fn init_db(profile: &Path) -> Result<Connection> {
          AND conversation_kind = 'group'",
         [],
     )?;
+    // Migration: old per-member fanout rows were stored with
+    // conversation_kind='contact' (the column default) and
+    // conversation_id=recipient_name.  They leak into DM history because the
+    // contact-filter does not exclude them.  Detect them by the classic fanout
+    // fingerprint — same direction + body + timestamp, different(contact) — and
+    // retag them as group rows so the existing DM/group filters handle them.
+    conn.execute(
+        "UPDATE messages
+         SET conversation_kind = 'group',
+             conversation_id = '_legacy_fanout_' || contact || '_' || timestamp_ms
+         WHERE direction = 'out'
+           AND conversation_kind = 'contact'
+           AND contact NOT IN ('You', '')
+           AND id IN (
+               SELECT MIN(id) FROM messages
+               WHERE direction = 'out'
+                 AND conversation_kind = 'contact'
+                 AND contact NOT IN ('You', '')
+               GROUP BY body, timestamp_ms
+               HAVING COUNT(DISTINCT contact) > 1
+           )",
+        [],
+    )?;
+    // And now prune the fanout duplicates we just retagged (same body+ts, keep lowest id)
+    conn.execute(
+        "DELETE FROM messages
+         WHERE id NOT IN (
+             SELECT MIN(id) FROM messages
+             WHERE direction = 'out'
+               AND conversation_kind = 'group'
+               AND contact != ''
+               AND conversation_id LIKE '_legacy_fanout_%'
+             GROUP BY timestamp_ms, body
+         )
+         AND direction = 'out'
+         AND conversation_kind = 'group'
+         AND conversation_id LIKE '_legacy_fanout_%'",
+        [],
+    )?;
     Ok(conn)
 }
 
@@ -3916,6 +3955,93 @@ mod tests {
         let contact_rows = load_history(dir.path(), Some("alice"), 10).unwrap();
         assert_eq!(contact_rows.len(), 1);
         assert_eq!(contact_rows[0].body, "direct hello");
+    }
+
+    #[test]
+    fn legacy_fanout_rows_retagged_and_excluded_from_dm_history() {
+        // Simulate the old per-member fanout: before the migration, a single
+        // group message was stored as multiple rows — one per recipient —
+        // each with conversation_kind='contact' (the column default) and
+        // conversation_id=recipient_name.  After running the migration, these
+        // rows must be retagged as 'group' so they don't leak into contact DM
+        // history.
+        let dir = tempfile::tempdir().unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+
+        // Simulate old fanout: same body + same timestamp, different contacts
+        store_message_for_conversation(
+            dir.path(),
+            "out",
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            "group hello",
+            100,
+            DeliveryStatus::Sent,
+            "contact",  // old default — should become 'group' after migration
+            "alice",
+        )
+        .unwrap();
+        store_message_for_conversation(
+            dir.path(),
+            "out",
+            "bob",
+            "bobonionaddr.onion",
+            "group hello",
+            100,
+            DeliveryStatus::Sent,
+            "contact",
+            "bob",
+        )
+        .unwrap();
+        store_message_for_conversation(
+            dir.path(),
+            "out",
+            "charlie",
+            "charlieonionaddr.onion",
+            "group hello",
+            100,
+            DeliveryStatus::Sent,
+            "contact",
+            "charlie",
+        )
+        .unwrap();
+        // A real DM — same body goes to only one contact, not a fanout
+        store_message(
+            dir.path(),
+            "out",
+            "alice",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            "real dm to alice",
+            200,
+            DeliveryStatus::Sent,
+        )
+        .unwrap();
+
+        // Run the init_db migration which should retag fanout rows
+        init_db(dir.path()).unwrap();
+
+        // After migration: DM history for alice should only show the real DM
+        let contact_rows = load_history(dir.path(), Some("alice"), 50).unwrap();
+        let dm_bodies: Vec<&str> = contact_rows.iter().map(|r| r.body.as_str()).collect();
+        assert!(
+            !dm_bodies.contains(&"group hello"),
+            "old fanout row should not appear in alice DM history: {:?}",
+            dm_bodies
+        );
+        assert!(
+            dm_bodies.contains(&"real dm to alice"),
+            "real DM should still appear in alice DM history: {:?}",
+            dm_bodies
+        );
     }
 
     #[test]
