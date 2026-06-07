@@ -149,8 +149,10 @@ APPIMAGE_EXTRACT_AND_RUN=1 "${LINUXDEPLOY}" \
     --desktop-file "${APPDIR}/usr/share/applications/${DESKTOP_ID}" \
     --icon-file "${ICON_DIR}/scalable/apps/sideband_gui.svg"
 
-if [[ -f "${APPDIR}/usr/lib/libtray_manager_plugin.so" ]] && [[ ! -e "${APPDIR}/usr/lib/libayatana-appindicator3.so.1" ]]; then
-    err "AppImage missing bundled libayatana-appindicator3.so.1 required by tray_manager"
+if [[ -f "${APPDIR}/usr/lib/libtray_manager_plugin.so" ]] && \
+   [[ ! -e "${APPDIR}/usr/lib/libayatana-appindicator3.so.1" ]] && \
+   [[ ! -e "${APPDIR}/usr/lib/libappindicator3.so.1" ]]; then
+    err "AppImage missing bundled AppIndicator library required by tray_manager"
     exit 1
 fi
 
