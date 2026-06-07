@@ -200,6 +200,30 @@ InputBorder _inputBorder(Color c) => OutlineInputBorder(
       borderSide: BorderSide(color: c),
     );
 
+// ── window handler ──────────────────────────────────────────────────────────
+
+class _WindowHandler extends WindowListener {
+  _WindowHandler(this._state);
+  final _ChatScreenState _state;
+
+  @override
+  void onWindowClose() {
+    if (_state._minimizeToTrayEnabled) {
+      unawaited(_state._minimizeToTray());
+    } else {
+      unawaited(windowManager.destroy());
+    }
+  }
+
+  @override
+  void onWindowMinimize() {
+    if (_state._minimizeToTrayEnabled) {
+      unawaited(_state._minimizeToTray());
+    }
+    // When not enabled, let the default minimize behavior happen
+  }
+}
+
 // ── app ─────────────────────────────────────────────────────────────────────
 
 Future<void> main() async {
@@ -787,6 +811,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   bool _showInAppNotifications = true;
   bool _showSystemNotifications = true;
   bool _showAudibleNotifications = true;
+  bool _minimizeToTrayEnabled = false;
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -805,6 +830,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   String _selectedTheme = 'Teal';
 
   ThemeDef get _t => _themeDef(_selectedTheme);
+  late _WindowHandler _windowHandler;
 
   @override
   void initState() {
@@ -814,11 +840,19 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     _startListener();
     _load();
     _poll = Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
+    _initWindowListeners();
+  }
+
+  void _initWindowListeners() {
+    _windowHandler = _WindowHandler(this);
+    windowManager.setPreventClose(true);
+    windowManager.addListener(_windowHandler);
   }
 
   @override
   void dispose() {
     trayManager.removeListener(this);
+    windowManager.removeListener(_windowHandler);
     _poll.cancel();
     _notificationTimer?.cancel();
     _listener?.kill(ProcessSignal.sigterm);
@@ -2231,13 +2265,14 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       unawaited(_showWindow());
                     },
                   ),
-                  ListTile(
-                    leading: Icon(Icons.vertical_align_bottom),
-                    title: Text('Minimize to tray'),
-                    subtitle: Text('Hide to system tray instead of taskbar'),
-                    onTap: () {
-                      Navigator.pop(dialogContext);
-                      unawaited(_minimizeToTray());
+                  SwitchListTile(
+                    secondary: const Icon(Icons.vertical_align_bottom),
+                    title: const Text('Minimize to tray'),
+                    subtitle: const Text('Minimize button sends to system tray'),
+                    value: _minimizeToTrayEnabled,
+                    onChanged: (value) {
+                      setState(() => _minimizeToTrayEnabled = value);
+                      setDialogState(() {});
                     },
                   ),
                   const Divider(height: 20),
