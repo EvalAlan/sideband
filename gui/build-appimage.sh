@@ -30,6 +30,10 @@ if [[ -z "${FLUTTER}" || ! -x "${FLUTTER}" ]]; then err "Flutter not found"; exi
 # Step 1: Build Rust binary
 log "Building Rust release binary..."
 cd "${REPO_ROOT}"
+if [[ "${CI:-}" == "true" ]]; then
+    warn "Cleaning Cargo target dir in CI to avoid stale cross-run release artifacts..."
+    cargo clean
+fi
 cargo build --release --bin sideband
 
 # Step 2: Build Flutter Linux release
