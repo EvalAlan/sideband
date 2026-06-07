@@ -3,3 +3,7 @@
 .tools/
 *.log
 *.db
+
+# CI AppImage artifacts (should never be committed)
+sideband-appimage-*
+dist/Sideband-*.AppImage
