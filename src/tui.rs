@@ -635,17 +635,11 @@ impl App {
     }
 
     fn push_sys(&mut self, body: &str, status: &str) {
-        let lines: Vec<&str> = body.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let body = if i == 0 {
-                format!("* {}", line)
-            } else {
-                format!("  {}", line)
-            };
+        for line in body.lines() {
             self.messages.push(DisplayMessage {
                 direction: "sys".into(),
-                contact: " ".into(),
-                body,
+                contact: String::new(),
+                body: line.to_string(),
                 _timestamp_ms: 0,
                 status: status.into(),
                 pending: false,
@@ -2077,4 +2071,54 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let text = Line::from(spans);
     let footer = Paragraph::new(text).style(Style::default().bg(Color::DarkGray));
     f.render_widget(footer, area);
+}
+
+#[cfg(test)]
+mod input_clear_on_command_test {
+    use super::*;
+
+    fn make_test_app() -> App {
+        let (tui_tx, _tui_rx) = mpsc::channel::<TuiEvent>(1);
+        let (send_tx, _send_rx) = mpsc::channel::<SendCommand>(1);
+        let (file_tx, _file_rx) = mpsc::channel::<FileCommand>(1);
+        drop(tui_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            _tui_rx,
+            send_tx,
+            file_tx,
+            vec!["alice".to_string()],
+            quit_tx,
+        );
+        app.profile_name = "alan".to_string();
+        app
+    }
+
+    #[test]
+    fn contact_add_clears_input_and_pushes_sys() {
+        let mut app = make_test_app();
+        app.input = "/add Steamdeck abc123 pubkey x25516key".to_string();
+
+        let should_quit = app.try_send();
+
+        assert!(!should_quit);
+        assert!(
+            app.input.is_empty(),
+            "input should be empty after /add, got: '{}'",
+            app.input
+        );
+        let sys: Vec<&DisplayMessage> =
+            app.messages.iter().filter(|m| m.direction == "sys").collect();
+        assert!(!sys.is_empty(), "expected sys messages after /add");
+        // The sys message body should NOT have the old "* " prefix.
+        for msg in &sys {
+            assert!(
+                !msg.body.starts_with("* "),
+                "sys message should not start with '* ', got: '{}'",
+                msg.body
+            );
+        }
+    }
 }
