@@ -685,6 +685,22 @@ impl App {
         self.groups.get(idx).map(|g| g.id.clone())
     }
 
+    fn selected_conversation_label(&self) -> String {
+        if let Some(contact) = self.selected_contact_name() {
+            return contact;
+        }
+        let Some(group_index) = self
+            .selected_contact
+            .checked_sub(self.sendable_contact_count())
+        else {
+            return "(no contacts)".to_string();
+        };
+        self.groups
+            .get(group_index)
+            .map(|group| format!("👥 {}", group.title))
+            .unwrap_or_else(|| "(no contacts)".to_string())
+    }
+
     fn do_send(&mut self, contact: &str, message: &str) {
         let _ = self.send_tx.try_send(SendCommand {
             contact: contact.to_string(),
@@ -1273,9 +1289,46 @@ mod group_sidebar_tests {
 
     #[test]
     fn sidebar_items_include_group_section() {
-        let groups = vec![crate::GroupInfo {
-            id: "g1".to_string(),
-            title: "Ops".to_string(),
+        let groups = vec![test_group("g1", "Ops")];
+
+        let items = sidebar_items(&["alice".to_string()], &groups);
+
+        assert!(items.iter().any(|item| item == "Contacts"));
+        assert!(items.iter().any(|item| item == "Groups"));
+        assert!(items.iter().any(|item| item == "👥 Ops (1)"));
+    }
+
+    #[test]
+    fn footer_does_not_index_contacts_when_group_is_selected() {
+        let (tui_tx, tui_rx) = mpsc::channel::<TuiEvent>(1);
+        let (send_tx, _send_rx) = mpsc::channel::<SendCommand>(1);
+        let (file_tx, _file_rx) = mpsc::channel::<FileCommand>(1);
+        drop(tui_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            tui_rx,
+            send_tx,
+            file_tx,
+            vec!["alice".to_string(), "bob".to_string()],
+            quit_tx,
+        );
+        app.groups = vec![test_group("g1", "Homies")];
+        app.selected_contact = app.sendable_contact_count();
+
+        let backend = ratatui::backend::TestBackend::new(80, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| draw_footer(f, f.area(), &app))
+            .expect("footer render should not panic for selected group");
+    }
+
+    fn test_group(id: &str, title: &str) -> crate::GroupInfo {
+        crate::GroupInfo {
+            id: id.to_string(),
+            title: title.to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
             members: vec![crate::GroupMember {
@@ -1283,13 +1336,7 @@ mod group_sidebar_tests {
                 role: "member".to_string(),
                 added_at_ms: 1,
             }],
-        }];
-
-        let items = sidebar_items(&["alice".to_string()], &groups);
-
-        assert!(items.iter().any(|item| item == "Contacts"));
-        assert!(items.iter().any(|item| item == "Groups"));
-        assert!(items.iter().any(|item| item == "👥 Ops (1)"));
+        }
     }
 }
 
@@ -1752,11 +1799,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let contact_name = if app.contacts.is_empty() || app.contacts[0] == "(no contacts)" {
-        "(no contacts)".into()
-    } else {
-        app.contacts[app.selected_contact].clone()
-    };
+    let contact_name = app.selected_conversation_label();
     let mut spans = vec![
         Span::styled(
             format!(" {} ", app.profile_name),
