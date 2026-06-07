@@ -1012,7 +1012,7 @@ class _ChatScreenState extends State<_ChatScreen> {
         _refreshSeenIds.add(m.id);
         newUnread++;
         if (m.group.isNotEmpty) {
-          _unreadGroups.add(m.group!);
+          _unreadGroups.add(m.group);
         } else if (m.contact.isNotEmpty) {
           _unreadContacts.add(m.contact);
         }
