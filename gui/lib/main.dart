@@ -883,21 +883,21 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Future<String?> _promptDisplayName() async {
     final controller = TextEditingController();
     try {
-      return showDialog<String>(
+      return await showDialog<String>(
         context: context,
         barrierDismissible: false,
-        builder: (_) => AlertDialog(
+        builder: (dialogContext) => AlertDialog(
           backgroundColor: _t.surface,
           title: Text('Set up Sideband', style: TextStyle(color: _t.text)),
           content: TextField(
             controller: controller,
             autofocus: true,
             decoration: const InputDecoration(labelText: 'Display name'),
-            onSubmitted: (v) => Navigator.pop(context, v.trim()),
+            onSubmitted: (v) => Navigator.pop(dialogContext, v.trim()),
           ),
           actions: [
             FilledButton(
-              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              onPressed: () => Navigator.pop(dialogContext, controller.text.trim()),
               child: Text('Create profile'),
             ),
           ],
