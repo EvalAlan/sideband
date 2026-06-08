@@ -269,6 +269,39 @@ impl App {
                     }
                     return false;
                 }
+                Some("group-leave") => {
+                    if parts.len() != 2 {
+                        self.push_sys("usage: /group-leave <id-or-title>", "error");
+                        return false;
+                    }
+                    match crate::resolve_group(&self.profile, parts[1]) {
+                        Ok(group) => {
+                            self.push_sys(
+                                &format!("leaving group '{}'...", group.title),
+                                "info",
+                            );
+                            let profile = self.profile.clone();
+                            tokio::spawn(async move {
+                                let tor = match crate::transport::tor::TorTransport::bootstrap(&profile).await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        tracing::error!(error=%e, "failed to bootstrap tor for group leave");
+                                        return;
+                                    }
+                                };
+                                if let Err(e) =
+                                    crate::leave_group(&profile, &group.id, tor).await
+                                {
+                                    tracing::error!(error=%e, "group leave failed");
+                                } else {
+                                    tracing::info!(group=%group.title, "left group");
+                                }
+                            });
+                        }
+                        Err(e) => self.push_sys(&format!("group not found: {}", e), "error"),
+                    }
+                    return false;
+                }
                 Some("group") => {
                     if parts.len() < 3 {
                         self.push_sys("usage: /group <id-or-title> <message>", "error");
@@ -369,7 +402,7 @@ impl App {
                 }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/group-create <title> <member> [member...] — create group\n/group-delete <id-or-title> — delete group\n/group-rename <id-or-title> <new-title> — rename group\n/group-add <id-or-title> <member> — add group member\n/group-remove <id-or-title> <member> — remove group member\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/who — show members of selected group\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/emoji  — show common emoji shortcuts\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send direct message\\n/group <id-or-title> <msg> — send group message\\n/group-create <title> <member> [member...] — create group\\n/group-delete <id-or-title> — delete group\\n/group-leave <id-or-title> — leave group\\n/group-rename <id-or-title> <new-title> — rename group\\n/group-add <id-or-title> <member> — add group member\\n/group-remove <id-or-title> <member> — remove group member\\n/file <contact> <path> — send file\\n/file <contact|group> <path> — send file to contact or group\\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\\n/history [contact] — show log\\n/history-group <id-or-title> — show group log\\n/contacts — list contacts with keys\\n/groups — list groups\\n/who — show members of selected group\\n/add <name> <onion> <ed25519_pk> <x25519_pk>\\n/delete <contact> — remove contact\\n/name [display-name] — show or set your name\\n/whoami — show identity keys\\n/share  — one-liner for sharing\\n/onion  — show onion address\\n/emoji  — show common emoji shortcuts\\n/ratchet <contact> — init double ratchet\\n/status  — full status\\n/clear  — clear messages\\n/quit   — exit",
                         "help",
                     );
                     return false;

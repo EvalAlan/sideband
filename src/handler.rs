@@ -16,7 +16,7 @@ use crate::{
     decrypt_and_verify, discover_or_update_group, resolve_contact_name_by_pubkey,
     send_typed_message, store_message, store_message_for_conversation, ChatMessage, ContactsMap,
     DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload, FileOfferPayload,
-    GroupMessagePayload, IncomingFileState, TuiEvent,
+    GroupDeletePayload, GroupLeavePayload, GroupMessagePayload, IncomingFileState, TuiEvent,
 };
 
 /// Parse a raw inbound line into a [`ChatMessage`].
@@ -69,6 +69,14 @@ pub async fn handle_inbound(
     if msg.r#type == "file_ack" {
         handle_file_ack(profile, tui_tx, contacts, msg).await?;
         return Ok(());
+    }
+
+    if msg.r#type == "group_leave" {
+        return handle_group_leave(profile, tui_tx, contacts, msg).await;
+    }
+
+    if msg.r#type == "group_deleted" {
+        return handle_group_deleted(profile, tui_tx, contacts, msg).await;
     }
 
     // Normal message.
@@ -795,4 +803,90 @@ mod group_chat_tests {
             other => panic!("expected group event, got {other:?}"),
         }
     }
+}
+
+async fn handle_group_leave(
+    profile: &Path,
+    tui_tx: &mpsc::Sender<TuiEvent>,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let (plaintext, verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
+        tracing::error!(error=%e, "decrypt/verify failed");
+        (String::new(), false)
+    });
+    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    if let Ok(payload) = serde_json::from_str::<crate::GroupLeavePayload>(&plaintext) {
+        let display = format!("[{} left group]", contact_name);
+        let status = if verified {
+            DeliveryStatus::Delivered
+        } else {
+            DeliveryStatus::Failed
+        };
+        store_message_for_conversation(
+            profile,
+            "in",
+            &contact_name,
+            "",
+            &display,
+            msg.timestamp_ms,
+            status,
+            "group",
+            &payload.group_id,
+        )?;
+        let _ = tui_tx
+            .send(TuiEvent::InboundGroupMessage {
+                group_id: payload.group_id,
+                group_title: payload.group_title,
+                contact: contact_name,
+                body: display,
+                timestamp_ms: msg.timestamp_ms,
+                verified,
+            })
+            .await;
+    }
+    Ok(())
+}
+
+async fn handle_group_deleted(
+    profile: &Path,
+    tui_tx: &mpsc::Sender<TuiEvent>,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let (plaintext, verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
+        tracing::error!(error=%e, "decrypt/verify failed");
+        (String::new(), false)
+    });
+    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    if let Ok(payload) = serde_json::from_str::<crate::GroupDeletePayload>(&plaintext) {
+        let display = format!("[group deleted by {}]", contact_name);
+        let status = if verified {
+            DeliveryStatus::Delivered
+        } else {
+            DeliveryStatus::Failed
+        };
+        store_message_for_conversation(
+            profile,
+            "in",
+            &contact_name,
+            "",
+            &display,
+            msg.timestamp_ms,
+            status,
+            "group",
+            &payload.group_id,
+        )?;
+        let _ = tui_tx
+            .send(TuiEvent::InboundGroupMessage {
+                group_id: payload.group_id,
+                group_title: payload.group_title,
+                contact: contact_name,
+                body: display,
+                timestamp_ms: msg.timestamp_ms,
+                verified,
+            })
+            .await;
+    }
+    Ok(())
 }

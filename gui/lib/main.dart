@@ -663,6 +663,13 @@ class _Cli {
   Future<String> deleteGroup(String group) =>
       _run(groupDeleteArgs(profile: profile, group: group));
 
+  List<String> groupLeaveArgs({required String profile, required String group}) => [
+        'group', 'leave', '--profile', profile, '--group', group,
+      ];
+
+  Future<String> leaveGroup(String group) =>
+      _run(groupLeaveArgs(profile: profile, group: group));
+
   Future<GroupInfo> renameGroup({required String group, required String title}) =>
       _parseGroupFromArgs(
           groupRenameArgs(profile: profile, group: group, title: title),
@@ -1768,7 +1775,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       switch (cmd) {
         case 'help':
           _showInfo('Slash commands',
-              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group-delete <id-or-title>\n/group-rename <id-or-title> <new-title>\n/group-add <id-or-title> <member>\n/group-remove <id-or-title> <member>\n/group <id-or-title> <msg>\n/file <filepath>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/who — show members of selected group\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
+              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group-delete <id-or-title>\n/group-leave <id-or-title>\n/group-rename <id-or-title> <new-title>\n/group-add <id-or-title> <member>\n/group-remove <id-or-title> <member>\n/group <id-or-title> <msg>\n/file <filepath>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/who — show members of selected group\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
           return;
         case 'send':
           if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
@@ -1791,6 +1798,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         case 'group-delete':
           if (parts.length != 2) throw Exception('usage: /group-delete <id-or-title>');
           _showInfo('Group deleted', await _cli.deleteGroup(parts[1]));
+          await _load();
+          if (_selGroup?.id == parts[1] || _selGroup?.title == parts[1]) {
+            setState(() {
+              _selGroup = null;
+              _msgs = const [];
+            });
+          }
+          return;
+        case 'group-leave':
+          if (parts.length != 2) throw Exception('usage: /group-leave <id-or-title>');
+          _showInfo('Left group', await _cli.leaveGroup(parts[1]));
           await _load();
           if (_selGroup?.id == parts[1] || _selGroup?.title == parts[1]) {
             setState(() {
@@ -2327,6 +2345,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         PopupMenuDivider(),
         PopupMenuItem(value: 'edit', child: Text('Manage group')),
         PopupMenuItem(value: 'delete', child: Text('Delete group')),
+        PopupMenuItem(value: 'leave', child: Text('Leave group')),
         PopupMenuDivider(),
         PopupMenuItem(value: 'details', child: Text('Group details')),
       ],
@@ -2349,9 +2368,31 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       case 'delete':
         await _deleteGroup(group);
         return;
+      case 'leave':
+        await _leaveGroup(group);
+        return;
       case 'details':
         _showInfo('Group details', group.details);
         return;
+    }
+  }
+
+  Future<void> _leaveGroup(GroupInfo group) async {
+    if (!await _confirm('Leave group',
+        'Leave ${group.title}? The group will remain for other members.')) {
+      return;
+    }
+    try {
+      _showInfo('Left group', await _cli.leaveGroup(group.id));
+      await _load();
+      if (_selGroup?.id == group.id) {
+        setState(() {
+          _selGroup = null;
+          _msgs = const [];
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
     }
   }
 

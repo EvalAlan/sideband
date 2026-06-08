@@ -275,6 +275,13 @@ enum GroupAction {
         #[arg(long)]
         json: bool,
     },
+    Leave {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Group id or exact title.
+        #[arg(long)]
+        group: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +384,20 @@ impl GroupMessagePayload {
             body: body.to_string(),
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct GroupLeavePayload {
+    pub(crate) kind: String,
+    pub(crate) group_id: String,
+    pub(crate) group_title: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct GroupDeletePayload {
+    pub(crate) kind: String,
+    pub(crate) group_id: String,
+    pub(crate) group_title: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1710,6 +1731,77 @@ pub(crate) fn delete_group(profile: &Path, group_ref: &str) -> Result<GroupInfo>
     Ok(group)
 }
 
+/// Notify all group members that this group has been deleted by its owner.
+/// Sends a `group_deleted` typed message to each member before removing local state.
+fn notify_group_deleted(
+    profile: &Path,
+    group: &GroupInfo,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    let contacts = load_contacts(profile)?;
+    let payload = GroupDeletePayload {
+        kind: "group_deleted".to_string(),
+        group_id: group.id.clone(),
+        group_title: group.title.clone(),
+    };
+    let payload_json = serde_json::to_string(&payload).unwrap_or_default();
+    for member in &group.members {
+        if let Some(contact) = contacts.get(&member.contact) {
+            if contact.onion.is_empty() {
+                continue;
+            }
+            let onion = contact.onion.clone();
+            let name = contact.name.clone();
+            let profile = profile.to_path_buf();
+            let tor = Arc::clone(&tor_client);
+            let body = payload_json.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::send_typed_message(&profile, &onion, &name, "group_deleted", &body, tor)
+                        .await
+                {
+                    tracing::warn!(error=%e, member=%name, "failed to send group_deleted notification");
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Send a `group_leave` typed message to all group members announcing departure.
+pub(crate) async fn leave_group(
+    profile: &Path,
+    group_ref: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<GroupInfo> {
+    let group = resolve_group(profile, group_ref)?;
+    let contacts = load_contacts(profile)?;
+    let payload = GroupLeavePayload {
+        kind: "group_leave".to_string(),
+        group_id: group.id.clone(),
+        group_title: group.title.clone(),
+    };
+    let payload_json = serde_json::to_string(&payload).unwrap_or_default();
+    for member in &group.members {
+        if let Some(contact) = contacts.get(&member.contact) {
+            if contact.onion.is_empty() {
+                continue;
+            }
+            let onion = contact.onion.clone();
+            let name = contact.name.clone();
+            let profile = profile.to_path_buf();
+            let tor = Arc::clone(&tor_client);
+            let body = payload_json.clone();
+            if let Err(e) =
+                crate::send_typed_message(&profile, &onion, &name, "group_leave", &body, tor).await
+            {
+                tracing::warn!(error=%e, member=%name, "failed to send group_leave notification");
+            }
+        }
+    }
+    Ok(group)
+}
+
 pub(crate) fn add_group_member(profile: &Path, group_ref: &str, member: &str) -> Result<GroupInfo> {
     let member = member.trim();
     if member.is_empty() {
@@ -2227,6 +2319,14 @@ async fn main() -> Result<()> {
                 } else {
                     println!("member '{}' removed from group '{}'", member, group.title);
                 }
+                Ok(())
+            }
+            GroupAction::Leave { profile, group } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
+                let group = leave_group(&profile, &group, tor_client).await?;
+                println!("left group '{}'", group.title);
                 Ok(())
             }
         },
@@ -3590,6 +3690,34 @@ pub(crate) async fn serve(
                                 Ok(()) => println!("file sent to {}", to),
                                 Err(e) => println!("file send error: {e}"),
                             }
+                        }
+                    });
+                }
+                "group_leave" => {
+                    let Some(group) = cmd.group else {
+                        println!("group leave error: missing group");
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        match crate::leave_group(&profile, &group, tor_client).await {
+                            Ok(g) => println!("left group: {}", g.title),
+                            Err(e) => println!("group leave error: {e}"),
+                        }
+                    });
+                }
+                "group_delete" => {
+                    let Some(group) = cmd.group else {
+                        println!("group delete error: missing group");
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        // Notify members before deleting locally
+                        if let Ok(g) = crate::resolve_group(&profile, &group) {
+                            let _ = crate::notify_group_deleted(&profile, &g, tor_client.clone());
+                        }
+                        match crate::delete_group(&profile, &group) {
+                            Ok(g) => println!("group deleted: {}", g.title),
+                            Err(e) => println!("group delete error: {e}"),
                         }
                     });
                 }
