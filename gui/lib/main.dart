@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -1296,69 +1297,24 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<void> _showFileDialog() async {
-    final controller = TextEditingController();
     final c = _sel;
     final g = _selGroup;
-    // Pre-fill with selected contact/group name
     final target = c?.name ?? g?.title ?? '';
-    // Build dialog label
-    final label = target.isNotEmpty ? 'Send file to $target' : 'File path';
+    if (target.isEmpty) {
+      setState(() => _error = 'No contact or group selected');
+      return;
+    }
     try {
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (_) => AlertDialog(
-          backgroundColor: _t.surface,
-          title: Text('Send file', style: TextStyle(color: _t.text)),
-          content: SizedBox(
-            width: 380,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (target.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Text('Recipient: $target',
-                        style: TextStyle(color: _t.text, fontSize: 12)),
-                  ),
-                TextField(
-                  controller: controller,
-                  autofocus: true,
-                  style: TextStyle(fontSize: 14, color: _t.text),
-                  decoration: InputDecoration(
-                    labelText: label,
-                    hintText: '/path/to/file',
-                  ),
-                  onSubmitted: (_) => Navigator.pop(context, true),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: Text('Send'),
-            ),
-          ],
-        ),
-      );
-      if (ok == true && controller.text.trim().isNotEmpty) {
-        final path = controller.text.trim();
-        if (target.isNotEmpty) {
-          await _sendFileViaListener(to: target, path: path);
-        } else {
-          setState(() => _error = 'No contact or group selected');
-          return;
-        }
+      final result = await FilePicker.platform
+         .pickFiles(dialogTitle: 'Send file to $target');
+      if (result != null && result.files.single.path != null) {
+        final path = result.files.single.path!;
+        await _sendFileViaListener(to: target, path: path);
         await _refresh();
         _scrollToBottom();
       }
-    } finally {
-      controller.dispose();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
     }
   }
 
