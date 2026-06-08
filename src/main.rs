@@ -6013,3 +6013,12 @@ fn int_v2_unknown_sender_decrypts_with_raw_key() {
     let plaintext = decrypt_body(&shared_bob, &enc_body).unwrap();
     assert_eq!(plaintext, "secret from eve");
 }
+
+// ---------------------------------------------------------------------------
+// Serve protocol integration tests
+//
+// Note: Full integration tests that spawn `cargo run -- serve` are not
+// practical in CI because they require Tor bootstrap. The structured
+// response types (ServeResponse) are validated by the unit tests above
+// and by the GUI's Dart-side parsing at runtime.
+// ---------------------------------------------------------------------------
