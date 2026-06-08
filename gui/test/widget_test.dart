@@ -76,6 +76,59 @@ void main() {
     );
   });
 
+  test('raw group payload messages normalize to group chat bodies', () {
+    const raw = '{"kind":"group_message","group_id":"g1","group_title":"SecX","members":["Alan","Zimbro"],"body":"Ping"}';
+    const msg = ChatMsg(
+      id: 1,
+      direction: 'in',
+      status: 'delivered',
+      contact: 'Zimbro',
+      group: '',
+      text: raw,
+      tsMs: 100,
+    );
+
+    final normalized = normalizeRawGroupPayloadMessage(msg);
+    expect(normalized.group, 'g1');
+    expect(normalized.text, 'Ping');
+    expect(normalized.contact, 'Zimbro');
+  });
+
+  test('contact views hide raw group payload rows and groups recover them', () {
+    const raw = '{"kind":"group_message","group_id":"g1","group_title":"SecX","members":["Alan","Zimbro"],"body":"Ho"}';
+    const badDm = ChatMsg(
+      id: 2,
+      direction: 'in',
+      status: 'failed',
+      contact: 'Zimbro',
+      group: '',
+      text: raw,
+      tsMs: 200,
+    );
+    const realDm = ChatMsg(
+      id: 3,
+      direction: 'in',
+      status: 'delivered',
+      contact: 'Zimbro',
+      group: '',
+      text: 'actual dm',
+      tsMs: 300,
+    );
+
+    final normalized = [badDm, realDm].map(normalizeRawGroupPayloadMessage).toList();
+    expect(visibleContactMessages(normalized).map((m) => m.text), ['actual dm']);
+
+    final recovered = mergeRecoveredGroupMessages(
+      groupRows: const [],
+      globalRows: normalized,
+      groupId: 'g1',
+      limit: 80,
+    );
+    expect(recovered, hasLength(1));
+    expect(recovered.first.text, 'Ho');
+    expect(recovered.first.group, 'g1');
+  });
+
   testWidgets('app boot does not crash', (WidgetTester tester) async {
     await tester.pumpWidget(const SidebandApp());
     await tester.pump(const Duration(milliseconds: 500));

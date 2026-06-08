@@ -401,6 +401,86 @@ class _History {
   final String bin;
 }
 
+class ParsedGroupPayload {
+  const ParsedGroupPayload({
+    required this.groupId,
+    required this.title,
+    required this.body,
+  });
+
+  final String groupId;
+  final String title;
+  final String body;
+}
+
+ParsedGroupPayload? parseGroupPayloadText(String text) {
+  Object? decoded;
+  try {
+    decoded = jsonDecode(text);
+  } catch (_) {
+    return null;
+  }
+
+  if (decoded is String) {
+    try {
+      decoded = jsonDecode(decoded);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  if (decoded is! Map) return null;
+  if (decoded['kind'] != 'group_message') return null;
+  final groupId = decoded['group_id']?.toString().trim() ?? '';
+  final body = decoded['body']?.toString() ?? '';
+  if (groupId.isEmpty) return null;
+  return ParsedGroupPayload(
+    groupId: groupId,
+    title: decoded['group_title']?.toString() ?? '',
+    body: body,
+  );
+}
+
+ChatMsg normalizeRawGroupPayloadMessage(ChatMsg msg) {
+  final payload = parseGroupPayloadText(msg.text);
+  if (payload == null) return msg;
+  return ChatMsg(
+    id: msg.id,
+    direction: msg.direction,
+    status: msg.status,
+    contact: msg.contact,
+    group: payload.groupId,
+    text: payload.body,
+    tsMs: msg.tsMs,
+  );
+}
+
+List<ChatMsg> visibleContactMessages(List<ChatMsg> msgs) =>
+    msgs.where((m) => m.group.isEmpty).toList(growable: false);
+
+List<ChatMsg> mergeRecoveredGroupMessages({
+  required List<ChatMsg> groupRows,
+  required List<ChatMsg> globalRows,
+  required String groupId,
+  required int limit,
+}) {
+  final byId = <int, ChatMsg>{};
+  for (final msg in groupRows) {
+    if (msg.group == groupId) byId[msg.id] = msg;
+  }
+  for (final msg in globalRows) {
+    final normalized = normalizeRawGroupPayloadMessage(msg);
+    if (normalized.group == groupId) byId[normalized.id] = normalized;
+  }
+  final merged = byId.values.toList();
+  merged.sort((a, b) {
+    final ts = b.tsMs.compareTo(a.tsMs);
+    return ts != 0 ? ts : b.id.compareTo(a.id);
+  });
+  if (merged.length > limit) return merged.take(limit).toList(growable: false);
+  return merged;
+}
+
 class ShareInfo {
   const ShareInfo({required this.command, required this.qr});
   final String command;
@@ -726,7 +806,7 @@ class _Cli {
     for (final item in decoded) {
       if (item is! Map) continue;
       final conversationKind = (item['conversation_kind'] as String?) ?? '';
-      parsed.add(ChatMsg(
+      final msg = ChatMsg(
         id: (item['id'] as num).toInt(),
         direction: item['direction'] as String,
         status: _statusLabel((item['status'] as num).toInt()),
@@ -734,7 +814,8 @@ class _Cli {
         group: conversationKind == 'group' ? (item['conversation_id'] as String?) ?? '' : '',
         text: item['body'] as String,
         tsMs: (item['timestamp_ms'] as num).toInt(),
-      ));
+      );
+      parsed.add(normalizeRawGroupPayloadMessage(msg));
     }
     parsed.sort((a, b) => b.id.compareTo(a.id));
     final maxId = parsed.isEmpty ? null : parsed.first.id;
@@ -1256,13 +1337,35 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     Iterable<String>? knownContacts,
   }) async {
     final filtered = await _cli.history(contact: contact, group: group);
+    if (group != null) {
+      final global = await _cli.history(limit: 200);
+      final merged = mergeRecoveredGroupMessages(
+        groupRows: filtered.msgs,
+        globalRows: global.msgs,
+        groupId: group,
+        limit: 80,
+      );
+      return _History(
+        msgs: merged,
+        maxId: merged.isEmpty ? null : merged.map((m) => m.id).reduce((a, b) => a > b ? a : b),
+        bin: filtered.bin,
+      );
+    }
+
+    final contactMsgs = visibleContactMessages(filtered.msgs);
+    final visibleFiltered = _History(
+      msgs: contactMsgs,
+      maxId: contactMsgs.isEmpty ? null : contactMsgs.map((m) => m.id).reduce((a, b) => a > b ? a : b),
+      bin: filtered.bin,
+    );
+
     if (!shouldFallbackToGlobalHistory(
-      groupSelected: group != null,
-      filteredHistoryEmpty: filtered.msgs.isEmpty,
+      groupSelected: false,
+      filteredHistoryEmpty: visibleFiltered.msgs.isEmpty,
       contact: contact,
       knownContacts: knownContacts ?? _contacts.map((c) => c.name),
     )) {
-      return filtered;
+      return visibleFiltered;
     }
 
     // If inbound was stored under a raw pubkey/verified-peer because the local
