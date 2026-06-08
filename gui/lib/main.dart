@@ -4,7 +4,6 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -1297,59 +1296,27 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<void> _showFileDialog() async {
-    final c = _sel;
-    final g = _selGroup;
-    final target = c?.name ?? g?.title ?? '';
+    final target = _sel?.name ?? _selGroup?.title ?? '';
     if (target.isEmpty) {
       setState(() => _error = 'No contact or group selected');
       return;
     }
-    // Try native Linux file choosers first (most reliable in AppImage context)
-    final nativePath = await _tryNativeFileChooser(target);
-    if (nativePath != null) {
-      if (nativePath.isEmpty) return; // user cancelled
-      await _sendFileViaListener(to: target, path: nativePath);
-      await _refresh();
-      _scrollToBottom();
-      return;
-    }
-    // Fallback to file_picker package
+    if (!mounted) return;
+    final path = await showDialog<String>(
+      context: context,
+      builder: (ctx) => _FlutterFilePicker(
+        title: 'Send file to $target',
+        initialPath: Platform.environment['HOME'] ?? '/',
+      ),
+    );
+    if (path == null || path.isEmpty) return;
     try {
-      final result = await FilePicker.platform.pickFiles(
-        dialogTitle: 'Send file to $target',
-        type: FileType.any,
-      );
-      if (result == null || result.files.isEmpty) return;
-      final path = result.files.single.path;
-      if (path == null || path.isEmpty) return;
       await _sendFileViaListener(to: target, path: path);
       await _refresh();
       _scrollToBottom();
     } catch (e) {
-      if (mounted) setState(() => _error = 'File picker: $e');
+      if (mounted) setState(() => _error = 'Send failed: $e');
     }
-  }
-
-  /// Tries kdialog (KDE), then zenity (GNOME/XFCE), returns path or null if
-  /// none available. Returns empty string if user cancelled.
-  Future<String?> _tryNativeFileChooser(String target) async {
-    final choosers = <List<String>>[
-      ['kdialog', '--getopenfilename', '--title', 'Send file to $target', '.'],
-      ['zenity', '--file-selection', '--title=Send file to $target'],
-      ['yad', '--file', '--title=Send file to $target'],
-    ];
-    for (final cmd in choosers) {
-      try {
-        final result = await Process.run(cmd[0], cmd.sublist(1))
-            .timeout(const Duration(seconds: 5));
-        if (result.exitCode == 0) {
-          return (result.stdout as String).trim();
-        }
-      } catch (_) {
-        continue;
-      }
-    }
-    return null; // none available
   }
 
   Future<void> _load() async {
@@ -3602,5 +3569,194 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final y = n.subtract(const Duration(days: 1));
     if (_sameDay(d, y)) return 'Yesterday';
     return '${d.month}/${d.day}/${d.year % 100}';
+  }
+}
+
+// ── flutter file picker (pure Dart, no platform channels) ───────────────────
+
+class _FlutterFilePicker extends StatefulWidget {
+  const _FlutterFilePicker({required this.title, required this.initialPath});
+  final String title;
+  final String initialPath;
+
+  @override
+  State<_FlutterFilePicker> createState() => _FlutterFilePickerState();
+}
+
+class _FlutterFilePickerState extends State<_FlutterFilePicker> {
+  late String _currentDir;
+  List<FileSystemEntity> _entries = [];
+  String? _error;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentDir = widget.initialPath;
+    _loadDir();
+  }
+
+  Future<void> _loadDir() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final dir = Directory(_currentDir);
+      final list = await dir.list().toList();
+      list.sort((a, b) {
+        final aIsDir = a is Directory;
+        final bIsDir = b is Directory;
+        if (aIsDir && !bIsDir) return -1;
+        if (!aIsDir && bIsDir) return 1;
+        return a.path.toLowerCase().compareTo(b.path.toLowerCase());
+      });
+      if (mounted) {
+        setState(() {
+          _entries = list;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = '$e';
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  void _navigateTo(String path) {
+    setState(() => _currentDir = path);
+    _loadDir();
+  }
+
+  void _goUp() {
+    final parent = Directory(_currentDir).parent.path;
+    if (parent != _currentDir) _navigateTo(parent);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final bg = theme.dialogBackgroundColor;
+    final surface = isDark ? const Color(0xFF1E1E1E) : Colors.grey[100]!;
+    final text = theme.textTheme.bodyMedium?.color ?? Colors.black;
+    final dim = text.withAlpha(128);
+
+    return Dialog(
+      backgroundColor: bg,
+      insetPadding: const EdgeInsets.all(24),
+      child: SizedBox(
+        width: 560,
+        height: 480,
+        child: Column(
+          children: [
+            // title bar
+            Container(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+              decoration: BoxDecoration(
+                color: surface,
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(widget.title,
+                        style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 14,
+                            color: text)),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 18),
+                    onPressed: () => Navigator.pop(context),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                  ),
+                ],
+              ),
+            ),
+            // breadcrumb / path bar
+            Container(
+              color: surface,
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+              child: Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.arrow_upward, size: 16),
+                    onPressed: _goUp,
+                    tooltip: 'Go up',
+                    padding: const EdgeInsets.all(4),
+                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(_currentDir,
+                        style: TextStyle(fontSize: 11, color: dim),
+                        overflow: TextOverflow.ellipsis),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            // file list
+            Expanded(
+              child: _loading
+                  ? Center(child: CircularProgressIndicator(strokeWidth: 2))
+                  : _error != null
+                      ? Center(
+                          child: Text(_error!,
+                              style: TextStyle(color: Colors.redAccent, fontSize: 12)))
+                      : _entries.isEmpty
+                          ? Center(
+                              child: Text('Empty directory',
+                                  style: TextStyle(color: dim, fontSize: 13)))
+                          : ListView.builder(
+                              itemCount: _entries.length,
+                              itemBuilder: (ctx, i) {
+                                final e = _entries[i];
+                                final isDir = e is Directory;
+                                final name = e.path.split('/').last;
+                                return ListTile(
+                                  dense: true,
+                                  leading: Icon(
+                                    isDir ? Icons.folder : Icons.insert_drive_file,
+                                    size: 18,
+                                    color: isDir ? Colors.amber[700] : dim,
+                                  ),
+                                  title: Text(name,
+                                      style: TextStyle(fontSize: 13, color: text)),
+                                  onTap: () {
+                                    if (isDir) {
+                                      _navigateTo(e.path);
+                                    } else {
+                                      Navigator.pop(context, e.path);
+                                    }
+                                  },
+                                );
+                              },
+                            ),
+            ),
+            const Divider(height: 1),
+            // bottom bar with select/cancel
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Cancel'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
