@@ -330,9 +330,48 @@ impl App {
                     self.push_sys(&format!("groups:\n{}", list), "info");
                     return false;
                 }
+                Some("who") => {
+                    let Some(group_id) = self.selected_group_id() else {
+                        self.push_sys("no group selected — use Tab to select a group first", "error");
+                        return false;
+                    };
+                    self.groups = crate::load_groups(&self.profile).unwrap_or_default();
+                    let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
+                        self.push_sys(&format!("group '{}' not found", group_id), "error");
+                        return false;
+                    };
+                    let full = crate::load_contacts(&self.profile).unwrap_or_default();
+                    let lines: Vec<String> = group
+                        .members
+                        .iter()
+                        .map(|m| {
+                            let security = full.get(&m.contact).map(|c| {
+                                let has_ratchet = std::path::Path::new(&self.profile)
+                                    .join("ratchet")
+                                    .join(format!("{}.bin", m.contact))
+                                    .exists();
+                                if has_ratchet {
+                                    "🔒 Double Ratchet"
+                                } else if c.x25519_pubkey_b64.as_ref().is_some_and(|k| !k.is_empty()) {
+                                    "🔑 Static key"
+                                } else {
+                                    "✍️ Signed only"
+                                }
+                            }).unwrap_or("❓ Unknown");
+                            let onion = full.get(&m.contact).map(|c| c.onion.as_str()).unwrap_or("?");
+                            format!("  {}  onion={}  security={}  role={}", m.contact, onion, security, m.role)
+                        })
+                        .collect();
+                    let header = format!("'{}' members ({}):", group.title, lines.len() + 1);
+                    let self_line = format!("  {}  onion={}  (you)", self.profile_name, if self.onion.is_empty() { "(not yet)" } else { &self.onion });
+                    let mut all_lines = vec![header, self_line];
+                    all_lines.extend(lines);
+                    self.push_sys(&all_lines.join("\n"), "info");
+                    return false;
+                }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/group-create <title> <member> [member...] — create group\n/group-delete <id-or-title> — delete group\n/group-rename <id-or-title> <new-title> — rename group\n/group-add <id-or-title> <member> — add group member\n/group-remove <id-or-title> <member> — remove group member\n/file <contact> <path> — send file (or Ctrl+A)\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/emoji  — show common emoji shortcuts\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/group-create <title> <member> [member...] — create group\n/group-delete <id-or-title> — delete group\n/group-rename <id-or-title> <new-title> — rename group\n/group-add <id-or-title> <member> — add group member\n/group-remove <id-or-title> <member> — remove group member\n/file <contact> <path> — send file (or Ctrl+A)\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/who — show members of selected group\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/emoji  — show common emoji shortcuts\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
                         "help",
                     );
                     return false;

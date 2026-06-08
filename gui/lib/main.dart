@@ -1754,7 +1754,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       switch (cmd) {
         case 'help':
           _showInfo('Slash commands',
-              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group-delete <id-or-title>\n/group-rename <id-or-title> <new-title>\n/group-add <id-or-title> <member>\n/group-remove <id-or-title> <member>\n/group <id-or-title> <msg>\n/file <filepath>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
+              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group-delete <id-or-title>\n/group-rename <id-or-title> <new-title>\n/group-add <id-or-title> <member>\n/group-remove <id-or-title> <member>\n/group <id-or-title> <msg>\n/file <filepath>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/who — show members of selected group\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
           return;
         case 'send':
           if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
@@ -1845,6 +1845,28 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               _groups.isEmpty
                   ? '(no groups)'
                   : _groups.map((g) => g.details).join('\n\n'));
+          return;
+        case 'who':
+          final g = _selGroup;
+          if (g == null) {
+            _showInfo('Who', 'No group selected — select a group from the sidebar first.');
+            return;
+          }
+          await _load();
+          final sel = _groups.firstWhere((x) => x.id == g.id, orElse: () => g);
+          if (sel.members.isEmpty) {
+            _showInfo('Who', 'No member info for this group yet.');
+            return;
+          }
+          final lines = sel.members.map((m) {
+            final c = _contacts.where((x) => x.name == m.contact).firstOrNull;
+            final onion = c?.onion ?? '?';
+            final sec = c?.securityLabel ?? 'Unknown';
+            final role = m.role.isNotEmpty ? m.role : 'member';
+            return '${m.contact}\nonion=${onion}\nsecurity=${sec}\nrole=${role}';
+          }).join('\n\n');
+          _showInfo("'${sel.title}' members (${sel.members.length + 1})",
+              'You (self)\n\n$lines');
           return;
         case 'add':
           if (parts.length < 5) {
