@@ -458,19 +458,21 @@ struct OutboundTransferState {
     next_chunk_index: usize,
 }
 
-static INCOMING_FILES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, IncomingFileState>>,
-> = std::sync::OnceLock::new();
-static FILE_ACKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
+use std::collections::HashSet;
+use std::sync::LazyLock;
 
-pub(crate) fn incoming_files_map(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, IncomingFileState>> {
-    INCOMING_FILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+// Global file transfer statics — restored after incomplete SharedTransferState refactor.
+static INCOMING_FILES: LazyLock<std::sync::Mutex<HashMap<String, IncomingFileState>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static FILE_ACK_SET: LazyLock<std::sync::Mutex<HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+fn incoming_files_map() -> &'static std::sync::Mutex<HashMap<String, IncomingFileState>> {
+    &INCOMING_FILES
 }
 
-pub(crate) fn file_ack_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    FILE_ACKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+fn file_ack_set() -> &'static std::sync::Mutex<HashSet<String>> {
+    &FILE_ACK_SET
 }
 
 pub(crate) fn ack_key(hash: &str, chunk_index: usize) -> String {
@@ -3619,6 +3621,7 @@ pub(crate) async fn serve(
 
     // Main dispatch loop: pull envelopes from the channel and handle them.
     // This is the only place that calls handle_inbound — transport is agnostic.
+    let transfer_state = transport.transfer_state();
     loop {
         while let Ok(cmd) = control_rx.try_recv() {
             let profile = profile.to_path_buf();
@@ -3747,6 +3750,7 @@ pub(crate) async fn serve(
                         &contacts,
                         &mut msg,
                         tor_client.clone(),
+                        &transfer_state,
                     )
                     .await
                     {

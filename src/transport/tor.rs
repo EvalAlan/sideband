@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,7 +17,26 @@ use tor_rtcompat::PreferredRuntime;
 
 use super::{Envelope, Transport, TransportCapabilities, TransportStatus};
 use crate::handler::parse_inbound_line;
-use crate::TuiEvent;
+use crate::{IncomingFileState, TuiEvent};
+
+/// Shared file transfer state, held inside `TorTransport` and passed to the
+/// handler and persistence layer.  Uses `tokio::sync::Mutex` so it is
+/// async-safe and cannot poison across tasks.
+pub(crate) struct FileTransferState {
+    pub incoming_files: HashMap<String, IncomingFileState>,
+    pub ack_set: HashSet<String>,
+}
+
+impl FileTransferState {
+    pub fn new() -> Self {
+        Self {
+            incoming_files: HashMap::new(),
+            ack_set: HashSet::new(),
+        }
+    }
+}
+
+pub(crate) type SharedTransferState = Arc<tokio::sync::Mutex<FileTransferState>>;
 
 pub struct TorTransport {
     local_onion: Option<String>,
@@ -26,6 +46,7 @@ pub struct TorTransport {
     inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
     /// Sender kept alive so the channel stays open while run_inbound_loop runs.
     inbound_tx: mpsc::Sender<Envelope>,
+    transfer_state: Option<SharedTransferState>,
 }
 
 impl TorTransport {
@@ -45,7 +66,15 @@ impl TorTransport {
             status_tx,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             inbound_tx,
+            transfer_state: Some(Arc::new(tokio::sync::Mutex::new(FileTransferState::new()))),
         }
+    }
+
+    pub fn transfer_state(&self) -> SharedTransferState {
+        self.transfer_state
+            .as_ref()
+            .expect("transfer_state not initialised")
+            .clone()
     }
 
     pub fn raw_line_to_envelope(raw_line: &str) -> Envelope {

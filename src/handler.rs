@@ -12,11 +12,12 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use tokio::sync::mpsc;
 
 use crate::transport::tor::TorTransport;
+use crate::transport::tor::SharedTransferState;
 use crate::{
     decrypt_and_verify, discover_or_update_group, resolve_contact_name_by_pubkey,
     send_typed_message, store_message, store_message_for_conversation, ChatMessage, ContactsMap,
     DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload, FileOfferPayload,
-    GroupDeletePayload, GroupLeavePayload, GroupMessagePayload, IncomingFileState, TuiEvent,
+    GroupMessagePayload, IncomingFileState, TuiEvent,
 };
 
 /// Parse a raw inbound line into a [`ChatMessage`].
@@ -50,14 +51,15 @@ pub async fn handle_inbound(
     contacts: &ContactsMap,
     msg: &mut ChatMessage,
     tor_client: Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>,
+    transfer_state: &SharedTransferState,
 ) -> Result<()> {
     if msg.r#type == "file_offer" {
-        handle_file_offer(profile, tui_tx, contacts, msg).await?;
+        handle_file_offer(profile, tui_tx, contacts, msg, transfer_state).await?;
         return Ok(());
     }
 
     if msg.r#type == "file_chunk" {
-        handle_file_chunk(profile, tui_tx, contacts, msg, tor_client).await?;
+        handle_file_chunk(profile, tui_tx, contacts, msg, tor_client, transfer_state).await?;
         return Ok(());
     }
 
@@ -67,7 +69,7 @@ pub async fn handle_inbound(
     }
 
     if msg.r#type == "file_ack" {
-        handle_file_ack(profile, tui_tx, contacts, msg).await?;
+        handle_file_ack(profile, tui_tx, contacts, msg, transfer_state).await?;
         return Ok(());
     }
 
@@ -210,6 +212,7 @@ async fn handle_file_offer(
     tui_tx: &mpsc::Sender<TuiEvent>,
     contacts: &ContactsMap,
     msg: &mut ChatMessage,
+    transfer_state: &SharedTransferState,
 ) -> Result<()> {
     let (plaintext, verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
         tracing::error!(error=%e, "decrypt/verify failed");
@@ -222,16 +225,15 @@ async fn handle_file_offer(
         match serde_json::from_str::<FileOfferPayload>(&plaintext) {
             Ok(offer) => {
                 let key = format!("{}:{}", msg.from, offer.hash);
-                let mut map = crate::incoming_files_map()
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("incoming file map lock poisoned"))?;
-                map.insert(
+                let mut state = transfer_state.lock().await;
+                state.incoming_files.insert(
                     key,
                     IncomingFileState {
                         total_chunks: offer.total_chunks,
                         chunks: vec![None; offer.total_chunks],
                     },
                 );
+                drop(state);
                 if let Err(e) = crate::persist_incoming_states(profile) {
                     tracing::warn!(error=%e, "failed to persist incoming file offer state");
                 }
@@ -279,6 +281,7 @@ async fn handle_file_chunk(
     contacts: &ContactsMap,
     msg: &mut ChatMessage,
     tor_client: Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>,
+    transfer_state: &SharedTransferState,
 ) -> Result<()> {
     let (plaintext, _verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
         tracing::error!(error=%e, "decrypt/verify failed");
@@ -293,27 +296,28 @@ async fn handle_file_chunk(
         let mut completed_data: Option<Vec<u8>> = None;
 
         {
-            let mut map = crate::incoming_files_map()
-                .lock()
-                .map_err(|_| anyhow::anyhow!("incoming file map lock poisoned"))?;
-            let state = map.entry(key.clone()).or_insert_with(|| IncomingFileState {
-                total_chunks: chunk.total_chunks,
-                chunks: vec![None; chunk.total_chunks],
-            });
+            let mut state = transfer_state.lock().await;
+            let file_state = state
+                .incoming_files
+                .entry(key.clone())
+                .or_insert_with(|| IncomingFileState {
+                    total_chunks: chunk.total_chunks,
+                    chunks: vec![None; chunk.total_chunks],
+                });
 
-            if chunk.chunk_index < state.total_chunks {
+            if chunk.chunk_index < file_state.total_chunks {
                 if let Ok(bytes) = B64.decode(chunk.data_b64.as_bytes()) {
-                    state.chunks[chunk.chunk_index] = Some(bytes);
+                    file_state.chunks[chunk.chunk_index] = Some(bytes);
                 }
             }
 
-            if state.chunks.iter().all(|c| c.is_some()) {
+            if file_state.chunks.iter().all(|c| c.is_some()) {
                 let mut assembled = Vec::new();
-                for c in &state.chunks {
+                for c in &file_state.chunks {
                     assembled.extend_from_slice(c.as_ref().unwrap());
                 }
                 completed_data = Some(assembled);
-                map.remove(&key);
+                state.incoming_files.remove(&key);
             }
         }
 
@@ -515,6 +519,7 @@ async fn handle_file_ack(
     tui_tx: &mpsc::Sender<TuiEvent>,
     contacts: &ContactsMap,
     msg: &mut ChatMessage,
+    transfer_state: &SharedTransferState,
 ) -> Result<()> {
     let (plaintext, verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
         tracing::error!(error=%e, "decrypt/verify failed");
@@ -526,10 +531,9 @@ async fn handle_file_ack(
     let mut accepted = false;
     if let Ok(ack) = serde_json::from_str::<FileAckPayload>(&plaintext) {
         if ack_is_acceptable(&ack) {
-            if let Ok(mut set) = crate::file_ack_set().lock() {
-                set.insert(crate::ack_key(&ack.hash, ack.chunk_index));
-                accepted = true;
-            }
+            let mut state = transfer_state.lock().await;
+            state.ack_set.insert(crate::ack_key(&ack.hash, ack.chunk_index));
+            accepted = true;
         }
     }
     let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
