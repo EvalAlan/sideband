@@ -328,7 +328,7 @@ impl App {
                 }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/group-create <title> <member> [member...] — create group\n/group-delete <id-or-title> — delete group\n/group-rename <id-or-title> <new-title> — rename group\n/group-add <id-or-title> <member> — add group member\n/group-remove <id-or-title> <member> — remove group member\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/group-create <title> <member> [member...] — create group\n/group-delete <id-or-title> — delete group\n/group-rename <id-or-title> <new-title> — rename group\n/group-add <id-or-title> <member> — add group member\n/group-remove <id-or-title> <member> — remove group member\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/emoji  — show common emoji shortcuts\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
                         "help",
                     );
                     return false;
@@ -446,6 +446,17 @@ impl App {
                             pk,
                             x25519_pk,
                         ),
+                        "info",
+                    );
+                    return false;
+                }
+                Some("emoji") | Some("emojis") | Some("e") => {
+                    self.push_sys(
+                        "emojis: 😀 😂 🤣 😊 😍 🥰 😎 🤔 😢 😡 👍 👎 👋 🙏 💪 🎉 🔥 ❤️ 💔 ⭐ ✅ ❌ ⚠️ 💡 📌",
+                        "info",
+                    );
+                    self.push_sys(
+                        "tip: type/paste Unicode emoji directly, or use Ctrl+Shift+U <hex> in most terminals",
                         "info",
                     );
                     return false;

@@ -3257,9 +3257,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     );
   }
 
+  String _displayText(ChatMsg m) {
+    final payload = parseGroupPayloadText(m.text);
+    if (payload != null) return payload.body;
+    return m.text;
+  }
+
   Widget _bubble(ChatMsg m) {
     final right = m.out;
     final showGroupSender = _selGroup != null;
+    final displayText = _displayText(m);
     return Align(
       alignment: right ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -3287,7 +3294,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       fontWeight: FontWeight.w700)),
               SizedBox(height: 3),
             ],
-            Text(m.text,
+            Text(displayText,
                 style:
                     TextStyle(color: _t.text, fontSize: 14, height: 1.35)),
             SizedBox(height: 3),
@@ -3329,6 +3336,61 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   // ── input ────────────────────────────────────────────────────────────────
 
+  static const _emojis = [
+    '😀','😂','🤣','😊','😍','🥰','😎','🤔','😢','😡',
+    '👍','👎','👋','🙏','💪','🎉','🔥','❤️','💔','⭐',
+    '✅','❌','⚠️','💡','📌','🔒','🔑','💬','📢','🚀',
+    '🐛','🎯','🏆','🎵','🍕','☕','🌙','☀️','🌈','⚡',
+  ];
+
+  void _showEmojiPicker() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _t.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(16),
+          child: GridView.builder(
+            shrinkWrap: true,
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 8,
+              mainAxisSpacing: 4,
+              crossAxisSpacing: 4,
+            ),
+            itemCount: _emojis.length,
+            itemBuilder: (ctx, i) {
+              final emoji = _emojis[i];
+              return GestureDetector(
+                onTap: () {
+                  final sel = _input.selection;
+                  final text = _input.text;
+                  final newText = text.replaceRange(
+                    sel.start,
+                    sel.end,
+                    emoji,
+                  );
+                  _input.value = TextEditingValue(
+                    text: newText,
+                    selection: TextSelection.collapsed(
+                      offset: sel.start + emoji.length,
+                    ),
+                  );
+                  Navigator.pop(ctx);
+                },
+                child: Center(
+                  child: Text(emoji, style: const TextStyle(fontSize: 22)),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
   Widget _inputArea() {
     return Container(
       color: _t.surface,
@@ -3336,6 +3398,18 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
+          // emoji button
+          Padding(
+            padding: const EdgeInsets.only(bottom: 2),
+            child: IconButton(
+              icon: const Text('😊', style: TextStyle(fontSize: 20)),
+              onPressed: _showEmojiPicker,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              splashRadius: 18,
+            ),
+          ),
+          const SizedBox(width: 4),
           Expanded(
             child: Shortcuts(
               shortcuts: const <ShortcutActivator, Intent>{
