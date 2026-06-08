@@ -42,6 +42,7 @@ pub struct SendCommand {
 #[derive(Debug)]
 pub struct FileCommand {
     pub contact: String,
+    #[allow(dead_code)]
     pub group: Option<String>,
     pub file_path: String,
 }
@@ -2118,7 +2119,6 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod input_clear_on_command_test {
     use super::*;
-    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn make_test_app() -> App {
         let (tui_tx, _tui_rx) = mpsc::channel::<TuiEvent>(1);
