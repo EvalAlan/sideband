@@ -2091,6 +2091,37 @@ struct ServeControlCommand {
     path: Option<String>,
 }
 
+/// Typed response emitted as JSON on stdout for the GUI to parse.
+/// Each response line starts with `__sideband_resp__:` prefix so the GUI
+/// can distinguish structured responses from other stdout output.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ServeResponse {
+    #[serde(rename = "ack")]
+    Ack { cmd: String },
+    #[serde(rename = "error")]
+    Error { cmd: String, kind: String, message: String },
+    #[serde(rename = "sent")]
+    Sent { cmd: String, to: String },
+    #[serde(rename = "group_sent")]
+    GroupSent { cmd: String, group: String, sent: usize, total: usize },
+    #[serde(rename = "file_sent")]
+    FileSent { cmd: String, to: String },
+    #[serde(rename = "group_file_sent")]
+    GroupFileSent { cmd: String, group: String, sent: usize },
+    #[serde(rename = "left")]
+    Left { cmd: String, group: String },
+    #[serde(rename = "deleted")]
+    Deleted { cmd: String, group: String },
+}
+
+/// Emit a structured JSON response on stdout for the GUI.
+fn emit_response(resp: &ServeResponse) {
+    if let Ok(json) = serde_json::to_string(resp) {
+        println!("__sideband_resp__:{json}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------------
@@ -3641,13 +3672,14 @@ pub(crate) async fn serve(
             match cmd.cmd.as_str() {
                 "send" => {
                     let Some(message) = cmd.message else {
-                        println!("send error: missing message");
+                        emit_response(&ServeResponse::Error { cmd: "send".into(), kind: "validation".into(), message: "missing message".into() });
                         continue;
                     };
                     let Some(to) = cmd.to else {
-                        println!("send error: missing to");
+                        emit_response(&ServeResponse::Error { cmd: "send".into(), kind: "validation".into(), message: "missing to".into() });
                         continue;
                     };
+                    emit_response(&ServeResponse::Ack { cmd: "send".into() });
                     tokio::spawn(async move {
                         let _guard = send_lock.lock().await;
                         match resolve_to(&profile, &to) {
@@ -3655,87 +3687,131 @@ pub(crate) async fn serve(
                                 match send(&profile, &onion, &message, &to, None, tor_client, false)
                                     .await
                                 {
-                                    Ok(()) => println!("message sent"),
-                                    Err(e) => println!("send error: {e}"),
+                                    Ok(()) => {
+                                        println!("message sent");
+                                        emit_response(&ServeResponse::Sent { cmd: "send".into(), to: to.clone() });
+                                    }
+                                    Err(e) => {
+                                        println!("send error: {e}");
+                                        emit_response(&ServeResponse::Error { cmd: "send".into(), kind: "send".into(), message: e.to_string() });
+                                    }
                                 }
                             }
-                            Err(e) => println!("resolve error: {e}"),
+                            Err(e) => {
+                                println!("resolve error: {e}");
+                                emit_response(&ServeResponse::Error { cmd: "send".into(), kind: "resolve".into(), message: e.to_string() });
+                            }
                         }
                     });
                 }
                 "group_send" => {
                     let Some(message) = cmd.message else {
-                        println!("send error: missing message");
+                        emit_response(&ServeResponse::Error { cmd: "group_send".into(), kind: "validation".into(), message: "missing message".into() });
                         continue;
                     };
                     let Some(group) = cmd.group else {
-                        println!("send error: missing group");
+                        emit_response(&ServeResponse::Error { cmd: "group_send".into(), kind: "validation".into(), message: "missing group".into() });
                         continue;
                     };
+                    emit_response(&ServeResponse::Ack { cmd: "group_send".into() });
                     tokio::spawn(async move {
                         let _guard = send_lock.lock().await;
                         match send_group(&profile, &group, &message, tor_client, false).await {
-                            Ok(result) => println!(
-                                "group message sent: {} {}/{}",
-                                result.group_title, result.sent, result.total
-                            ),
-                            Err(e) => println!("send error: {e}"),
+                            Ok(result) => {
+                                println!(
+                                    "group message sent: {} {}/{}",
+                                    result.group_title, result.sent, result.total
+                                );
+                                emit_response(&ServeResponse::GroupSent { cmd: "group_send".into(), group: result.group_title, sent: result.sent, total: result.total });
+                            }
+                            Err(e) => {
+                                println!("send error: {e}");
+                                emit_response(&ServeResponse::Error { cmd: "group_send".into(), kind: "send".into(), message: e.to_string() });
+                            }
                         }
                     });
                 }
                 "file" => {
                     let Some(path) = cmd.path else {
-                        println!("file send error: missing path");
+                        emit_response(&ServeResponse::Error { cmd: "file".into(), kind: "validation".into(), message: "missing path".into() });
                         continue;
                     };
+                    emit_response(&ServeResponse::Ack { cmd: "file".into() });
                     tokio::spawn(async move {
                         let _guard = send_lock.lock().await;
                         if let Some(ref group) = cmd.group {
                             match crate::send_file_to_group(&profile, group, &path, tor_client).await {
-                                Ok(sent) => println!("file sent to group: {sent} members"),
-                                Err(e) => println!("file send error: {e}"),
+                                Ok(sent) => {
+                                    println!("file sent to group: {sent} members");
+                                    emit_response(&ServeResponse::GroupFileSent { cmd: "file".into(), group: group.clone(), sent });
+                                }
+                                Err(e) => {
+                                    println!("file send error: {e}");
+                                    emit_response(&ServeResponse::Error { cmd: "file".into(), kind: "send".into(), message: e.to_string() });
+                                }
                             }
                         } else {
                             let Some(to) = cmd.to else {
-                                println!("file send error: missing to");
+                                emit_response(&ServeResponse::Error { cmd: "file".into(), kind: "validation".into(), message: "missing to".into() });
                                 return;
                             };
                             match crate::send_file(&profile, &to, &path, None, tor_client).await {
-                                Ok(()) => println!("file sent to {}", to),
-                                Err(e) => println!("file send error: {e}"),
+                                Ok(()) => {
+                                    println!("file sent to {}", to);
+                                    emit_response(&ServeResponse::FileSent { cmd: "file".into(), to: to.clone() });
+                                }
+                                Err(e) => {
+                                    println!("file send error: {e}");
+                                    emit_response(&ServeResponse::Error { cmd: "file".into(), kind: "send".into(), message: e.to_string() });
+                                }
                             }
                         }
                     });
                 }
                 "group_leave" => {
                     let Some(group) = cmd.group else {
-                        println!("group leave error: missing group");
+                        emit_response(&ServeResponse::Error { cmd: "group_leave".into(), kind: "validation".into(), message: "missing group".into() });
                         continue;
                     };
+                    emit_response(&ServeResponse::Ack { cmd: "group_leave".into() });
                     tokio::spawn(async move {
                         match crate::leave_group(&profile, &group, tor_client).await {
-                            Ok(g) => println!("left group: {}", g.title),
-                            Err(e) => println!("group leave error: {e}"),
+                            Ok(g) => {
+                                println!("left group: {}", g.title);
+                                emit_response(&ServeResponse::Left { cmd: "group_leave".into(), group: g.title });
+                            }
+                            Err(e) => {
+                                println!("group leave error: {e}");
+                                emit_response(&ServeResponse::Error { cmd: "group_leave".into(), kind: "leave".into(), message: e.to_string() });
+                            }
                         }
                     });
                 }
                 "group_delete" => {
                     let Some(group) = cmd.group else {
-                        println!("group delete error: missing group");
+                        emit_response(&ServeResponse::Error { cmd: "group_delete".into(), kind: "validation".into(), message: "missing group".into() });
                         continue;
                     };
+                    emit_response(&ServeResponse::Ack { cmd: "group_delete".into() });
                     tokio::spawn(async move {
-                        // Notify members before deleting locally
                         if let Ok(g) = crate::resolve_group(&profile, &group) {
                             let _ = crate::notify_group_deleted(&profile, &g, tor_client.clone());
                         }
                         match crate::delete_group(&profile, &group) {
-                            Ok(g) => println!("group deleted: {}", g.title),
-                            Err(e) => println!("group delete error: {e}"),
+                            Ok(g) => {
+                                println!("group deleted: {}", g.title);
+                                emit_response(&ServeResponse::Deleted { cmd: "group_delete".into(), group: g.title });
+                            }
+                            Err(e) => {
+                                println!("group delete error: {e}");
+                                emit_response(&ServeResponse::Error { cmd: "group_delete".into(), kind: "delete".into(), message: e.to_string() });
+                            }
                         }
                     });
                 }
-                other => println!("control error: unknown cmd '{}'", other),
+                other => {
+                    emit_response(&ServeResponse::Error { cmd: other.into(), kind: "unknown".into(), message: format!("unknown cmd '{other}'") });
+                }
             }
         }
 

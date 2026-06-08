@@ -1182,7 +1182,38 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             } else if (!_listenerRunning) {
               _listenerStatus = last;
             }
-            if ((lower.contains('send error') ||
+            // Parse structured JSON responses from Rust backend
+            for (final line in lines) {
+              if (line.startsWith('__sideband_resp__:')) {
+                final jsonStr = line.substring('__sideband_resp__:'.length);
+                try {
+                  final decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
+                  final type = decoded['type'] as String?;
+                  switch (type) {
+                    case 'error':
+                      _error = decoded['message'] as String? ?? 'error';
+                      if (!_isRecentSendTransient(lower)) {
+                        _listenerStatus = 'error: ${_error}';
+                      }
+                      break;
+                    case 'sent':
+                    case 'group_sent':
+                    case 'file_sent':
+                    case 'group_file_sent':
+                    case 'left':
+                    case 'deleted':
+                    case 'ack':
+                      _error = null;
+                      break;
+                  }
+                } catch (_) {
+                  // Not valid JSON, ignore
+                }
+              }
+            }
+            // Legacy string matching fallback
+            if (_error == null &&
+                (lower.contains('send error') ||
                     lower.contains('resolve error') ||
                     lower.contains('control error')) &&
                 !_isRecentSendTransient(lower)) {
@@ -1195,6 +1226,20 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               lower.contains('send error') ||
               lower.contains('resolve error')) {
             unawaited(_refresh());
+          }
+          // Also refresh on structured group events
+          for (final line in lines) {
+            if (line.startsWith('__sideband_resp__:')) {
+              try {
+                final decoded = jsonDecode(
+                    line.substring('__sideband_resp__:'.length))
+                    as Map<String, dynamic>;
+                final type = decoded['type'];
+                if (type == 'group_sent' || type == 'group_file_sent' || type == 'left' || type == 'deleted') {
+                  unawaited(_refresh());
+                }
+              } catch (_) {}
+            }
           }
         }
       });
