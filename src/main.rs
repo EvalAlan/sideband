@@ -927,6 +927,53 @@ pub(crate) async fn send_file(
     Ok(())
 }
 
+/// Send a file to each member of a group individually.
+/// Resolves the group, then calls `send_file` for each member.
+/// Returns the number of members the file was successfully sent to.
+pub(crate) async fn send_file_to_group(
+    profile: &Path,
+    group_ref: &str,
+    file_path: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<usize> {
+    let group = resolve_group(profile, group_ref)?;
+    let total = group.members.len();
+    let mut sent = 0usize;
+
+    for member in &group.members {
+        match send_file(
+            profile,
+            &member.contact,
+            file_path,
+            None,
+            Arc::clone(&tor_client),
+        )
+        .await
+        {
+            Ok(()) => {
+                sent += 1;
+            }
+            Err(e) => {
+                warn!(
+                    group = %group.title,
+                    member = %member.contact,
+                    error = %e,
+                    "file send to group member failed"
+                );
+            }
+        }
+    }
+
+    if sent == 0 && total > 0 {
+        return Err(anyhow!(
+            "file send failed to all {total} members of group '{}'",
+            group.title
+        ));
+    }
+
+    Ok(sent)
+}
+
 async fn wait_for_file_ack(hash: &str, chunk_index: usize, timeout: Duration) -> bool {
     let key = ack_key(hash, chunk_index);
     let start = std::time::Instant::now();
@@ -3523,19 +3570,26 @@ pub(crate) async fn serve(
                     });
                 }
                 "file" => {
-                    let Some(to) = cmd.to else {
-                        println!("file send error: missing to");
-                        continue;
-                    };
                     let Some(path) = cmd.path else {
                         println!("file send error: missing path");
                         continue;
                     };
                     tokio::spawn(async move {
                         let _guard = send_lock.lock().await;
-                        match crate::send_file(&profile, &to, &path, None, tor_client).await {
-                            Ok(()) => println!("file sent to {}", to),
-                            Err(e) => println!("file send error: {e}"),
+                        if let Some(ref group) = cmd.group {
+                            match crate::send_file_to_group(&profile, group, &path, tor_client).await {
+                                Ok(sent) => println!("file sent to group: {sent} members"),
+                                Err(e) => println!("file send error: {e}"),
+                            }
+                        } else {
+                            let Some(to) = cmd.to else {
+                                println!("file send error: missing to");
+                                return;
+                            };
+                            match crate::send_file(&profile, &to, &path, None, tor_client).await {
+                                Ok(()) => println!("file sent to {}", to),
+                                Err(e) => println!("file send error: {e}"),
+                            }
                         }
                     });
                 }

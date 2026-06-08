@@ -1282,7 +1282,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     await listener.stdin.flush();
   }
 
-  Future<void> _sendFileViaListener({String? to, required String path}) async {
+  Future<void> _sendFileViaListener({String? to, String? group, required String path}) async {
     final listener = _listener;
     if (listener == null) {
       throw Exception('listener control channel is not available; restart the GUI');
@@ -1290,6 +1290,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     listener.stdin.writeln(jsonEncode({
       'cmd': 'file',
       if (to != null) 'to': to,
+      if (group != null) 'group': group,
       'path': path,
     }));
     await listener.stdin.flush();
@@ -1305,7 +1306,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final path = await _pickFile(target);
     if (path == null || path.isEmpty) return;
     try {
-      await _sendFileViaListener(to: target, path: path);
+      final isGroup = _selGroup != null;
+      await _sendFileViaListener(
+        to: isGroup ? null : target,
+        group: isGroup ? target : null,
+        path: path,
+      );
       await _refresh();
       _scrollToBottom();
     } catch (e) {
@@ -1932,7 +1938,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           final path = parts.skip(1).join(' ');
           final target = _sel?.name ?? _selGroup?.title;
           if (target == null) throw Exception('no contact or group selected');
-          await _sendFileViaListener(to: target, path: path);
+          final isGroup = _selGroup != null;
+          await _sendFileViaListener(
+            to: isGroup ? null : target,
+            group: isGroup ? target : null,
+            path: path,
+          );
           await _refresh();
           _scrollToBottom();
           return;
