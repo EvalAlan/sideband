@@ -1338,7 +1338,22 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             .timeout(const Duration(seconds: 3));
         if (r.exitCode == 0) {
           final p = (r.stdout as String).trim();
-          if (p.isNotEmpty) return p;
+          if (p.isNotEmpty) {
+            // Validate file size
+            try {
+              final size = File(p).lengthSync();
+              if (size > 100 * 1024 * 1024) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('File too large (max 100 MB)'),
+                    duration: Duration(seconds: 3),
+                  ));
+                }
+                return null;
+              }
+            } catch (_) {}
+            return p;
+          }
         }
       } catch (_) {}
     }
@@ -3631,10 +3646,22 @@ class _FlutterFilePicker extends StatefulWidget {
 }
 
 class _FlutterFilePickerState extends State<_FlutterFilePicker> {
+  static const int maxFileSize = 100 * 1024 * 1024; // 100 MB
+
   late String _currentDir;
   List<FileSystemEntity> _entries = [];
+  final Map<String, int> _fileSizes = {};
   String? _error;
   bool _loading = true;
+
+  static String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
 
   @override
   void initState() {
@@ -3668,6 +3695,16 @@ class _FlutterFilePickerState extends State<_FlutterFilePicker> {
           _entries = list;
           _loading = false;
         });
+        // Populate file size cache for files only
+        for (final e in list) {
+          if (e is! Directory) {
+            try {
+              _fileSizes[e.path] = File(e.path).lengthSync();
+            } catch (_) {
+              // Permission error or file unavailable — skip
+            }
+          }
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -3772,6 +3809,7 @@ class _FlutterFilePickerState extends State<_FlutterFilePicker> {
                                 final e = _entries[i];
                                 final isDir = e is Directory;
                                 final name = e.path.split('/').last;
+                                final sizeStr = isDir ? null : _fileSizes[e.path];
                                 return ListTile(
                                   dense: true,
                                   leading: Icon(
@@ -3781,10 +3819,25 @@ class _FlutterFilePickerState extends State<_FlutterFilePicker> {
                                   ),
                                   title: Text(name,
                                       style: TextStyle(fontSize: 13, color: text)),
+                                  subtitle: sizeStr != null
+                                      ? Text(_formatSize(sizeStr),
+                                          style: TextStyle(
+                                              fontSize: 11, color: dim))
+                                      : null,
                                   onTap: () {
                                     if (isDir) {
                                       _navigateTo(e.path);
                                     } else {
+                                      final sz = _fileSizes[e.path];
+                                      if (sz != null && sz > maxFileSize) {
+                                        ScaffoldMessenger.of(context)
+                                            .showSnackBar(const SnackBar(
+                                          content: Text(
+                                              'File too large (max 100 MB)'),
+                                          duration: Duration(seconds: 3),
+                                        ));
+                                        return;
+                                      }
                                       Navigator.pop(context, e.path);
                                     }
                                   },
