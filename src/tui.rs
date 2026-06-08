@@ -193,23 +193,32 @@ impl App {
                         self.push_sys("usage: /group-delete <id-or-title>", "error");
                         return false;
                     };
-                    match crate::delete_group(&self.profile, group_ref) {
+                    match crate::resolve_group(&self.profile, group_ref) {
                         Ok(group) => {
-                            self.groups = crate::load_groups(&self.profile).unwrap_or_default();
-                            self.unread_groups.remove(&group.id);
-                            if self
-                                .selected_group_id()
-                                .map(|selected| selected == group.id)
-                                .unwrap_or(false)
-                            {
-                                self.selected_contact = 0;
-                            }
                             self.push_sys(
-                                &format!("group '{}' deleted ({})", group.title, group.id),
+                                &format!("deleting group '{}'...", group.title),
                                 "info",
                             );
+                            let profile = self.profile.clone();
+                            let group_id = group.id.clone();
+                            tokio::spawn(async move {
+                                let tor = match crate::transport::tor::TorTransport::bootstrap(&profile).await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        tracing::error!(error=%e, "failed to bootstrap tor for group delete");
+                                        return;
+                                    }
+                                };
+                                if let Err(e) =
+                                    crate::delete_group_notify(&profile, &group_id, tor).await
+                                {
+                                    tracing::error!(error=%e, "group delete failed");
+                                } else {
+                                    tracing::info!(group=%group_id, "deleted group");
+                                }
+                            });
                         }
-                        Err(e) => self.push_sys(&format!("group delete failed: {}", e), "error"),
+                        Err(e) => self.push_sys(&format!("group not found: {}", e), "error"),
                     }
                     return false;
                 }

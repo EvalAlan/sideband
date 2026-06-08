@@ -1733,6 +1733,16 @@ pub(crate) fn delete_group(profile: &Path, group_ref: &str) -> Result<GroupInfo>
     Ok(group)
 }
 
+/// Delete a group and notify all members that it was deleted.
+pub(crate) async fn delete_group_notify(
+    profile: &Path,
+    group_ref: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<GroupInfo> {
+    notify_group_deleted(profile, &resolve_group(profile, group_ref)?, tor_client)?;
+    delete_group(profile, group_ref)
+}
+
 /// Notify all group members that this group has been deleted by its owner.
 /// Sends a `group_deleted` typed message to each member before removing local state.
 fn notify_group_deleted(
