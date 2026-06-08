@@ -1668,9 +1668,21 @@ pub(crate) fn add_group_member(profile: &Path, group_ref: &str, member: &str) ->
     if member.is_empty() {
         return Err(anyhow!("group member is required"));
     }
-    let contacts = load_contacts(profile)?;
+    let mut contacts = load_contacts(profile)?;
     if !contacts.contains_key(member) {
-        return Err(anyhow!("unknown group member '{member}'"));
+        // Auto-create a stub contact so the member can be added to the group
+        // even before a real key exchange has happened.
+        let unique = unique_autodiscovered_contact_name(&contacts, member, member);
+        contacts.insert(
+            unique.clone(),
+            ContactFile {
+                name: unique.clone(),
+                onion: String::new(),
+                pubkey_b64: String::new(),
+                x25519_pubkey_b64: None,
+            },
+        );
+        save_contacts(profile, &contacts)?;
     }
     let group = resolve_group(profile, group_ref)?;
     let now = now_ms_i64()?;
@@ -1736,19 +1748,38 @@ pub(crate) fn discover_or_update_group(
          ON CONFLICT(id) DO UPDATE SET title=excluded.title, updated_at_ms=excluded.updated_at_ms",
         params![group_id, title, now],
     )?;
-    let contacts = load_contacts(profile)?;
+    let mut contacts = load_contacts(profile)?;
     let mut members_to_add = Vec::new();
     if !sender_contact.is_empty() {
         members_to_add.push(sender_contact.to_string());
     }
     for member in advertised_members {
         let member = member.trim();
-        if member.is_empty() || !contacts.contains_key(member) {
+        if member.is_empty() {
             continue;
         }
         if !members_to_add.iter().any(|m| m == member) {
             members_to_add.push(member.to_string());
         }
+    }
+    // Ensure every advertised member has a stub contact entry so group
+    // membership is preserved even before a real contact exchange.
+    for member in &members_to_add {
+        if !contacts.contains_key(member) {
+            let unique = unique_autodiscovered_contact_name(&contacts, member, member);
+            contacts.insert(
+                unique.clone(),
+                ContactFile {
+                    name: unique.clone(),
+                    onion: String::new(),
+                    pubkey_b64: String::new(),
+                    x25519_pubkey_b64: None,
+                },
+            );
+        }
+    }
+    if !members_to_add.is_empty() {
+        save_contacts(profile, &contacts)?;
     }
     for member in members_to_add {
         conn.execute(
@@ -4030,7 +4061,7 @@ mod tests {
     }
 
     #[test]
-    fn group_member_add_rejects_unknown_contact() {
+    fn group_member_add_auto_creates_stub_contact() {
         let dir = tempfile::tempdir().unwrap();
         let pk = B64.encode([1u8; 32]);
         let xpk = B64.encode([2u8; 32]);
@@ -4043,8 +4074,11 @@ mod tests {
         )
         .unwrap();
         let group = create_group(dir.path(), "Ops", &["alice".into()]).unwrap();
-        let err = add_group_member(dir.path(), &group.id, "ghost").unwrap_err();
-        assert!(err.to_string().contains("unknown group member"));
+        // Unknown members are auto-created as stub contacts
+        let result = add_group_member(dir.path(), &group.id, "ghost");
+        assert!(result.is_ok());
+        let group = result.unwrap();
+        assert!(group.members.iter().any(|m| m.contact == "ghost"));
     }
 
     #[test]

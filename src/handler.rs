@@ -700,7 +700,8 @@ mod group_chat_tests {
         assert_eq!(groups[0].title, "Ops");
         assert!(groups[0].members.iter().any(|m| m.contact == "alice"));
         assert!(groups[0].members.iter().any(|m| m.contact == "bob"));
-        assert!(!groups[0]
+        // Unknown sender is added as a stub contact for group membership tracking.
+        assert!(groups[0]
             .members
             .iter()
             .any(|m| m.contact == "local-self-is-not-a-contact"));
