@@ -1242,7 +1242,7 @@ fn migrate_raw_group_payload_pm_rows(conn: &Connection) -> Result<()> {
             "SELECT id, contact, body
              FROM messages
              WHERE conversation_kind = 'contact'
-               AND body LIKE '%\"kind\":%group_message%'",
+               AND body LIKE '%group_message%'",
         )?;
         let mapped = stmt.query_map([], |row| {
             Ok((
@@ -1255,10 +1255,10 @@ fn migrate_raw_group_payload_pm_rows(conn: &Connection) -> Result<()> {
     };
 
     for (id, contact, body) in rows {
-        let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(&body) else {
+        let Some(payload) = parse_stored_group_message_payload(&body) else {
             continue;
         };
-        if payload.kind != "group_message" || payload.group_id.trim().is_empty() {
+        if payload.group_id.trim().is_empty() {
             continue;
         }
         let group_id = payload.group_id.trim();
@@ -1306,6 +1306,22 @@ fn migrate_raw_group_payload_pm_rows(conn: &Connection) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn parse_stored_group_message_payload(body: &str) -> Option<GroupMessagePayload> {
+    fn valid(payload: GroupMessagePayload) -> Option<GroupMessagePayload> {
+        (payload.kind == "group_message").then_some(payload)
+    }
+
+    if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(body) {
+        return valid(payload);
+    }
+    if let Ok(inner) = serde_json::from_str::<String>(body) {
+        if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(&inner) {
+            return valid(payload);
+        }
+    }
+    None
 }
 
 fn ensure_message_column(conn: &Connection, column: &str, alter_sql: &str) -> Result<()> {

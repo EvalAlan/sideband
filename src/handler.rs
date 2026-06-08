@@ -116,82 +116,40 @@ pub(crate) async fn record_inbound_chat_plaintext(
         DeliveryStatus::Failed
     };
 
-    // Always try to parse as group message first, regardless of verified
+    // Always try to parse as a group message first, regardless of verified
     // status. The verified flag affects delivery status only, not routing.
-    // This is critical for v3 (Double Ratchet) messages from unknown senders:
-    // v3 decrypt_and_verify does not call verify_message_with_sender_metadata,
-    // so verified can be false even for legitimate group messages.
-    if verified {
-        if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(plaintext) {
-            if payload.kind == "group_message" {
-                let group = discover_or_update_group(
-                    profile,
-                    &payload.group_id,
-                    &payload.group_title,
-                    contact_name,
-                    &payload.members,
-                )?;
-                store_message_for_conversation(
-                    profile,
-                    "in",
-                    contact_name,
-                    "",
-                    &payload.body,
-                    timestamp_ms,
-                    status,
-                    "group",
-                    &group.id,
-                )?;
-                let _ = tui_tx
-                    .send(TuiEvent::InboundGroupMessage {
-                        group_id: group.id,
-                        group_title: group.title,
-                        contact: contact_name.to_string(),
-                        body: payload.body,
-                        timestamp_ms,
-                        verified,
-                    })
-                    .await;
-                return Ok(());
-            }
-        }
-    } else {
-        // Unverified: still try to parse as group message so we don't store
-        // raw GroupMessagePayload JSON as a contact PM.
-        if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(plaintext) {
-            if payload.kind == "group_message" {
-                if let Ok(group) = discover_or_update_group(
-                    profile,
-                    &payload.group_id,
-                    &payload.group_title,
-                    contact_name,
-                    &payload.members,
-                ) {
-                    store_message_for_conversation(
-                        profile,
-                        "in",
-                        contact_name,
-                        "",
-                        &payload.body,
-                        timestamp_ms,
-                        status,
-                        "group",
-                        &group.id,
-                    )?;
-                    let _ = tui_tx
-                        .send(TuiEvent::InboundGroupMessage {
-                            group_id: group.id,
-                            group_title: group.title,
-                            contact: contact_name.to_string(),
-                            body: payload.body,
-                            timestamp_ms,
-                            verified,
-                        })
-                        .await;
-                    return Ok(());
-                }
-            }
-        }
+    // Never fall through to contact storage after a valid group payload: that
+    // produces GUI PMs containing raw {"kind":"group_message", ...} JSON.
+    if let Some(payload) = parse_group_message_payload(plaintext) {
+        let group = discover_or_update_group(
+            profile,
+            &payload.group_id,
+            &payload.group_title,
+            contact_name,
+            &payload.members,
+        )?;
+        store_message_for_conversation(
+            profile,
+            "in",
+            contact_name,
+            "",
+            &payload.body,
+            timestamp_ms,
+            status,
+            "group",
+            &group.id,
+        )?;
+        let _ = tui_tx
+            .send(TuiEvent::InboundGroupMessage {
+                group_id: group.id,
+                group_title: group.title,
+                contact: contact_name.to_string(),
+                body: payload.body,
+                timestamp_ms,
+                verified,
+            })
+            .await;
+        return Ok(());
     }
 
     store_message(
@@ -218,6 +176,26 @@ pub(crate) async fn record_inbound_chat_plaintext(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+fn parse_group_message_payload(plaintext: &str) -> Option<GroupMessagePayload> {
+    fn valid(payload: GroupMessagePayload) -> Option<GroupMessagePayload> {
+        (payload.kind == "group_message").then_some(payload)
+    }
+
+    if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(plaintext) {
+        return valid(payload);
+    }
+
+    // Some bad historical rows/paths can contain a JSON string whose content is
+    // the actual group payload JSON. Peel that once so routing is still robust.
+    if let Ok(inner) = serde_json::from_str::<String>(plaintext) {
+        if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(&inner) {
+            return valid(payload);
+        }
+    }
+
+    None
+}
 
 async fn handle_file_offer(
     profile: &Path,
