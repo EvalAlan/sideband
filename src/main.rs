@@ -1176,6 +1176,7 @@ fn init_db(profile: &Path) -> Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_kind, conversation_id)",
         [],
     )?;
+    migrate_raw_group_payload_pm_rows(&conn)?;
     // Migration: prune duplicate outbound group message rows left over from
     // the old per-member fanout that stored one row per recipient instead of
     // one row per sent message.  Keep the row whose contact is 'You' (the
@@ -1233,6 +1234,78 @@ fn init_db(profile: &Path) -> Result<Connection> {
         [],
     )?;
     Ok(conn)
+}
+
+fn migrate_raw_group_payload_pm_rows(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT id, contact, body
+             FROM messages
+             WHERE conversation_kind = 'contact'
+               AND body LIKE '%\"kind\":%group_message%'",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    for (id, contact, body) in rows {
+        let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(&body) else {
+            continue;
+        };
+        if payload.kind != "group_message" || payload.group_id.trim().is_empty() {
+            continue;
+        }
+        let group_id = payload.group_id.trim();
+        let group_title = payload.group_title.trim();
+        let group_title = if group_title.is_empty() {
+            group_id
+        } else {
+            group_title
+        };
+        let now = now_ms_i64()?;
+        conn.execute(
+            "INSERT INTO groups (id, title, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(id) DO UPDATE SET title=excluded.title, updated_at_ms=excluded.updated_at_ms",
+            params![group_id, group_title, now],
+        )?;
+
+        let mut members = Vec::new();
+        let sender = contact.trim();
+        if !sender.is_empty() {
+            members.push(sender.to_string());
+        }
+        for member in &payload.members {
+            let member = member.trim();
+            if !member.is_empty() && !members.iter().any(|m| m == member) {
+                members.push(member.to_string());
+            }
+        }
+        for member in members {
+            conn.execute(
+                "INSERT OR IGNORE INTO group_members (group_id, contact, role, added_at_ms) VALUES (?1, ?2, 'member', ?3)",
+                params![group_id, member, now],
+            )?;
+        }
+
+        conn.execute(
+            "UPDATE messages
+             SET conversation_kind = 'group', conversation_id = ?1, body = ?2
+             WHERE id = ?3 AND conversation_kind = 'contact'",
+            params![group_id, payload.body, id],
+        )?;
+        tracing::info!(
+            message_id = id,
+            group_id,
+            "retagged raw group payload contact row"
+        );
+    }
+    Ok(())
 }
 
 fn ensure_message_column(conn: &Connection, column: &str, alter_sql: &str) -> Result<()> {
@@ -2421,13 +2494,21 @@ pub(crate) fn contact_add(
     Ok(())
 }
 
-fn unique_autodiscovered_contact_name(contacts: &ContactsMap, wanted: &str, pubkey_b64: &str) -> String {
+fn unique_autodiscovered_contact_name(
+    contacts: &ContactsMap,
+    wanted: &str,
+    pubkey_b64: &str,
+) -> String {
     let base = wanted
         .trim()
         .chars()
         .filter(|c| !c.is_control())
         .collect::<String>();
-    let base = if base.is_empty() { "verified-peer" } else { base.as_str() };
+    let base = if base.is_empty() {
+        "verified-peer"
+    } else {
+        base.as_str()
+    };
     if !contacts.contains_key(base) {
         return base.to_string();
     }
@@ -3726,7 +3807,8 @@ mod tests {
             r#type: "msg".to_string(),
             from: alice_pub.clone(),
             sender_name: "Alice".to_string(),
-            sender_onion: "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion".to_string(),
+            sender_onion: "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion"
+                .to_string(),
             sender_x25519_pubkey_b64: B64.encode(alice_x_pub.as_bytes()),
             timestamp_ms: 123,
             body: "hello first-contact".to_string(),
@@ -3742,14 +3824,20 @@ mod tests {
 
         let contacts = load_contacts(bob_dir.path()).unwrap();
         assert!(contacts.is_empty());
-        let (plaintext, verified) = decrypt_and_verify(&mut msg, bob_dir.path(), &contacts).unwrap();
+        let (plaintext, verified) =
+            decrypt_and_verify(&mut msg, bob_dir.path(), &contacts).unwrap();
         assert_eq!(plaintext, "hello first-contact");
         assert!(verified);
 
         let contacts = load_contacts(bob_dir.path()).unwrap();
-        let alice = contacts.get("Alice").expect("autodiscovered contact missing");
+        let alice = contacts
+            .get("Alice")
+            .expect("autodiscovered contact missing");
         assert_eq!(alice.pubkey_b64, alice_pub);
-        assert_eq!(alice.x25519_pubkey_b64.as_deref(), Some(msg.sender_x25519_pubkey_b64.as_str()));
+        assert_eq!(
+            alice.x25519_pubkey_b64.as_deref(),
+            Some(msg.sender_x25519_pubkey_b64.as_str())
+        );
     }
 
     // -- contacts CRUD --
@@ -3987,7 +4075,7 @@ mod tests {
             "group hello",
             100,
             DeliveryStatus::Sent,
-            "contact",  // old default — should become 'group' after migration
+            "contact", // old default — should become 'group' after migration
             "alice",
         )
         .unwrap();
@@ -4043,6 +4131,52 @@ mod tests {
             "real DM should still appear in alice DM history: {:?}",
             dm_bodies
         );
+    }
+
+    #[test]
+    fn raw_group_payload_contact_rows_are_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        let payload = serde_json::json!({
+            "kind": "group_message",
+            "group_id": "4da24733597d007333820bc5dd3a0813",
+            "group_title": "SecX",
+            "members": ["Alan", "Steamdeck", "Sydney"],
+            "body": "dong"
+        })
+        .to_string();
+
+        store_message_for_conversation(
+            dir.path(),
+            "in",
+            "Zimbro",
+            "",
+            &payload,
+            300,
+            DeliveryStatus::Failed,
+            "contact",
+            "Zimbro",
+        )
+        .unwrap();
+
+        init_db(dir.path()).unwrap();
+
+        assert!(load_history(dir.path(), Some("Zimbro"), 10)
+            .unwrap()
+            .is_empty());
+        let group_rows = load_group_history(dir.path(), "SecX", 10).unwrap();
+        assert_eq!(group_rows.len(), 1);
+        assert_eq!(group_rows[0].contact, "Zimbro");
+        assert_eq!(group_rows[0].body, "dong");
+        assert_eq!(group_rows[0].conversation_kind, "group");
+        assert_eq!(
+            group_rows[0].conversation_id,
+            "4da24733597d007333820bc5dd3a0813"
+        );
+        let groups = load_groups(dir.path()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "SecX");
+        assert!(groups[0].members.iter().any(|m| m.contact == "Zimbro"));
     }
 
     #[test]

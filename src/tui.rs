@@ -1861,9 +1861,7 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
                 Some(name) => m.contact == *name && m.conversation_id.is_none(),
                 None => selected_group
                     .as_ref()
-                    .map(|_| {
-                        m.conversation_id.as_deref() == app.selected_group_id().as_deref()
-                    })
+                    .map(|_| m.conversation_id.as_deref() == app.selected_group_id().as_deref())
                     .unwrap_or(true),
             }
         })
@@ -2109,8 +2107,11 @@ mod input_clear_on_command_test {
             "input should be empty after /add, got: '{}'",
             app.input
         );
-        let sys: Vec<&DisplayMessage> =
-            app.messages.iter().filter(|m| m.direction == "sys").collect();
+        let sys: Vec<&DisplayMessage> = app
+            .messages
+            .iter()
+            .filter(|m| m.direction == "sys")
+            .collect();
         assert!(!sys.is_empty(), "expected sys messages after /add");
         // The sys message body should NOT have the old "* " prefix.
         for msg in &sys {
