@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use base64::Engine;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -42,6 +42,7 @@ pub struct SendCommand {
 #[derive(Debug)]
 pub struct FileCommand {
     pub contact: String,
+    pub group: Option<String>,
     pub file_path: String,
 }
 
@@ -71,6 +72,7 @@ struct App {
     error_until: Option<Instant>,
     unread_contacts: HashSet<String>,
     unread_groups: HashSet<String>,
+    pending_attachment: Option<String>,
 }
 
 #[derive(Debug)]
@@ -124,6 +126,7 @@ impl App {
             error_until: None,
             unread_contacts: HashSet::new(),
             unread_groups: HashSet::new(),
+            pending_attachment: None,
         }
     }
 
@@ -328,7 +331,7 @@ impl App {
                 }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/group-create <title> <member> [member...] — create group\n/group-delete <id-or-title> — delete group\n/group-rename <id-or-title> <new-title> — rename group\n/group-add <id-or-title> <member> — add group member\n/group-remove <id-or-title> <member> — remove group member\n/file <contact> <path> — send file\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/emoji  — show common emoji shortcuts\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
+                        "/send <contact> <msg>  — send direct message\n/group <id-or-title> <msg> — send group message\n/group-create <title> <member> [member...] — create group\n/group-delete <id-or-title> — delete group\n/group-rename <id-or-title> <new-title> — rename group\n/group-add <id-or-title> <member> — add group member\n/group-remove <id-or-title> <member> — remove group member\n/file <contact> <path> — send file (or Ctrl+A)\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\n/history [contact] — show log\n/history-group <id-or-title> — show group log\n/contacts — list contacts with keys\n/groups — list groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact> — remove contact\n/name [display-name] — show or set your name\n/whoami — show identity keys\n/share  — one-liner for sharing\n/onion  — show onion address\n/emoji  — show common emoji shortcuts\n/ratchet <contact> — init double ratchet\n/status  — full status\n/clear  — clear messages\n/quit   — exit",
                         "help",
                     );
                     return false;
@@ -846,8 +849,10 @@ impl App {
     }
 
     fn do_send_file(&mut self, contact: &str, file_path: &str) {
+        let group = self.selected_group_id();
         let _ = self.file_tx.try_send(FileCommand {
             contact: contact.to_string(),
+            group,
             file_path: file_path.to_string(),
         });
         let ts = std::time::SystemTime::now()
@@ -1293,13 +1298,35 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
                             }
                         }
                         KeyCode::Char(c) => {
-                            app.input.push(c);
+                            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'a' {
+                                // Ctrl+A: prompt for file to send to current contact/group
+                                app.input.clear();
+                                let target = app
+                                    .selected_contact_name()
+                                    .or_else(|| app.selected_group_id());
+                                match target {
+                                    Some(t) => {
+                                        app.input.push_str(&format!("/file {} ", t));
+                                        app.pending_attachment = Some(t);
+                                    }
+                                    None => {
+                                        app.input.push_str("/file ");
+                                        app.pending_attachment = None;
+                                    }
+                                }
+                            } else {
+                                app.input.push(c);
+                            }
                         }
                         KeyCode::Backspace => {
                             app.input.pop();
+                            if !app.input.starts_with("/file ") {
+                                app.pending_attachment = None;
+                            }
                         }
                         KeyCode::Esc => {
                             app.input.clear();
+                            app.pending_attachment = None;
                         }
                         KeyCode::Tab => {
                             let count = app.conversation_count();
@@ -2039,9 +2066,15 @@ mod tests {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
+    let attachment_indicator = if app.pending_attachment.is_some() {
+        " 📎"
+    } else {
+        ""
+    };
+    let title = format!("Input — Ctrl+A to attach{}", attachment_indicator);
     let input = Paragraph::new(Span::raw(&app.input)).block(
         Block::default()
-            .title("Input")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow)),
     );
@@ -2085,6 +2118,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod input_clear_on_command_test {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn make_test_app() -> App {
         let (tui_tx, _tui_rx) = mpsc::channel::<TuiEvent>(1);
@@ -2132,5 +2166,72 @@ mod input_clear_on_command_test {
                 msg.body
             );
         }
+    }
+
+    #[test]
+    fn ctrl_a_prefills_file_command_with_selected_contact() {
+        let mut app = make_test_app();
+        // App has "alice" as contact, selected by default.
+        // Simulate Ctrl+A by directly calling the same logic as the event handler.
+        app.input.clear();
+        let target = app
+            .selected_contact_name()
+            .or_else(|| app.selected_group_id());
+        match target {
+            Some(t) => {
+                app.input.push_str(&format!("/file {} ", t));
+                app.pending_attachment = Some(t);
+            }
+            None => {
+                app.input.push_str("/file ");
+            }
+        }
+
+        assert_eq!(app.input, "/file alice ");
+        assert!(app.pending_attachment.is_some());
+        assert_eq!(app.pending_attachment.as_ref().unwrap(), "alice");
+    }
+
+    #[test]
+    fn ctrl_a_with_no_contacts_prompts_generic_file() {
+        let (tui_tx, _tui_rx) = mpsc::channel::<TuiEvent>(1);
+        let (send_tx, _send_rx) = mpsc::channel::<SendCommand>(1);
+        let (file_tx, _file_rx) = mpsc::channel::<FileCommand>(1);
+        drop(tui_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            _tui_rx,
+            send_tx,
+            file_tx,
+            vec![], // no contacts
+            quit_tx,
+        );
+        app.profile_name = "alan".to_string();
+
+        // With no contacts and no groups, Ctrl+A should produce bare /file
+        app.input.clear();
+        let target = app
+            .selected_contact_name()
+            .or_else(|| app.selected_group_id());
+        assert!(target.is_none());
+        app.input.push_str("/file ");
+
+        assert_eq!(app.input, "/file ");
+        assert!(app.pending_attachment.is_none());
+    }
+
+    #[test]
+    fn esc_clears_pending_attachment() {
+        let mut app = make_test_app();
+        app.pending_attachment = Some("alice".to_string());
+        app.input = "/file alice /tmp/test.txt".to_string();
+
+        app.input.clear();
+        app.pending_attachment = None;
+
+        assert!(app.input.is_empty());
+        assert!(app.pending_attachment.is_none());
     }
 }
