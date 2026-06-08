@@ -1937,6 +1937,7 @@ struct ServeControlCommand {
     to: Option<String>,
     group: Option<String>,
     message: Option<String>,
+    path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3514,6 +3515,23 @@ pub(crate) async fn serve(
                                 result.group_title, result.sent, result.total
                             ),
                             Err(e) => println!("send error: {e}"),
+                        }
+                    });
+                }
+                "file" => {
+                    let Some(to) = cmd.to else {
+                        println!("file send error: missing to");
+                        continue;
+                    };
+                    let Some(path) = cmd.path else {
+                        println!("file send error: missing path");
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        let _guard = send_lock.lock().await;
+                        match crate::send_file(&profile, &to, &path, None, tor_client).await {
+                            Ok(()) => println!("file sent to {}", to),
+                            Err(e) => println!("file send error: {e}"),
                         }
                     });
                 }

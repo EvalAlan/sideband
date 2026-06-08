@@ -1282,6 +1282,86 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     await listener.stdin.flush();
   }
 
+  Future<void> _sendFileViaListener({String? to, required String path}) async {
+    final listener = _listener;
+    if (listener == null) {
+      throw Exception('listener control channel is not available; restart the GUI');
+    }
+    listener.stdin.writeln(jsonEncode({
+      'cmd': 'file',
+      if (to != null) 'to': to,
+      'path': path,
+    }));
+    await listener.stdin.flush();
+  }
+
+  Future<void> _showFileDialog() async {
+    final controller = TextEditingController();
+    final c = _sel;
+    final g = _selGroup;
+    // Pre-fill with selected contact/group name
+    final target = c?.name ?? g?.title ?? '';
+    // Build dialog label
+    final label = target.isNotEmpty ? 'Send file to $target' : 'File path';
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (_) => AlertDialog(
+          backgroundColor: _t.surface,
+          title: Text('Send file', style: TextStyle(color: _t.text)),
+          content: SizedBox(
+            width: 380,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (target.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text('Recipient: $target',
+                        style: TextStyle(color: _t.text, fontSize: 12)),
+                  ),
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  style: TextStyle(fontSize: 14, color: _t.text),
+                  decoration: InputDecoration(
+                    labelText: label,
+                    hintText: '/path/to/file',
+                  ),
+                  onSubmitted: (_) => Navigator.pop(context, true),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: Text('Send'),
+            ),
+          ],
+        ),
+      );
+      if (ok == true && controller.text.trim().isNotEmpty) {
+        final path = controller.text.trim();
+        if (target.isNotEmpty) {
+          await _sendFileViaListener(to: target, path: path);
+        } else {
+          setState(() => _error = 'No contact or group selected');
+          return;
+        }
+        await _refresh();
+        _scrollToBottom();
+      }
+    } finally {
+      controller.dispose();
+    }
+  }
+
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -1674,7 +1754,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       switch (cmd) {
         case 'help':
           _showInfo('Slash commands',
-              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group-delete <id-or-title>\n/group-rename <id-or-title> <new-title>\n/group-add <id-or-title> <member>\n/group-remove <id-or-title> <member>\n/group <id-or-title> <msg>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
+              '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group-delete <id-or-title>\n/group-rename <id-or-title> <new-title>\n/group-add <id-or-title> <member>\n/group-remove <id-or-title> <member>\n/group <id-or-title> <msg>\n/file <filepath>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
           return;
         case 'send':
           if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
@@ -1834,6 +1914,14 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           await _showSettings();
           return;
         case 'file':
+          if (parts.length < 2) throw Exception('usage: /file <filepath> — or use the 📎 button');
+          final path = parts.skip(1).join(' ');
+          final target = _sel?.name ?? _selGroup?.title;
+          if (target == null) throw Exception('no contact or group selected');
+          await _sendFileViaListener(to: target, path: path);
+          await _refresh();
+          _scrollToBottom();
+          return;
         case 'transfers':
           throw Exception('/$cmd is not wired in the GUI yet. Backend support is TUI-only right now. Annoying, but honest.');
         default:
@@ -3404,6 +3492,18 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             child: IconButton(
               icon: const Text('😊', style: TextStyle(fontSize: 20)),
               onPressed: _showEmojiPicker,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              splashRadius: 18,
+            ),
+          ),
+          const SizedBox(width: 4),
+          // attachment button
+          Padding(
+            padding: const EdgeInsets.only(bottom: 2),
+            child: IconButton(
+              icon: Icon(Icons.attach_file, size: 18, color: _t.textDim),
+              onPressed: _showFileDialog,
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
               splashRadius: 18,
