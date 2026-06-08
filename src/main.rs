@@ -2281,7 +2281,8 @@ async fn main() -> Result<()> {
             GroupAction::Delete { profile, group } => {
                 let profile = profile.path()?;
                 ensure_profile(&profile)?;
-                let deleted = delete_group(&profile, &group)?;
+                let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
+                let deleted = delete_group_notify(&profile, &group, tor_client).await?;
                 println!("group '{}' deleted ({})", deleted.title, deleted.id);
                 Ok(())
             }
