@@ -1304,18 +1304,52 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       setState(() => _error = 'No contact or group selected');
       return;
     }
-    try {
-      final result = await FilePicker.platform
-         .pickFiles(dialogTitle: 'Send file to $target');
-      if (result != null && result.files.single.path != null) {
-        final path = result.files.single.path!;
-        await _sendFileViaListener(to: target, path: path);
-        await _refresh();
-        _scrollToBottom();
-      }
-    } catch (e) {
-      if (mounted) setState(() => _error = '$e');
+    // Try native Linux file choosers first (most reliable in AppImage context)
+    final nativePath = await _tryNativeFileChooser(target);
+    if (nativePath != null) {
+      if (nativePath.isEmpty) return; // user cancelled
+      await _sendFileViaListener(to: target, path: nativePath);
+      await _refresh();
+      _scrollToBottom();
+      return;
     }
+    // Fallback to file_picker package
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        dialogTitle: 'Send file to $target',
+        type: FileType.any,
+      );
+      if (result == null || result.files.isEmpty) return;
+      final path = result.files.single.path;
+      if (path == null || path.isEmpty) return;
+      await _sendFileViaListener(to: target, path: path);
+      await _refresh();
+      _scrollToBottom();
+    } catch (e) {
+      if (mounted) setState(() => _error = 'File picker: $e');
+    }
+  }
+
+  /// Tries kdialog (KDE), then zenity (GNOME/XFCE), returns path or null if
+  /// none available. Returns empty string if user cancelled.
+  Future<String?> _tryNativeFileChooser(String target) async {
+    final choosers = <List<String>>[
+      ['kdialog', '--getopenfilename', '--title', 'Send file to $target', '.'],
+      ['zenity', '--file-selection', '--title=Send file to $target'],
+      ['yad', '--file', '--title=Send file to $target'],
+    ];
+    for (final cmd in choosers) {
+      try {
+        final result = await Process.run(cmd[0], cmd.sublist(1))
+            .timeout(const Duration(seconds: 5));
+        if (result.exitCode == 0) {
+          return (result.stdout as String).trim();
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+    return null; // none available
   }
 
   Future<void> _load() async {
