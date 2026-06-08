@@ -1858,12 +1858,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             _showInfo('Who', 'No member info for this group yet.');
             return;
           }
-          final lines = sel.members.map((m) {
-            final c = _contacts.where((x) => x.name == m.contact).firstOrNull;
+          final lines = sel.members.map((name) {
+            final c = _contacts.where((x) => x.name == name).firstOrNull;
             final onion = c?.onion ?? '?';
             final sec = c?.securityLabel ?? 'Unknown';
-            final role = m.role.isNotEmpty ? m.role : 'member';
-            return '${m.contact}\nonion=${onion}\nsecurity=${sec}\nrole=${role}';
+            return '$name\n  onion=$onion\n  security=$sec';
           }).join('\n\n');
           _showInfo("'${sel.title}' members (${sel.members.length + 1})",
               'You (self)\n\n$lines');
