@@ -3474,15 +3474,15 @@ pub(crate) async fn serve(
     // This is the only place that calls handle_inbound — transport is agnostic.
     loop {
         while let Ok(cmd) = control_rx.try_recv() {
-            let Some(message) = cmd.message else {
-                println!("send error: missing message");
-                continue;
-            };
             let profile = profile.to_path_buf();
             let tor_client = tor_client.clone();
             let send_lock = send_lock.clone();
             match cmd.cmd.as_str() {
                 "send" => {
+                    let Some(message) = cmd.message else {
+                        println!("send error: missing message");
+                        continue;
+                    };
                     let Some(to) = cmd.to else {
                         println!("send error: missing to");
                         continue;
@@ -3503,6 +3503,10 @@ pub(crate) async fn serve(
                     });
                 }
                 "group_send" => {
+                    let Some(message) = cmd.message else {
+                        println!("send error: missing message");
+                        continue;
+                    };
                     let Some(group) = cmd.group else {
                         println!("send error: missing group");
                         continue;

@@ -1336,14 +1336,21 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         }
       } catch (_) {}
     }
-    // Fallback: in-app file browser dialog
+    // Fallback: in-app file browser as modal bottom sheet (same pattern as emoji picker)
     if (!mounted) return null;
-    return showDialog<String>(
+    return showModalBottomSheet<String>(
       context: context,
-      barrierDismissible: true,
-      builder: (ctx) => _FlutterFilePicker(
-        title: 'Send file to $target',
-        initialPath: Platform.environment['HOME'] ?? '/home',
+      backgroundColor: _t.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      isScrollControlled: true,
+      builder: (ctx) => SizedBox(
+        height: 400,
+        child: _FlutterFilePicker(
+          title: 'Send file to $target',
+          initialPath: Platform.environment['HOME'] ?? '/home',
+        ),
       ),
     );
   }
@@ -3632,7 +3639,12 @@ class _FlutterFilePickerState extends State<_FlutterFilePicker> {
     });
     try {
       final dir = Directory(_currentDir);
-      final list = await dir.list().toList();
+      var list = await dir.list().toList();
+      // Hide dotfiles and dotdirs
+      list = list.where((e) {
+        final name = e.path.split('/').last;
+        return !name.startsWith('.');
+      }).toList();
       list.sort((a, b) {
         final aIsDir = a is Directory;
         final bIsDir = b is Directory;
