@@ -1298,25 +1298,54 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Future<void> _showFileDialog() async {
     final target = _sel?.name ?? _selGroup?.title ?? '';
     if (target.isEmpty) {
-      setState(() => _error = 'No contact or group selected');
+      _snack('No contact or group selected');
       return;
     }
     if (!mounted) return;
-    final path = await showDialog<String>(
-      context: context,
-      builder: (ctx) => _FlutterFilePicker(
-        title: 'Send file to $target',
-        initialPath: Platform.environment['HOME'] ?? '/',
-      ),
-    );
+    final path = await _pickFile(target);
     if (path == null || path.isEmpty) return;
     try {
       await _sendFileViaListener(to: target, path: path);
       await _refresh();
       _scrollToBottom();
     } catch (e) {
-      if (mounted) setState(() => _error = 'Send failed: $e');
+      if (mounted) _snack('Send failed: $e');
     }
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), duration: const Duration(seconds: 3)),
+    );
+  }
+
+  Future<String?> _pickFile(String target) async {
+    // Try kdialog first (KDE Plasma native), then zenity, then yad
+    for (final cmd in [
+      ['kdialog', '--getopenfilename', '--title', 'Send file to $target', '.'],
+      ['zenity', '--file-selection', '--title=Send file to $target'],
+      ['yad', '--file', '--title=Send file to $target'],
+    ]) {
+      try {
+        final r = await Process.run(cmd[0], cmd.sublist(1))
+            .timeout(const Duration(seconds: 3));
+        if (r.exitCode == 0) {
+          final p = (r.stdout as String).trim();
+          if (p.isNotEmpty) return p;
+        }
+      } catch (_) {}
+    }
+    // Fallback: in-app file browser dialog
+    if (!mounted) return null;
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => _FlutterFilePicker(
+        title: 'Send file to $target',
+        initialPath: Platform.environment['HOME'] ?? '/home',
+      ),
+    );
   }
 
   Future<void> _load() async {
