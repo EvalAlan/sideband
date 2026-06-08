@@ -116,6 +116,11 @@ pub(crate) async fn record_inbound_chat_plaintext(
         DeliveryStatus::Failed
     };
 
+    // Always try to parse as group message first, regardless of verified
+    // status. The verified flag affects delivery status only, not routing.
+    // This is critical for v3 (Double Ratchet) messages from unknown senders:
+    // v3 decrypt_and_verify does not call verify_message_with_sender_metadata,
+    // so verified can be false even for legitimate group messages.
     if verified {
         if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(plaintext) {
             if payload.kind == "group_message" {
@@ -148,6 +153,43 @@ pub(crate) async fn record_inbound_chat_plaintext(
                     })
                     .await;
                 return Ok(());
+            }
+        }
+    } else {
+        // Unverified: still try to parse as group message so we don't store
+        // raw GroupMessagePayload JSON as a contact PM.
+        if let Ok(payload) = serde_json::from_str::<GroupMessagePayload>(plaintext) {
+            if payload.kind == "group_message" {
+                if let Ok(group) = discover_or_update_group(
+                    profile,
+                    &payload.group_id,
+                    &payload.group_title,
+                    contact_name,
+                    &payload.members,
+                ) {
+                    store_message_for_conversation(
+                        profile,
+                        "in",
+                        contact_name,
+                        "",
+                        &payload.body,
+                        timestamp_ms,
+                        status,
+                        "group",
+                        &group.id,
+                    )?;
+                    let _ = tui_tx
+                        .send(TuiEvent::InboundGroupMessage {
+                            group_id: group.id,
+                            group_title: group.title,
+                            contact: contact_name.to_string(),
+                            body: payload.body,
+                            timestamp_ms,
+                            verified,
+                        })
+                        .await;
+                    return Ok(());
+                }
             }
         }
     }
@@ -707,6 +749,69 @@ mod group_chat_tests {
                 assert_eq!(group_title, "Ops");
                 assert_eq!(contact, "alice");
                 assert_eq!(body, "ops hello");
+            }
+            other => panic!("expected group event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_group_payload_unverified_still_stores_as_group() {
+        // Regression: when verified=false (e.g. v3 from unknown sender),
+        // GroupMessagePayload must still be routed to group history, not
+        // stored as a contact PM with raw JSON.
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "bob",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel::<TuiEvent>(4);
+        let payload = serde_json::json!({
+            "kind": "group_message",
+            "group_id": "g-offtopic",
+            "group_title": "Offtopic",
+            "members": ["bob"],
+            "body": "hello from unknown"
+        })
+        .to_string();
+
+        record_inbound_chat_plaintext(dir.path(), &tx, "stranger", &payload, 456, false)
+            .await
+            .unwrap();
+
+        // Must appear in group history, not in stranger's DM history.
+        let groups = load_groups(dir.path()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "g-offtopic");
+
+        let group_rows = load_group_history(dir.path(), "g-offtopic", 10).unwrap();
+        assert_eq!(group_rows.len(), 1);
+        assert_eq!(group_rows[0].body, "hello from unknown");
+        assert_eq!(group_rows[0].contact, "stranger");
+        assert_eq!(group_rows[0].conversation_kind, "group");
+
+        // Must NOT appear as a contact PM.
+        assert!(load_history(dir.path(), Some("stranger"), 10)
+            .unwrap()
+            .is_empty());
+
+        // Must emit InboundGroupMessage event.
+        match rx.recv().await.unwrap() {
+            TuiEvent::InboundGroupMessage {
+                group_id,
+                body,
+                contact,
+                ..
+            } => {
+                assert_eq!(group_id, "g-offtopic");
+                assert_eq!(body, "hello from unknown");
+                assert_eq!(contact, "stranger");
             }
             other => panic!("expected group event, got {other:?}"),
         }

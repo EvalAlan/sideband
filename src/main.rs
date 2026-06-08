@@ -3108,7 +3108,8 @@ pub(crate) fn decrypt_and_verify(
             String::from_utf8(plaintext_bytes).context("ratchet plaintext not valid utf8")?;
         // Verify Ed25519 signature on the plaintext.
         msg.body = plaintext.clone();
-        let verified = verify_message(msg, contacts).unwrap_or(false);
+        let verified = verify_message(msg, contacts).unwrap_or(false)
+            || verify_message_with_sender_metadata(msg).unwrap_or(false);
         return Ok((plaintext, verified));
     }
     if msg.v < 2 || msg.enc_body.is_empty() {
