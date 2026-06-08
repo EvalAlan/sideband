@@ -1414,6 +1414,7 @@ pub(crate) fn load_history(
             "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at, conversation_kind, conversation_id
              FROM messages
              WHERE conversation_kind = 'contact' AND contact = ?1
+               AND body NOT LIKE '%group_message%'
              ORDER BY timestamp_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![c, limit as i64], history_row_from_sql)?;
@@ -1450,11 +1451,43 @@ pub(crate) fn load_group_history(
          WHERE conversation_kind = 'group' AND conversation_id = ?1
          ORDER BY timestamp_ms DESC LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![group.id, limit as i64], history_row_from_sql)?;
+    let rows = stmt.query_map(
+        params![group.id.clone(), limit as i64],
+        history_row_from_sql,
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
+
+    let mut raw_stmt = conn.prepare(
+        "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at, conversation_kind, conversation_id
+         FROM messages
+         WHERE conversation_kind = 'contact'
+           AND body LIKE '%group_message%'
+         ORDER BY timestamp_ms DESC LIMIT ?1",
+    )?;
+    let raw_rows = raw_stmt.query_map(params![limit as i64], history_row_from_sql)?;
+    for row in raw_rows {
+        let mut row = row?;
+        let Some(payload) = parse_stored_group_message_payload(&row.body) else {
+            continue;
+        };
+        if payload.group_id != group.id {
+            continue;
+        }
+        row.body = payload.body;
+        row.conversation_kind = "group".to_string();
+        row.conversation_id = group.id.clone();
+        out.push(row);
+    }
+
+    out.sort_by(|a, b| {
+        b.timestamp_ms
+            .cmp(&a.timestamp_ms)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    out.truncate(limit);
     Ok(out)
 }
 
@@ -4193,6 +4226,56 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].title, "SecX");
         assert!(groups[0].members.iter().any(|m| m.contact == "Zimbro"));
+    }
+
+    #[test]
+    fn history_readers_hide_and_recover_raw_group_payload_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        contact_add(
+            dir.path(),
+            "Zimbro",
+            "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion",
+            &pk,
+            &xpk,
+        )
+        .unwrap();
+        let group = create_group(dir.path(), "SecX", &["Zimbro".into()]).unwrap();
+        let payload = serde_json::json!({
+            "kind": "group_message",
+            "group_id": group.id,
+            "group_title": "SecX",
+            "members": ["Alan", "Zimbro", "Sydney"],
+            "body": "still a group message"
+        })
+        .to_string();
+
+        // Simulate a stale writer inserting the old bad shape after migrations
+        // already ran: contact row, raw group payload body.
+        let conn = init_db(dir.path()).unwrap();
+        conn.execute(
+            "INSERT INTO messages (direction, contact, onion, body, timestamp_ms, status, conversation_kind, conversation_id)
+             VALUES ('in', 'Zimbro', '', ?1, 400, 2, 'contact', 'Zimbro')",
+            params![payload],
+        )
+        .unwrap();
+        drop(conn);
+
+        let dm_rows = load_history(dir.path(), Some("Zimbro"), 10).unwrap();
+        assert!(
+            dm_rows.is_empty(),
+            "raw group payload must not appear in contact history: {:?}",
+            dm_rows.iter().map(|r| r.body.as_str()).collect::<Vec<_>>()
+        );
+
+        let group_rows = load_group_history(dir.path(), "SecX", 10).unwrap();
+        assert_eq!(group_rows.len(), 1);
+        assert_eq!(group_rows[0].contact, "Zimbro");
+        assert_eq!(group_rows[0].body, "still a group message");
+        assert_eq!(group_rows[0].conversation_kind, "group");
+        assert_eq!(group_rows[0].conversation_id, group.id);
     }
 
     #[test]
