@@ -11,6 +11,7 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - '.github/workflows/appimage.yml'
+      - 'download-latest-appimage.sh'
 
 jobs:
   appimage:
@@ -66,62 +67,7 @@ jobs:
 
       - name: Analyze Flutter GUI
         working-directory: gui
-        run: flutter analyze --no-fatal-infos
-
-      - name: Test Flutter GUI
-        working-directory: gui
-        run: flutter test
-
-      - name: Build AppImage
-        run: ./gui/build-appimage.sh
-
-      - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: sideband-appimage-${{ matrix.arch }}
-          path: dist/*.AppImage
-          if-no-files-found: error
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Linux desktop build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang \
-            cmake \
-            fuse \
-            imagemagick \
-            libappindicator3-dev \
-            libblkid-dev \
-            libfuse2 \
-            libgtk-3-dev \
-            liblzma-dev \
-            ninja-build \
-            pkg-config \
-            wget
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Enable Flutter Linux desktop
-        run: flutter config --enable-linux-desktop
-
-      - name: Check Rust warnings
-        run: RUSTFLAGS='-D warnings' cargo check --bin sideband
-
-      - name: Analyze Flutter GUI
-        working-directory: gui
-        run: flutter analyze --no-fatal-infos
+        run: flutter analyze
 
       - name: Test Flutter GUI
         working-directory: gui

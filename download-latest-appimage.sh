@@ -1,6 +1,6 @@
 #!/bin/bash
 # download-latest-appimage.sh
-# Downloads the latest successful AppImage build from CI and prepares it for use.
+# Downloads the newest x86_64 AppImage artifact from CI and prepares it for use.
 # Usage: ./download-latest-appimage.sh [output-dir]
 # Default output-dir: /tmp/sideband-appimage
 
@@ -9,43 +9,68 @@ set -euo pipefail
 OUTPUT_DIR="${1:-/tmp/sideband-appimage}"
 REPO="EvalAlan/sideband"
 WORKFLOW="appimage.yml"
+ARTIFACT="sideband-appimage-x86_64"
 
-# Find the latest successful run
-echo "🔍 Finding latest successful AppImage build…"
-RUN_ID=$(gh run list \
+echo "🔍 Finding newest x86_64 AppImage artifact…"
+
+RUNS_JSON=$(gh run list \
   --repo "$REPO" \
   --workflow "$WORKFLOW" \
-  --status success \
-  --limit 1 \
-  --json databaseId \
-  --jq '.[0].databaseId')
+  --limit 25 \
+  --json databaseId,headSha,createdAt,displayTitle,status,conclusion)
+
+RUN_ID=""
+RUN_SHA=""
+RUN_DATE=""
+RUN_TITLE=""
+RUN_CONCLUSION=""
+
+while IFS= read -r encoded; do
+  row=$(printf '%s' "$encoded" | base64 --decode)
+  id=$(printf '%s' "$row" | jq -r '.databaseId')
+  sha=$(printf '%s' "$row" | jq -r '.headSha')
+  created=$(printf '%s' "$row" | jq -r '.createdAt')
+  title=$(printf '%s' "$row" | jq -r '.displayTitle')
+  status=$(printf '%s' "$row" | jq -r '.status')
+  conclusion=$(printf '%s' "$row" | jq -r '.conclusion // ""')
+  [[ -z "$id" || "$status" != "completed" ]] && continue
+  if gh api "repos/$REPO/actions/runs/$id/artifacts" \
+      --jq ".artifacts[] | select(.name == \"$ARTIFACT\" and .expired == false) | .id" \
+      | grep -q .; then
+    RUN_ID="$id"
+    RUN_SHA="$sha"
+    RUN_DATE="$created"
+    RUN_TITLE="$title"
+    RUN_CONCLUSION="$conclusion"
+    break
+  fi
+done < <(printf '%s' "$RUNS_JSON" | jq -r '.[] | @base64')
 
 if [[ -z "$RUN_ID" ]]; then
-  echo "❌ No successful AppImage build found." >&2
+  echo "❌ No downloadable $ARTIFACT artifact found in recent AppImage runs." >&2
   exit 1
 fi
 
-# Get run info for display
-RUN_INFO=$(gh run view "$RUN_ID" \
-  --repo "$REPO" \
-  --json headSha,createdAt,displayTitle \
-  --jq '"  commit: " + .headSha[:8] + "\n  date:   " + .createdAt + "\n  title:  " + .displayTitle')
+if [[ "$RUN_CONCLUSION" != "success" ]]; then
+  echo "⚠️  Workflow conclusion is '$RUN_CONCLUSION', but the x86_64 AppImage artifact exists."
+  echo "   This is expected when another matrix job failed or an artifact upload conflicted."
+fi
 
 echo "✅ Found run #$RUN_ID"
-echo "$RUN_INFO"
+echo "  commit: ${RUN_SHA:0:8}"
+echo "  date:   $RUN_DATE"
+echo "  title:  $RUN_TITLE"
 echo ""
 
-# Clean and download
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
-echo "⬇️  Downloading artifact…"
+echo "⬇️  Downloading $ARTIFACT…"
 gh run download "$RUN_ID" \
   --repo "$REPO" \
-  --name sideband-appimage-x86_64 \
+  --name "$ARTIFACT" \
   --dir "$OUTPUT_DIR"
 
-# Make executable
 chmod +x "$OUTPUT_DIR"/*.AppImage
 
 echo ""
