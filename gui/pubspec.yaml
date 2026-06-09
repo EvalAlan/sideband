@@ -10,6 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
+  file_selector: ^1.0.3
   window_manager: ^0.5.1
   tray_manager: ^0.5.2
 

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tray_manager/tray_manager.dart';
@@ -1492,39 +1493,32 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<String?> _pickFile(String target) async {
-    // Use the host desktop file chooser. Recreating a file browser here is how
-    // you get a worse file browser.
-    final choosers = <List<String>>[
-      ['kdialog', '--getopenfilename', '--title', 'Send file to $target', '.'],
-      ['zenity', '--file-selection', '--title=Send file to $target'],
-      ['yad', '--file', '--title=Send file to $target'],
-    ];
-
-    for (final cmd in choosers) {
+    // Use Flutter's platform file-selector plugin. On Linux this routes through
+    // the desktop's native chooser/portal instead of our own fake browser.
+    try {
+      final picked = await openFile(
+        acceptedTypeGroups: const [
+          XTypeGroup(label: 'All files'),
+        ],
+        confirmButtonText: 'Send',
+      ).timeout(const Duration(minutes: 10));
+      final path = picked?.path.trim() ?? '';
+      if (path.isEmpty) return null;
       try {
-        final result = await Process.run(cmd[0], cmd.sublist(1))
-            .timeout(const Duration(minutes: 10));
-        if (result.exitCode != 0) continue;
-        final path = (result.stdout as String).trim();
-        if (path.isEmpty) return null;
-        try {
-          final size = File(path).lengthSync();
-          if (size > 100 * 1024 * 1024) {
-            _snack('File too large (max 100 MB)');
-            return null;
-          }
-        } catch (_) {}
-        return path;
-      } on TimeoutException {
-        _snack('File picker timed out');
-        return null;
-      } catch (_) {
-        // chooser not installed or failed; try the next native/default option
-      }
+        final size = File(path).lengthSync();
+        if (size > 100 * 1024 * 1024) {
+          _snack('File too large (max 100 MB)');
+          return null;
+        }
+      } catch (_) {}
+      return path;
+    } on TimeoutException {
+      _snack('File picker timed out');
+      return null;
+    } catch (e) {
+      _snack('File picker failed: $e');
+      return null;
     }
-
-    _snack('No desktop file picker found. Install kdialog, zenity, or yad.');
-    return null;
   }
 
   Future<void> _load() async {
@@ -3973,31 +3967,39 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                                         fontWeight: FontWeight.w700,
                                         letterSpacing: 0.4)),
                               ),
-                              Wrap(
-                                spacing: 5,
-                                runSpacing: 5,
-                                children: entry.value.map((emoji) {
-                                  return Material(
-                                    color: _t.surface2,
-                                    borderRadius: BorderRadius.circular(9),
-                                    child: InkWell(
-                                      borderRadius: BorderRadius.circular(9),
-                                      onTap: () {
-                                        _insertEmoji(emoji);
-                                        Navigator.pop(ctx);
-                                      },
-                                      child: SizedBox(
-                                        width: 34,
-                                        height: 32,
-                                        child: Center(
-                                          child: Text(emoji,
-                                              style: const TextStyle(
-                                                  fontSize: 20)),
+                              LayoutBuilder(
+                                builder: (context, constraints) {
+                                  final columns = (constraints.maxWidth ~/ 36)
+                                      .clamp(6, 18)
+                                      .toInt();
+                                  return GridView.count(
+                                    crossAxisCount: columns,
+                                    mainAxisSpacing: 4,
+                                    crossAxisSpacing: 4,
+                                    childAspectRatio: 1.05,
+                                    shrinkWrap: true,
+                                    physics:
+                                        const NeverScrollableScrollPhysics(),
+                                    children: entry.value.map((emoji) {
+                                      return Material(
+                                        color: _t.surface2,
+                                        borderRadius: BorderRadius.circular(8),
+                                        child: InkWell(
+                                          borderRadius: BorderRadius.circular(8),
+                                          onTap: () {
+                                            _insertEmoji(emoji);
+                                            Navigator.pop(ctx);
+                                          },
+                                          child: Center(
+                                            child: Text(emoji,
+                                                style: const TextStyle(
+                                                    fontSize: 20)),
+                                          ),
                                         ),
-                                      ),
-                                    ),
+                                      );
+                                    }).toList(growable: false),
                                   );
-                                }).toList(growable: false),
+                                },
                               ),
                             ],
                           ),
