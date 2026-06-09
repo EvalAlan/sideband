@@ -3916,96 +3916,100 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: _t.surface,
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
         return SafeArea(
-          child: SizedBox(
-            height: 320,
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 400),
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Icon(Icons.emoji_emotions_outlined,
-                              size: 16, color: _t.primary),
-                          const SizedBox(width: 6),
-                          Text('Emoji',
-                              style: TextStyle(
-                                  color: _t.text,
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 12)),
-                          const Spacer(),
-                          IconButton(
-                            icon: const Icon(Icons.close, size: 16),
-                            onPressed: () => Navigator.pop(ctx),
-                            constraints: const BoxConstraints(
-                                minWidth: 28, minHeight: 28),
-                            padding: EdgeInsets.zero,
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 4),
-                      Expanded(
-                        child: ListView(
-                          children: _emojiSections.entries.map((entry) {
-                            return Padding(
-                              padding: const EdgeInsets.only(top: 8),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Padding(
-                                    padding: const EdgeInsets.only(
-                                        left: 4, bottom: 4),
-                                    child: Text(entry.key,
-                                        style: TextStyle(
-                                            color: _t.textDim,
-                                            fontSize: 10,
-                                            fontWeight: FontWeight.w700,
-                                            letterSpacing: 0.3)),
-                                  ),
-                                  Wrap(
-                                    spacing: 4,
-                                    runSpacing: 4,
-                                    children: entry.value.map((emoji) {
-                                      return Material(
-                                        color: _t.surface2,
+          child: Padding(
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.of(ctx).viewInsets.bottom,
+            ),
+            child: SizedBox(
+              width: 400,
+              height: 340,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.emoji_emotions_outlined,
+                            size: 16, color: _t.primary),
+                        const SizedBox(width: 6),
+                        Text('Emoji',
+                            style: TextStyle(
+                                color: _t.text,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 12)),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.close, size: 16),
+                          onPressed: () => Navigator.pop(ctx),
+                          constraints: const BoxConstraints(
+                              minWidth: 28, minHeight: 28),
+                          padding: EdgeInsets.zero,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Expanded(
+                      child: ListView(
+                        children: _emojiSections.entries.map((entry) {
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 8),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Padding(
+                                  padding: const EdgeInsets.only(
+                                      left: 4, bottom: 4),
+                                  child: Text(entry.key,
+                                      style: TextStyle(
+                                          color: _t.textDim,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w700,
+                                          letterSpacing: 0.3)),
+                                ),
+                                Wrap(
+                                  spacing: 4,
+                                  runSpacing: 4,
+                                  children: entry.value.map((emoji) {
+                                    return Material(
+                                      color: _t.surface2,
+                                      borderRadius:
+                                          BorderRadius.circular(6),
+                                      child: InkWell(
                                         borderRadius:
                                             BorderRadius.circular(6),
-                                        child: InkWell(
-                                          borderRadius:
-                                              BorderRadius.circular(6),
-                                          onTap: () {
-                                            _insertEmoji(emoji);
-                                            Navigator.pop(ctx);
-                                          },
-                                          child: SizedBox(
-                                            width: 36,
-                                            height: 34,
-                                            child: Center(
-                                              child: Text(emoji,
-                                                  style: const TextStyle(
-                                                      fontSize: 20)),
-                                            ),
+                                        onTap: () {
+                                          _insertEmoji(emoji);
+                                          Navigator.pop(ctx);
+                                        },
+                                        child: SizedBox(
+                                          width: 36,
+                                          height: 34,
+                                          child: Center(
+                                            child: Text(emoji,
+                                                style: const TextStyle(
+                                                    fontSize: 20,
+                                                    fontFamily:
+                                                        'NotoColorEmoji')),
                                           ),
                                         ),
-                                      );
-                                    }).toList(growable: false),
-                                  ),
-                                ],
-                              ),
-                            );
-                          }).toList(growable: false),
-                        ),
+                                      ),
+                                    );
+                                  }).toList(growable: false),
+                                ),
+                              ],
+                            ),
+                          );
+                        }).toList(growable: false),
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
               ),
             ),

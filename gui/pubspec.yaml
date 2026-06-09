@@ -25,3 +25,8 @@ flutter:
   assets:
     - assets/icon_512x512.png
     - assets/icon_256x256.png
+
+  fonts:
+    - family: NotoColorEmoji
+      fonts:
+        - asset: assets/fonts/NotoColorEmoji.ttf
