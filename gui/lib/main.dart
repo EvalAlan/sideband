@@ -3846,13 +3846,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       '😀',
       '😄',
       '😂',
-      '🙂',
-      '😊',
+      '🙂\uFE0F',
+      '😊\uFE0F',
       '😍',
       '😘',
       '😎',
       '🤔',
-      '😬',
+      '😬\uFE0F',
       '😢',
       '😡'
     ],
@@ -3868,17 +3868,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       '🤘',
       '🫡',
       '👌',
-      '✌️'
+      '✌\uFE0F'
     ],
     'Chat': [
-      '❤️',
+      '❤\uFE0F',
       '🔥',
       '🎉',
       '✨',
       '⭐',
       '✅',
       '❌',
-      '⚠️',
+      '⚠\uFE0F',
       '💡',
       '📌',
       '💬',
@@ -3887,12 +3887,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     'Objects': [
       '🔒',
       '🔑',
-      '🛡️',
+      '🛡\uFE0F',
       '🐛',
       '🎯',
       '🏆',
       '📷',
-      '🖼️',
+      '🖼\uFE0F',
       '📎',
       '📁',
       '☕',
@@ -3922,89 +3922,100 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       builder: (ctx) {
         return SafeArea(
           child: SizedBox(
-            height: 292,
+            height: 200,
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      Icon(Icons.emoji_emotions_outlined,
-                          size: 18, color: _t.primary),
-                      const SizedBox(width: 8),
-                      Text('Emoji',
-                          style: TextStyle(
-                              color: _t.text,
-                              fontWeight: FontWeight.w700,
-                              fontSize: 13)),
-                      const Spacer(),
-                      IconButton(
-                        icon: const Icon(Icons.close, size: 18),
-                        onPressed: () => Navigator.pop(ctx),
-                        constraints:
-                            const BoxConstraints(minWidth: 30, minHeight: 30),
-                        padding: EdgeInsets.zero,
-                      ),
-                    ],
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Row(
+                      children: [
+                        Icon(Icons.emoji_emotions_outlined,
+                            size: 16, color: _t.primary),
+                        const SizedBox(width: 6),
+                        Text('Emoji',
+                            style: TextStyle(
+                                color: _t.text,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 12)),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.close, size: 16),
+                          onPressed: () => Navigator.pop(ctx),
+                          constraints:
+                              const BoxConstraints(minWidth: 28, minHeight: 28),
+                          padding: EdgeInsets.zero,
+                        ),
+                      ],
+                    ),
                   ),
-                  const SizedBox(height: 4),
                   Expanded(
-                    child: ListView(
-                      children: _emojiSections.entries.map((entry) {
-                        return Padding(
-                          padding: const EdgeInsets.only(top: 8),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Padding(
-                                padding:
-                                    const EdgeInsets.only(left: 4, bottom: 5),
-                                child: Text(entry.key,
-                                    style: TextStyle(
-                                        color: _t.textDim,
-                                        fontSize: 10.5,
-                                        fontWeight: FontWeight.w700,
-                                        letterSpacing: 0.4)),
-                              ),
-                              LayoutBuilder(
-                                builder: (context, constraints) {
-                                  final columns = (constraints.maxWidth ~/ 36)
-                                      .clamp(6, 18)
-                                      .toInt();
-                                  return GridView.count(
-                                    crossAxisCount: columns,
-                                    mainAxisSpacing: 4,
-                                    crossAxisSpacing: 4,
-                                    childAspectRatio: 1.05,
-                                    shrinkWrap: true,
-                                    physics:
-                                        const NeverScrollableScrollPhysics(),
-                                    children: entry.value.map((emoji) {
-                                      return Material(
-                                        color: _t.surface2,
-                                        borderRadius: BorderRadius.circular(8),
-                                        child: InkWell(
-                                          borderRadius: BorderRadius.circular(8),
-                                          onTap: () {
-                                            _insertEmoji(emoji);
-                                            Navigator.pop(ctx);
-                                          },
-                                          child: Center(
-                                            child: Text(emoji,
-                                                style: const TextStyle(
-                                                    fontSize: 20)),
-                                          ),
-                                        ),
-                                      );
-                                    }).toList(growable: false),
-                                  );
-                                },
-                              ),
-                            ],
+                    child: DefaultTabController(
+                      length: _emojiSections.length,
+                      child: Column(
+                        children: [
+                          TabBar(
+                            isScrollable: true,
+                            tabAlignment: TabAlignment.start,
+                            labelColor: _t.primary,
+                            unselectedLabelColor: _t.textDim,
+                            labelStyle: const TextStyle(
+                                fontSize: 11, fontWeight: FontWeight.w600),
+                            indicatorColor: _t.primary,
+                            indicatorWeight: 2,
+                            padding: EdgeInsets.zero,
+                            tabs: _emojiSections.keys
+                                .map((s) => Tab(text: s))
+                                .toList(),
                           ),
-                        );
-                      }).toList(growable: false),
+                          Expanded(
+                            child: TabBarView(
+                              children: _emojiSections.values.map((emojis) {
+                                return Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: LayoutBuilder(
+                                    builder: (_, constraints) {
+                                      final cols =
+                                          (constraints.maxWidth ~/ 38)
+                                              .clamp(6, 18)
+                                              .toInt();
+                                      return GridView.count(
+                                        crossAxisCount: cols,
+                                        mainAxisSpacing: 3,
+                                        crossAxisSpacing: 3,
+                                        childAspectRatio: 1.0,
+                                        children: emojis.map((emoji) {
+                                          return Material(
+                                            color: _t.surface2,
+                                            borderRadius:
+                                                BorderRadius.circular(6),
+                                            child: InkWell(
+                                              borderRadius:
+                                                  BorderRadius.circular(6),
+                                              onTap: () {
+                                                _insertEmoji(emoji);
+                                                Navigator.pop(ctx);
+                                              },
+                                              child: Center(
+                                                child: Text(emoji,
+                                                    style:
+                                                        const TextStyle(
+                                                            fontSize: 22)),
+                                              ),
+                                            ),
+                                          );
+                                        }).toList(growable: false),
+                                      );
+                                    },
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ],
