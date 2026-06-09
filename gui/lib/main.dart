@@ -352,7 +352,8 @@ class GroupInfo {
 
   String get sidebarLabel => title.trim().isEmpty ? id : title;
   int get participantCount => members.length + 1;
-  String get memberSummary => participantCount == 1 ? '1 member' : '$participantCount members';
+  String get memberSummary =>
+      participantCount == 1 ? '1 member' : '$participantCount members';
   String get details => '$sidebarLabel\nid=$id\nmembers=${members.join(', ')}';
 }
 
@@ -411,6 +412,63 @@ class ParsedGroupPayload {
   final String groupId;
   final String title;
   final String body;
+}
+
+class AttachmentInfo {
+  const AttachmentInfo(
+      {required this.label, required this.path, required this.image});
+
+  final String label;
+  final String path;
+  final bool image;
+}
+
+AttachmentInfo? parseAttachmentText(String text) {
+  final trimmed = text.trim();
+  final received = RegExp(r'^\[file received: (.+)\]$').firstMatch(trimmed);
+  if (received != null) {
+    final path = received.group(1)!.trim();
+    return AttachmentInfo(
+      label: _basename(path),
+      path: path,
+      image: isImagePath(path),
+    );
+  }
+
+  final sent = RegExp(r'^\[file sent: (.+?) \((.+)\)\]$').firstMatch(trimmed);
+  if (sent != null) {
+    final pathOrName = sent.group(1)!.trim();
+    return AttachmentInfo(
+      label: _basename(pathOrName),
+      path: pathOrName,
+      image: isImagePath(pathOrName),
+    );
+  }
+
+  final offer = RegExp(r'^\[file offer\] (.+?) \(\d+ bytes, \d+ chunks\)$')
+      .firstMatch(trimmed);
+  if (offer != null) {
+    final name = offer.group(1)!.trim();
+    return AttachmentInfo(label: name, path: '', image: isImagePath(name));
+  }
+
+  return null;
+}
+
+bool isImagePath(String path) {
+  final lower = path.toLowerCase();
+  return lower.endsWith('.png') ||
+      lower.endsWith('.jpg') ||
+      lower.endsWith('.jpeg') ||
+      lower.endsWith('.gif') ||
+      lower.endsWith('.webp') ||
+      lower.endsWith('.bmp');
+}
+
+String _basename(String path) {
+  final normalized = path.replaceAll('\\', '/');
+  final idx = normalized.lastIndexOf('/');
+  return idx >= 0 ? normalized.substring(idx + 1) : normalized;
 }
 
 ParsedGroupPayload? parseGroupPayloadText(String text) {
@@ -498,15 +556,25 @@ List<String> groupCreateArgs({
   required String title,
   required List<String> members,
 }) {
-  final args = ['group', 'create', '--profile', profile, '--title', title.trim()];
-  for (final member in members.map((m) => m.trim()).where((m) => m.isNotEmpty)) {
+  final args = [
+    'group',
+    'create',
+    '--profile',
+    profile,
+    '--title',
+    title.trim()
+  ];
+  for (final member
+      in members.map((m) => m.trim()).where((m) => m.isNotEmpty)) {
     args.addAll(['--member', member]);
   }
   args.add('--json');
   return args;
 }
 
-List<String> groupDeleteArgs({required String profile, required String group}) => [
+List<String> groupDeleteArgs(
+        {required String profile, required String group}) =>
+    [
       'group',
       'delete',
       '--profile',
@@ -519,7 +587,8 @@ List<String> groupRenameArgs({
   required String profile,
   required String group,
   required String title,
-}) => [
+}) =>
+    [
       'group',
       'rename',
       '--profile',
@@ -536,7 +605,8 @@ List<String> groupMemberMutationArgs({
   required String action,
   required String group,
   required String member,
-}) => [
+}) =>
+    [
       'group',
       action,
       '--profile',
@@ -584,14 +654,16 @@ class _Cli {
     return p;
   }
 
-  bool identityConfigured() => File('${expandedProfilePath()}/identity.toml').existsSync();
+  bool identityConfigured() =>
+      File('${expandedProfilePath()}/identity.toml').existsSync();
 
   Future<String> initProfile(String name) =>
       _run(['init', '--profile', profile, '--name', name]);
 
   bool _ratchetActive(String contactName) {
     if (contactName.trim().isEmpty) return false;
-    return File('${expandedProfilePath()}/ratchet/$contactName.bin').existsSync();
+    return File('${expandedProfilePath()}/ratchet/$contactName.bin')
+        .existsSync();
   }
 
   Future<String> _run(List<String> args) async {
@@ -608,7 +680,8 @@ class _Cli {
   Future<String> identity() => _run(['identity', '--profile', profile]);
 
   Future<ShareInfo> share(String onion) async {
-    final raw = await _run(['share', '--profile', profile, '--onion', onion, '--json']);
+    final raw =
+        await _run(['share', '--profile', profile, '--onion', onion, '--json']);
     final decoded = jsonDecode(raw);
     if (decoded is! Map) {
       throw Exception('share JSON was not an object');
@@ -663,25 +736,38 @@ class _Cli {
   Future<String> deleteGroup(String group) =>
       _run(groupDeleteArgs(profile: profile, group: group));
 
-  List<String> groupLeaveArgs({required String profile, required String group}) => [
-        'group', 'leave', '--profile', profile, '--group', group,
+  List<String> groupLeaveArgs(
+          {required String profile, required String group}) =>
+      [
+        'group',
+        'leave',
+        '--profile',
+        profile,
+        '--group',
+        group,
       ];
 
   Future<String> leaveGroup(String group) =>
       _run(groupLeaveArgs(profile: profile, group: group));
 
-  Future<GroupInfo> renameGroup({required String group, required String title}) =>
+  Future<GroupInfo> renameGroup(
+          {required String group, required String title}) =>
       _parseGroupFromArgs(
           groupRenameArgs(profile: profile, group: group, title: title),
           context: 'group rename');
 
-  Future<GroupInfo> addGroupMember({required String group, required String member}) =>
+  Future<GroupInfo> addGroupMember(
+          {required String group, required String member}) =>
       _parseGroupFromArgs(
           groupMemberMutationArgs(
-              profile: profile, action: 'member-add', group: group, member: member),
+              profile: profile,
+              action: 'member-add',
+              group: group,
+              member: member),
           context: 'group member add');
 
-  Future<GroupInfo> removeGroupMember({required String group, required String member}) =>
+  Future<GroupInfo> removeGroupMember(
+          {required String group, required String member}) =>
       _parseGroupFromArgs(
           groupMemberMutationArgs(
               profile: profile,
@@ -762,11 +848,13 @@ class _Cli {
     required String title,
     required List<String> members,
   }) async {
-    final raw = await _run(groupCreateArgs(profile: profile, title: title, members: members));
+    final raw = await _run(
+        groupCreateArgs(profile: profile, title: title, members: members));
     return _parseGroup(raw, context: 'group create');
   }
 
-  Future<GroupInfo> _parseGroupFromArgs(List<String> args, {required String context}) async {
+  Future<GroupInfo> _parseGroupFromArgs(List<String> args,
+      {required String context}) async {
     final raw = await _run(args);
     return _parseGroup(raw, context: context);
   }
@@ -792,8 +880,16 @@ class _Cli {
     );
   }
 
-  Future<_History> history({String? contact, String? group, int limit = 80}) async {
-    final args = ['history', '--profile', profile, '--limit', '$limit', '--json'];
+  Future<_History> history(
+      {String? contact, String? group, int limit = 80}) async {
+    final args = [
+      'history',
+      '--profile',
+      profile,
+      '--limit',
+      '$limit',
+      '--json'
+    ];
     if (group != null && group.trim().isNotEmpty) {
       args.addAll(['--group', group.trim()]);
     } else if (contact != null && contact.trim().isNotEmpty) {
@@ -818,7 +914,9 @@ class _Cli {
         direction: item['direction'] as String,
         status: _statusLabel((item['status'] as num).toInt()),
         contact: item['contact'] as String,
-        group: conversationKind == 'group' ? (item['conversation_id'] as String?) ?? '' : '',
+        group: conversationKind == 'group'
+            ? (item['conversation_id'] as String?) ?? ''
+            : '',
         text: item['body'] as String,
         tsMs: (item['timestamp_ms'] as num).toInt(),
       );
@@ -843,7 +941,8 @@ class _Cli {
   }
 
   Future<void> send({required String to, required String message}) async {
-    await _run(['send', '--profile', profile, '--to', to, '--message', message]);
+    await _run(
+        ['send', '--profile', profile, '--to', to, '--message', message]);
   }
 }
 
@@ -874,7 +973,8 @@ class _QrPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _QrPainter oldDelegate) => oldDelegate.rows != rows;
+  bool shouldRepaint(covariant _QrPainter oldDelegate) =>
+      oldDelegate.rows != rows;
 }
 
 // ── screen ──────────────────────────────────────────────────────────────────
@@ -931,7 +1031,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     trayManager.addListener(this);
     _listenerLogFile = File('${_cli.expandedProfilePath()}/gui-listener.log');
     _initWindowListeners();
-    WidgetsBinding.instance.addPostFrameCallback((_) => unawaited(_bootstrap()));
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => unawaited(_bootstrap()));
   }
 
   void _initWindowListeners() {
@@ -985,8 +1086,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           ),
           actions: [
             FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, controller.text.trim()),
-              child: Text('Create profile'),
+              onPressed: () =>
+                  Navigator.pop(dialogContext, controller.text.trim()),
+              child: const Text('Create profile'),
             ),
           ],
         ),
@@ -1040,11 +1142,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final line = '[${DateTime.now().toIso8601String()}] $stream: $text\n';
     _listenerLogTail = (_listenerLogTail + line);
     if (_listenerLogTail.length > 4000) {
-      _listenerLogTail = _listenerLogTail.substring(_listenerLogTail.length - 4000);
+      _listenerLogTail =
+          _listenerLogTail.substring(_listenerLogTail.length - 4000);
     }
     try {
       await _listenerLogFile.parent.create(recursive: true);
-      await _listenerLogFile.writeAsString(line, mode: FileMode.append, flush: true);
+      await _listenerLogFile.writeAsString(line,
+          mode: FileMode.append, flush: true);
     } catch (_) {
       // The visible UI error matters more than failing to write diagnostics.
     }
@@ -1193,7 +1297,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     case 'error':
                       _error = decoded['message'] as String? ?? 'error';
                       if (!_isRecentSendTransient(lower)) {
-                        _listenerStatus = 'error: ${_error}';
+                        _listenerStatus = 'error: $_error';
                       }
                       break;
                     case 'sent':
@@ -1231,11 +1335,14 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           for (final line in lines) {
             if (line.startsWith('__sideband_resp__:')) {
               try {
-                final decoded = jsonDecode(
-                    line.substring('__sideband_resp__:'.length))
-                    as Map<String, dynamic>;
+                final decoded =
+                    jsonDecode(line.substring('__sideband_resp__:'.length))
+                        as Map<String, dynamic>;
                 final type = decoded['type'];
-                if (type == 'group_sent' || type == 'group_file_sent' || type == 'left' || type == 'deleted') {
+                if (type == 'group_sent' ||
+                    type == 'group_file_sent' ||
+                    type == 'left' ||
+                    type == 'deleted') {
                   unawaited(_refresh());
                 }
               } catch (_) {}
@@ -1320,10 +1427,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           ? Icons.lock_outline
           : Icons.edit_outlined;
 
-  Future<void> _sendViaListener({String? to, String? group, required String message}) async {
+  Future<void> _sendViaListener(
+      {String? to, String? group, required String message}) async {
     final listener = _listener;
     if (listener == null) {
-      throw Exception('listener control channel is not available; restart the GUI');
+      throw Exception(
+          'listener control channel is not available; restart the GUI');
     }
     listener.stdin.writeln(jsonEncode({
       'cmd': group == null ? 'send' : 'group_send',
@@ -1334,10 +1443,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     await listener.stdin.flush();
   }
 
-  Future<void> _sendFileViaListener({String? to, String? group, required String path}) async {
+  Future<void> _sendFileViaListener(
+      {String? to, String? group, required String path}) async {
     final listener = _listener;
     if (listener == null) {
-      throw Exception('listener control channel is not available; restart the GUI');
+      throw Exception(
+          'listener control channel is not available; restart the GUI');
     }
     listener.stdin.writeln(jsonEncode({
       'cmd': 'file',
@@ -1373,59 +1484,47 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   void _snack(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), duration: const Duration(seconds: 3)),
-    );
+    setState(() => _notificationText = msg);
+    _notificationTimer?.cancel();
+    _notificationTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _notificationText = null);
+    });
   }
 
   Future<String?> _pickFile(String target) async {
-    // Try kdialog first (KDE Plasma native), then zenity, then yad
-    for (final cmd in [
+    // Use the host desktop file chooser. Recreating a file browser here is how
+    // you get a worse file browser.
+    final choosers = <List<String>>[
       ['kdialog', '--getopenfilename', '--title', 'Send file to $target', '.'],
       ['zenity', '--file-selection', '--title=Send file to $target'],
       ['yad', '--file', '--title=Send file to $target'],
-    ]) {
+    ];
+
+    for (final cmd in choosers) {
       try {
-        final r = await Process.run(cmd[0], cmd.sublist(1))
-            .timeout(const Duration(seconds: 3));
-        if (r.exitCode == 0) {
-          final p = (r.stdout as String).trim();
-          if (p.isNotEmpty) {
-            // Validate file size
-            try {
-              final size = File(p).lengthSync();
-              if (size > 100 * 1024 * 1024) {
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                    content: Text('File too large (max 100 MB)'),
-                    duration: Duration(seconds: 3),
-                  ));
-                }
-                return null;
-              }
-            } catch (_) {}
-            return p;
+        final result = await Process.run(cmd[0], cmd.sublist(1))
+            .timeout(const Duration(minutes: 10));
+        if (result.exitCode != 0) continue;
+        final path = (result.stdout as String).trim();
+        if (path.isEmpty) return null;
+        try {
+          final size = File(path).lengthSync();
+          if (size > 100 * 1024 * 1024) {
+            _snack('File too large (max 100 MB)');
+            return null;
           }
-        }
-      } catch (_) {}
+        } catch (_) {}
+        return path;
+      } on TimeoutException {
+        _snack('File picker timed out');
+        return null;
+      } catch (_) {
+        // chooser not installed or failed; try the next native/default option
+      }
     }
-    // Fallback: in-app file browser as modal bottom sheet (same pattern as emoji picker)
-    if (!mounted) return null;
-    return showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: _t.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      isScrollControlled: true,
-      builder: (ctx) => SizedBox(
-        height: 400,
-        child: _FlutterFilePicker(
-          title: 'Send file to $target',
-          initialPath: Platform.environment['HOME'] ?? '/home',
-        ),
-      ),
-    );
+
+    _snack('No desktop file picker found. Install kdialog, zenity, or yad.');
+    return null;
   }
 
   Future<void> _load() async {
@@ -1452,7 +1551,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       } else {
         s = null;
       }
-      final h = await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((c) => c.name));
+      final h = await _historyVisibleFor(s?.name,
+          group: sg?.id, knownContacts: c.map((c) => c.name));
       final global = await _cli.history(limit: 200);
       // Startup bootstrap must mark the global transcript as already seen.
       // Seeding only the selected conversation makes old messages in other
@@ -1493,7 +1593,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       );
       return _History(
         msgs: merged,
-        maxId: merged.isEmpty ? null : merged.map((m) => m.id).reduce((a, b) => a > b ? a : b),
+        maxId: merged.isEmpty
+            ? null
+            : merged.map((m) => m.id).reduce((a, b) => a > b ? a : b),
         bin: filtered.bin,
       );
     }
@@ -1501,7 +1603,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final contactMsgs = visibleContactMessages(filtered.msgs);
     final visibleFiltered = _History(
       msgs: contactMsgs,
-      maxId: contactMsgs.isEmpty ? null : contactMsgs.map((m) => m.id).reduce((a, b) => a > b ? a : b),
+      maxId: contactMsgs.isEmpty
+          ? null
+          : contactMsgs.map((m) => m.id).reduce((a, b) => a > b ? a : b),
       bin: filtered.bin,
     );
 
@@ -1546,7 +1650,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         return;
       }
 
-      final h = await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((c) => c.name));
+      final h = await _historyVisibleFor(s?.name,
+          group: sg?.id, knownContacts: c.map((c) => c.name));
       await _checkUnread();
       setState(() {
         _msgs = _mergePending(h.msgs);
@@ -1605,8 +1710,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     if (msgs.length == 1) {
       final m = msgs.first;
       final sender = m.contact.isNotEmpty ? m.contact : 'Unknown';
-      final groupName =
-          m.group.isNotEmpty ? _groupNameForId(m.group) : '';
+      final groupName = m.group.isNotEmpty ? _groupNameForId(m.group) : '';
       final prefix = groupName.isNotEmpty ? ' in $groupName' : '';
       final preview =
           m.text.length > 80 ? '${m.text.substring(0, 80)}…' : m.text;
@@ -1640,7 +1744,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     try {
       // Use a simple ALSA/PulseAudio beep via paplay and a temp WAV.
       // Generate a short sine beep if no default sound is available.
-      await Process.run('paplay', ['/usr/share/sounds/freedesktop/stereo/message-new-instant.oga']);
+      await Process.run('paplay',
+          ['/usr/share/sounds/freedesktop/stereo/message-new-instant.oga']);
     } catch (_) {
       // Sound is best-effort; never break the UI over a missing sound backend.
     }
@@ -1664,7 +1769,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   String _notificationIconPath() {
     try {
       final exeDir = File(Platform.resolvedExecutable).parent.path;
-      final bundled = File('$exeDir/data/flutter_assets/assets/icon_256x256.png');
+      final bundled =
+          File('$exeDir/data/flutter_assets/assets/icon_256x256.png');
       if (bundled.existsSync()) return bundled.path;
     } catch (_) {}
     final sourceTree = File('assets/icon_256x256.png');
@@ -1692,18 +1798,19 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           child: Row(
             children: [
-              Icon(Icons.mail_outline, color: Color(0xFF26D9C8), size: 18),
-              SizedBox(width: 10),
+              const Icon(Icons.mail_outline,
+                  color: Color(0xFF26D9C8), size: 18),
+              const SizedBox(width: 10),
               Expanded(
                 child: Text(
                   _notificationText!,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: Colors.white, fontSize: 13),
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
                 ),
               ),
-              SizedBox(width: 8),
-              Icon(Icons.close, color: Colors.white54, size: 16),
+              const SizedBox(width: 8),
+              const Icon(Icons.close, color: Colors.white54, size: 16),
             ],
           ),
         ),
@@ -1780,7 +1887,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: Text('Close'),
+            child: const Text('Close'),
           ),
         ],
       ),
@@ -1797,11 +1904,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, false),
-                child: Text('Cancel'),
+                child: const Text('Cancel'),
               ),
               FilledButton(
                 onPressed: () => Navigator.pop(context, true),
-                child: Text('Do it'),
+                child: const Text('Do it'),
               ),
             ],
           ),
@@ -1823,7 +1930,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               '/send <contact> <msg>\n/group-create <title> <member> [member...]\n/group-delete <id-or-title>\n/group-leave <id-or-title>\n/group-rename <id-or-title> <new-title>\n/group-add <id-or-title> <member>\n/group-remove <id-or-title> <member>\n/group <id-or-title> <msg>\n/file <filepath>\n/history [contact]\n/history-group <id-or-title>\n/contacts\n/groups\n/who — show members of selected group\n/add <name> <onion> <ed25519_pk> <x25519_pk>\n/delete <contact>\n/name [display-name]\n/whoami\n/share\n/onion\n/ratchet <contact>\n/status\n/clear\n/clearhistory [contact]\n/settings');
           return;
         case 'send':
-          if (parts.length < 3) throw Exception('usage: /send <contact> <message>');
+          if (parts.length < 3) {
+            throw Exception('usage: /send <contact> <message>');
+          }
           final contact = parts[1];
           final msg = raw.split(RegExp(r'\s+')).skip(2).join(' ');
           await _cli.send(to: contact, message: msg);
@@ -1831,7 +1940,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           return;
         case 'group-create':
           if (parts.length < 3) {
-            throw Exception('usage: /group-create <title> <member> [member...]');
+            throw Exception(
+                'usage: /group-create <title> <member> [member...]');
           }
           final group = await _cli.createGroup(
             title: parts[1],
@@ -1841,7 +1951,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _showInfo('Group created', group.details);
           return;
         case 'group-delete':
-          if (parts.length != 2) throw Exception('usage: /group-delete <id-or-title>');
+          if (parts.length != 2) {
+            throw Exception('usage: /group-delete <id-or-title>');
+          }
           _showInfo('Group deleted', await _cli.deleteGroup(parts[1]));
           await _load();
           if (_selGroup?.id == parts[1] || _selGroup?.title == parts[1]) {
@@ -1852,7 +1964,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           }
           return;
         case 'group-leave':
-          if (parts.length != 2) throw Exception('usage: /group-leave <id-or-title>');
+          if (parts.length != 2) {
+            throw Exception('usage: /group-leave <id-or-title>');
+          }
           _showInfo('Left group', await _cli.leaveGroup(parts[1]));
           await _load();
           if (_selGroup?.id == parts[1] || _selGroup?.title == parts[1]) {
@@ -1874,20 +1988,30 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _showInfo('Group renamed', group.details);
           return;
         case 'group-add':
-          if (parts.length != 3) throw Exception('usage: /group-add <id-or-title> <member>');
-          final added = await _cli.addGroupMember(group: parts[1], member: parts[2]);
+          if (parts.length != 3) {
+            throw Exception('usage: /group-add <id-or-title> <member>');
+          }
+          final added =
+              await _cli.addGroupMember(group: parts[1], member: parts[2]);
           await _load();
           _showInfo('Member added', added.details);
           return;
         case 'group-remove':
-          if (parts.length != 3) throw Exception('usage: /group-remove <id-or-title> <member>');
-          final removed = await _cli.removeGroupMember(group: parts[1], member: parts[2]);
+          if (parts.length != 3) {
+            throw Exception('usage: /group-remove <id-or-title> <member>');
+          }
+          final removed =
+              await _cli.removeGroupMember(group: parts[1], member: parts[2]);
           await _load();
           _showInfo('Member removed', removed.details);
           return;
         case 'group':
-          if (parts.length < 3) throw Exception('usage: /group <id-or-title> <message>');
-          await _sendViaListener(group: parts[1], message: raw.split(RegExp(r'\s+')).skip(2).join(' '));
+          if (parts.length < 3) {
+            throw Exception('usage: /group <id-or-title> <message>');
+          }
+          await _sendViaListener(
+              group: parts[1],
+              message: raw.split(RegExp(r'\s+')).skip(2).join(' '));
           await _refresh();
           return;
         case 'history':
@@ -1901,7 +2025,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               lines.isEmpty ? '(no messages)' : lines.join('\n'));
           return;
         case 'history-group':
-          if (parts.length < 2) throw Exception('usage: /history-group <id-or-title>');
+          if (parts.length < 2) {
+            throw Exception('usage: /history-group <id-or-title>');
+          }
           await _loadGroupHistory(parts[1]);
           return;
         case 'contacts':
@@ -1926,7 +2052,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         case 'who':
           final g = _selGroup;
           if (g == null) {
-            _showInfo('Who', 'No group selected — select a group from the sidebar first.');
+            _showInfo('Who',
+                'No group selected — select a group from the sidebar first.');
             return;
           }
           await _load();
@@ -1946,7 +2073,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           return;
         case 'add':
           if (parts.length < 5) {
-            throw Exception('usage: /add <name> <onion> <ed25519_pubkey_b64> <x25519_pubkey_b64>');
+            throw Exception(
+                'usage: /add <name> <onion> <ed25519_pubkey_b64> <x25519_pubkey_b64>');
           }
           await _cli.addContact(
             name: parts[1],
@@ -1984,9 +2112,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _showInfo('Share contact', '/add $name $onion $ed $x');
           return;
         case 'onion':
-          _showInfo('Onion', _listenerStatus.startsWith('listening ')
-              ? _listenerStatus.substring('listening '.length)
-              : '(waiting for Tor)');
+          _showInfo(
+              'Onion',
+              _listenerStatus.startsWith('listening ')
+                  ? _listenerStatus.substring('listening '.length)
+                  : '(waiting for Tor)');
           return;
         case 'ratchet':
           if (parts.length < 2) throw Exception('usage: /ratchet <contact>');
@@ -2003,16 +2133,20 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           return;
         case 'clearhistory':
           final contact = parts.length > 1 ? parts[1] : _sel?.name;
-          final clearTarget = contact == null ? 'all message history' : 'history for $contact';
+          final clearTarget =
+              contact == null ? 'all message history' : 'history for $contact';
           if (!await _confirm('Clear history', 'Delete $clearTarget?')) return;
-          _showInfo('History cleared', await _cli.clearHistory(contact: contact));
+          _showInfo(
+              'History cleared', await _cli.clearHistory(contact: contact));
           await _load();
           return;
         case 'settings':
           await _showSettings();
           return;
         case 'file':
-          if (parts.length < 2) throw Exception('usage: /file <filepath> — or use the 📎 button');
+          if (parts.length < 2) {
+            throw Exception('usage: /file <filepath> — or use the 📎 button');
+          }
           final path = parts.skip(1).join(' ');
           final target = _sel?.name ?? _selGroup?.title;
           if (target == null) throw Exception('no contact or group selected');
@@ -2026,7 +2160,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _scrollToBottom();
           return;
         case 'transfers':
-          throw Exception('/$cmd is not wired in the GUI yet. Backend support is TUI-only right now. Annoying, but honest.');
+          throw Exception(
+              '/$cmd is not wired in the GUI yet. Backend support is TUI-only right now. Annoying, but honest.');
         default:
           throw Exception('unknown command: /$cmd (try /help)');
       }
@@ -2061,17 +2196,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 TextField(
                     controller: name,
                     decoration: const InputDecoration(labelText: 'Name')),
-                SizedBox(height: 8),
+                const SizedBox(height: 8),
                 TextField(
                     controller: onion,
                     decoration:
                         const InputDecoration(labelText: 'Onion address')),
-                SizedBox(height: 8),
+                const SizedBox(height: 8),
                 TextField(
                     controller: pubkey,
                     decoration:
                         const InputDecoration(labelText: 'Ed25519 pubkey')),
-                SizedBox(height: 8),
+                const SizedBox(height: 8),
                 TextField(
                     controller: x25519,
                     decoration:
@@ -2082,7 +2217,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           actions: [
             TextButton(
                 onPressed: () => Navigator.pop(context, false),
-                child: Text('Cancel')),
+                child: const Text('Cancel')),
             FilledButton(
                 onPressed: () => Navigator.pop(context, true),
                 child: Text(editing ? 'Save' : 'Add')),
@@ -2139,9 +2274,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     controller: title,
                     decoration: const InputDecoration(labelText: 'Group title'),
                   ),
-                  SizedBox(height: 12),
-                  Text('Members', style: TextStyle(color: _t.textDim, fontSize: 12)),
-                  SizedBox(height: 6),
+                  const SizedBox(height: 12),
+                  Text('Members',
+                      style: TextStyle(color: _t.textDim, fontSize: 12)),
+                  const SizedBox(height: 6),
                   if (_contacts.isEmpty)
                     Text('No contacts yet. Add contacts first.',
                         style: TextStyle(color: _t.textDim, fontSize: 12))
@@ -2169,7 +2305,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                             .toList(),
                       ),
                     ),
-                  SizedBox(height: 8),
+                  const SizedBox(height: 8),
                   Text(
                     'Groups fan out one encrypted message per member. There is no shared group ratchet yet.',
                     style: TextStyle(color: _t.textDim, fontSize: 11),
@@ -2180,10 +2316,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             actions: [
               TextButton(
                   onPressed: () => Navigator.pop(context, false),
-                  child: Text('Cancel')),
+                  child: const Text('Cancel')),
               FilledButton(
                   onPressed: () => Navigator.pop(context, true),
-                  child: Text('Create')),
+                  child: const Text('Create')),
             ],
           ),
         ),
@@ -2243,7 +2379,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       return;
     }
     try {
-      _showInfo('History deleted', await _cli.clearHistory(contact: contact.name));
+      _showInfo(
+          'History deleted', await _cli.clearHistory(contact: contact.name));
       await _load();
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
@@ -2251,8 +2388,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<void> _clearGroupHistoryFor(GroupInfo group) async {
-    if (!await _confirm(
-        'Delete group history', 'Delete all message history for ${group.title}?')) {
+    if (!await _confirm('Delete group history',
+        'Delete all message history for ${group.title}?')) {
       return;
     }
     try {
@@ -2291,7 +2428,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         builder: (_) => StatefulBuilder(
           builder: (context, setDialogState) => AlertDialog(
             backgroundColor: _t.surface,
-            title: Text('Manage ${group.title}', style: TextStyle(color: _t.text)),
+            title:
+                Text('Manage ${group.title}', style: TextStyle(color: _t.text)),
             content: SizedBox(
               width: 520,
               child: Column(
@@ -2302,9 +2440,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     controller: title,
                     decoration: const InputDecoration(labelText: 'Group title'),
                   ),
-                  SizedBox(height: 12),
-                  Text('Members', style: TextStyle(color: _t.textDim, fontSize: 12)),
-                  SizedBox(height: 6),
+                  const SizedBox(height: 12),
+                  Text('Members',
+                      style: TextStyle(color: _t.textDim, fontSize: 12)),
+                  const SizedBox(height: 6),
                   ConstrainedBox(
                     constraints: const BoxConstraints(maxHeight: 260),
                     child: ListView(
@@ -2328,7 +2467,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                           .toList(),
                     ),
                   ),
-                  SizedBox(height: 8),
+                  const SizedBox(height: 8),
                   Text(
                     'Membership changes affect local fan-out for future sends. They do not delete old messages or enforce remote removals.',
                     style: TextStyle(color: _t.textDim, fontSize: 11),
@@ -2339,10 +2478,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             actions: [
               TextButton(
                   onPressed: () => Navigator.pop(context, false),
-                  child: Text('Cancel')),
+                  child: const Text('Cancel')),
               FilledButton(
                   onPressed: () => Navigator.pop(context, true),
-                  child: Text('Save')),
+                  child: const Text('Save')),
             ],
           ),
         ),
@@ -2381,8 +2520,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Future<void> _showGroupMenu(GroupInfo group, Offset position) async {
     final action = await showMenu<String>(
       context: context,
-      position:
-          RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
+      position: RelativeRect.fromLTRB(
+          position.dx, position.dy, position.dx, position.dy),
       color: _t.surface,
       items: const [
         PopupMenuItem(value: 'history', child: Text('Show history')),
@@ -2444,8 +2583,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Future<void> _showContactMenu(Contact contact, Offset position) async {
     final action = await showMenu<String>(
       context: context,
-      position:
-          RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
+      position: RelativeRect.fromLTRB(
+          position.dx, position.dy, position.dx, position.dy),
       color: _t.surface,
       items: const [
         PopupMenuItem(value: 'history', child: Text('Show history')),
@@ -2480,11 +2619,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Future<void> _changeDisplayName() async {
     final current = await _cli.name();
+    if (!mounted) return;
     final controller = TextEditingController(text: current.trim());
     try {
       final ok = await showDialog<bool>(
         context: context,
-        builder: (_) => AlertDialog(
+        builder: (dialogContext) => AlertDialog(
           backgroundColor: _t.surface,
           title: Text('Display name', style: TextStyle(color: _t.text)),
           content: TextField(
@@ -2493,16 +2633,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           ),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: Text('Cancel')),
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel')),
             FilledButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: Text('Save')),
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('Save')),
           ],
         ),
       );
       if (ok == true) {
-        _showInfo('Name', await _cli.name(controller.text.trim()));
+        final result = await _cli.name(controller.text.trim());
+        if (mounted) _showInfo('Name', result);
       }
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
@@ -2531,7 +2672,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       if (!mounted) return;
       await showDialog<void>(
         context: context,
-        builder: (_) => AlertDialog(
+        builder: (dialogContext) => AlertDialog(
           backgroundColor: _t.surface,
           title: Text('Share contact', style: TextStyle(color: _t.text)),
           content: SizedBox(
@@ -2551,13 +2692,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     child: CustomPaint(painter: _QrPainter(share.qr)),
                   ),
                 ),
-                SizedBox(height: 16),
+                const SizedBox(height: 16),
                 Text(
                   'Scan this QR code to add this contact, or copy the command below.',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: _t.textDim),
                 ),
-                SizedBox(height: 12),
+                const SizedBox(height: 12),
                 SelectableText(
                   share.command,
                   style: TextStyle(
@@ -2571,16 +2712,19 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           ),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: Text('Close'),
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Close'),
             ),
             FilledButton.icon(
-              icon: Icon(Icons.copy, size: 16),
-              label: Text('Copy'),
+              icon: const Icon(Icons.copy, size: 16),
+              label: const Text('Copy'),
               onPressed: () async {
                 await Clipboard.setData(ClipboardData(text: share.command));
-                if (context.mounted) Navigator.pop(context);
-                _showInfo('Share contact', '${share.command}\n\nCopied to clipboard.');
+                if (dialogContext.mounted) Navigator.pop(dialogContext);
+                if (mounted) {
+                  _showInfo('Share contact',
+                      '${share.command}\n\nCopied to clipboard.');
+                }
               },
             ),
           ],
@@ -2592,7 +2736,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<void> _clearAllHistory() async {
-    if (!await _confirm('Delete all history', 'Delete all message history?')) return;
+    if (!await _confirm('Delete all history', 'Delete all message history?')) {
+      return;
+    }
     try {
       _showInfo('History deleted', await _cli.clearHistory());
       await _load();
@@ -2615,9 +2761,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   SwitchListTile(
-                    secondary: Icon(Icons.notifications_active_outlined),
-                    title: Text('Desktop notifications'),
-                    subtitle: Text('System notification daemon popups'),
+                    secondary: const Icon(Icons.notifications_active_outlined),
+                    title: const Text('Desktop notifications'),
+                    subtitle: const Text('System notification daemon popups'),
                     value: _showSystemNotifications,
                     onChanged: (value) {
                       setState(() => _showSystemNotifications = value);
@@ -2625,9 +2771,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     },
                   ),
                   SwitchListTile(
-                    secondary: Icon(Icons.mark_unread_chat_alt_outlined),
-                    title: Text('In-app notification banner'),
-                    subtitle: Text('Show the top banner inside Sideband'),
+                    secondary: const Icon(Icons.mark_unread_chat_alt_outlined),
+                    title: const Text('In-app notification banner'),
+                    subtitle: const Text('Show the top banner inside Sideband'),
                     value: _showInAppNotifications,
                     onChanged: (value) {
                       setState(() => _showInAppNotifications = value);
@@ -2635,9 +2781,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     },
                   ),
                   SwitchListTile(
-                    secondary: Icon(Icons.volume_up_outlined),
-                    title: Text('Notification sound'),
-                    subtitle: Text('Play a sound on new messages'),
+                    secondary: const Icon(Icons.volume_up_outlined),
+                    title: const Text('Notification sound'),
+                    subtitle: const Text('Play a sound on new messages'),
                     value: _showAudibleNotifications,
                     onChanged: (value) {
                       setState(() => _showAudibleNotifications = value);
@@ -2645,8 +2791,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     },
                   ),
                   ListTile(
-                    leading: Icon(Icons.palette_outlined),
-                    title: Text('Theme'),
+                    leading: const Icon(Icons.palette_outlined),
+                    title: const Text('Theme'),
                     subtitle: Text(_selectedTheme),
                     onTap: () async {
                       Navigator.pop(dialogContext);
@@ -2655,9 +2801,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   ),
                   const Divider(height: 20),
                   ListTile(
-                    leading: Icon(Icons.open_in_full),
-                    title: Text('Show Sideband'),
-                    subtitle: Text('Restore and focus the app window'),
+                    leading: const Icon(Icons.open_in_full),
+                    title: const Text('Show Sideband'),
+                    subtitle: const Text('Restore and focus the app window'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_showWindow());
@@ -2666,7 +2812,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   SwitchListTile(
                     secondary: const Icon(Icons.vertical_align_bottom),
                     title: const Text('Minimize to tray'),
-                    subtitle: const Text('Minimize button sends to system tray'),
+                    subtitle:
+                        const Text('Minimize button sends to system tray'),
                     value: _minimizeToTrayEnabled,
                     onChanged: (value) {
                       setState(() => _minimizeToTrayEnabled = value);
@@ -2675,35 +2822,36 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   ),
                   const Divider(height: 20),
                   ListTile(
-                    leading: Icon(Icons.badge_outlined),
-                    title: Text('Display name'),
-                    subtitle: Text('Set the name shared with contacts'),
+                    leading: const Icon(Icons.badge_outlined),
+                    title: const Text('Display name'),
+                    subtitle: const Text('Set the name shared with contacts'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_changeDisplayName());
                     },
                   ),
                   ListTile(
-                    leading: Icon(Icons.person_add_alt_1),
-                    title: Text('Add contact'),
-                    subtitle: Text('Paste a shared /add command by hand'),
+                    leading: const Icon(Icons.person_add_alt_1),
+                    title: const Text('Add contact'),
+                    subtitle: const Text('Paste a shared /add command by hand'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_showAddContactDialog());
                     },
                   ),
                   ListTile(
-                    leading: Icon(Icons.group_add),
-                    title: Text('Create group'),
-                    subtitle: Text('Pick contacts and make a local fan-out group'),
+                    leading: const Icon(Icons.group_add),
+                    title: const Text('Create group'),
+                    subtitle: const Text(
+                        'Pick contacts and make a local fan-out group'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_showCreateGroupDialog());
                     },
                   ),
                   ListTile(
-                    leading: Icon(Icons.ios_share),
-                    title: Text('Share my contact'),
+                    leading: const Icon(Icons.ios_share),
+                    title: const Text('Share my contact'),
                     subtitle: Text(_listenerStatus),
                     onTap: () {
                       Navigator.pop(dialogContext);
@@ -2711,27 +2859,28 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     },
                   ),
                   ListTile(
-                    leading: Icon(Icons.fingerprint),
-                    title: Text('Show identity'),
-                    subtitle: Text('Public keys and profile identity'),
+                    leading: const Icon(Icons.fingerprint),
+                    title: const Text('Show identity'),
+                    subtitle: const Text('Public keys and profile identity'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_runSlashCommand('/whoami'));
                     },
                   ),
                   ListTile(
-                    leading: Icon(Icons.info_outline),
-                    title: Text('Runtime status'),
-                    subtitle: Text('${_cli.profile} • ${_contacts.length} contacts'),
+                    leading: const Icon(Icons.info_outline),
+                    title: const Text('Runtime status'),
+                    subtitle:
+                        Text('${_cli.profile} • ${_contacts.length} contacts'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_runSlashCommand('/status'));
                     },
                   ),
                   ListTile(
-                    leading: Icon(Icons.delete_sweep_outlined),
-                    title: Text('Delete all history'),
-                    subtitle: Text('Contacts stay. Messages go away.'),
+                    leading: const Icon(Icons.delete_sweep_outlined),
+                    title: const Text('Delete all history'),
+                    subtitle: const Text('Contacts stay. Messages go away.'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_clearAllHistory());
@@ -2739,9 +2888,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   ),
                   if (!_listenerRunning)
                     ListTile(
-                      leading: Icon(Icons.power_settings_new),
-                      title: Text('Start listener'),
-                      subtitle: Text('Bring the onion service back up'),
+                      leading: const Icon(Icons.power_settings_new),
+                      title: const Text('Start listener'),
+                      subtitle: const Text('Bring the onion service back up'),
                       onTap: () {
                         Navigator.pop(dialogContext);
                         unawaited(_startListener());
@@ -2754,7 +2903,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogContext),
-              child: Text('Close'),
+              child: const Text('Close'),
             ),
           ],
         ),
@@ -2790,7 +2939,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
-            child: Text('Cancel'),
+            child: const Text('Cancel'),
           ),
         ],
       ),
@@ -2828,7 +2977,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                           child: CircularProgressIndicator(
                               strokeWidth: 2.5, color: _t.primary),
                         ),
-                        SizedBox(height: 16),
+                        const SizedBox(height: 16),
                         Text('Connecting…',
                             style: Theme.of(context)
                                 .textTheme
@@ -2840,14 +2989,19 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 }
 
                 if (constraints.maxWidth < 720) {
-                  return _sel == null && _selGroup == null ? _emptyChat() : _chat();
+                  return _sel == null && _selGroup == null
+                      ? _emptyChat()
+                      : _chat();
                 }
 
                 return Row(
                   children: [
                     SizedBox(width: 320, child: _sidebar()),
                     Container(width: 1, color: _t.border),
-                    Expanded(child: _sel == null && _selGroup == null ? _emptyChat() : _chat()),
+                    Expanded(
+                        child: _sel == null && _selGroup == null
+                            ? _emptyChat()
+                            : _chat()),
                   ],
                 );
               },
@@ -2888,12 +3042,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   width: 34,
                   child: IconButton(
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    constraints:
+                        const BoxConstraints.tightFor(width: 34, height: 34),
                     style: IconButton.styleFrom(
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
-                    icon: Icon(Icons.person_add_alt_1, size: 19),
+                    icon: const Icon(Icons.person_add_alt_1, size: 19),
                     onPressed: _showAddContactDialog,
                     tooltip: 'Add contact',
                   ),
@@ -2902,12 +3057,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   width: 34,
                   child: IconButton(
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    constraints:
+                        const BoxConstraints.tightFor(width: 34, height: 34),
                     style: IconButton.styleFrom(
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
-                    icon: Icon(Icons.group_add, size: 19),
+                    icon: const Icon(Icons.group_add, size: 19),
                     onPressed: _showCreateGroupDialog,
                     tooltip: 'Create group',
                   ),
@@ -2916,12 +3072,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   width: 34,
                   child: IconButton(
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    constraints:
+                        const BoxConstraints.tightFor(width: 34, height: 34),
                     style: IconButton.styleFrom(
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
-                    icon: Icon(Icons.qr_code, size: 19),
+                    icon: const Icon(Icons.qr_code, size: 19),
                     onPressed: _showShareDialog,
                     tooltip: 'Share contact',
                   ),
@@ -2930,12 +3087,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   width: 34,
                   child: IconButton(
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    constraints:
+                        const BoxConstraints.tightFor(width: 34, height: 34),
                     style: IconButton.styleFrom(
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
-                    icon: Icon(Icons.settings, size: 19),
+                    icon: const Icon(Icons.settings, size: 19),
                     onPressed: _showSettings,
                     tooltip: 'Settings',
                   ),
@@ -2944,12 +3102,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   width: 34,
                   child: IconButton(
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+                    constraints:
+                        const BoxConstraints.tightFor(width: 34, height: 34),
                     style: IconButton.styleFrom(
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
-                    icon: Icon(Icons.refresh, size: 19),
+                    icon: const Icon(Icons.refresh, size: 19),
                     onPressed: _load,
                     tooltip: 'Refresh',
                   ),
@@ -2974,214 +3133,224 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                         ),
                       )
                     : ListView.builder(
-                    padding: const EdgeInsets.symmetric(horizontal: 6),
-                    itemCount: _contacts.length + (_groups.isEmpty ? 0 : _groups.length + 1),
-                    itemBuilder: (_, i) {
-                      if (i >= _contacts.length) {
-                        if (i == _contacts.length) {
-                          return Padding(
-                            padding: EdgeInsets.fromLTRB(14, 14, 14, 6),
-                            child: Text('Groups',
-                                style: TextStyle(
-                                    color: _t.primary,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w700)),
-                          );
-                        }
-                        final g = _groups[i - _contacts.length - 1];
-                        return GestureDetector(
-                          onSecondaryTapDown: (details) =>
-                              _showGroupMenu(g, details.globalPosition),
-                          child: ListTile(
-                          leading: CircleAvatar(
-                            radius: 17,
-                            backgroundColor: _t.surface2,
-                            child: Icon(Icons.groups, size: 17, color: _t.primary),
-                          ),
-                          title: Text(g.sidebarLabel,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                  fontSize: 13.5,
-                                  fontWeight: FontWeight.w500,
-                                  color: _t.text)),
-                          subtitle: Text(g.memberSummary,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 10.5, color: _t.textDim)),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (_unreadGroups.contains(g.id)) _unreadDot(),
-                              PopupMenuButton<String>(
-                                icon: Icon(Icons.more_vert, size: 17),
-                                tooltip: 'Group menu',
-                                color: _t.surface,
-                                onSelected: (action) async =>
-                                    _handleGroupAction(g, action),
-                                itemBuilder: (_) => const [
-                                  PopupMenuItem(
-                                      value: 'history',
-                                      child: Text('Show history')),
-                                  PopupMenuItem(
-                                      value: 'clear-history',
-                                      child: Text('Delete history')),
-                                  PopupMenuDivider(),
-                                  PopupMenuItem(
-                                      value: 'edit',
-                                      child: Text('Manage group')),
-                                  PopupMenuItem(
-                                      value: 'delete',
-                                      child: Text('Delete group')),
-                                  PopupMenuDivider(),
-                                  PopupMenuItem(
-                                      value: 'details',
-                                      child: Text('Group details')),
-                                ],
-                              ),
-                            ],
-                          ),
-                          selected: _selGroup?.id == g.id,
-                          onTap: () async {
-                            final h = await _historyVisibleFor(null, group: g.id);
-                            setState(() {
-                              _sel = null;
-                              _selGroup = g;
-                              _msgs = _mergePending(h.msgs);
-                              _unreadGroups.remove(g.id);
-                            });
-                            _scrollToBottom();
-                          },
-                          ),
-                        );
-                      }
-                      final c = _contacts[i];
-                      final on = _sel?.name == c.name;
-                      return GestureDetector(
-                        onSecondaryTapDown: (details) =>
-                            _showContactMenu(c, details.globalPosition),
-                        child: ListTile(
-                          selected: on,
-                          leading: CircleAvatar(
-                            radius: 17,
-                            backgroundColor: c.avatarColor,
-                            child: Text(c.initial,
-                                style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w700)),
-                          ),
-                          title: Row(
-                            children: [
-                              Expanded(
-                                child: Text(c.name,
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        itemCount: _contacts.length +
+                            (_groups.isEmpty ? 0 : _groups.length + 1),
+                        itemBuilder: (_, i) {
+                          if (i >= _contacts.length) {
+                            if (i == _contacts.length) {
+                              return Padding(
+                                padding:
+                                    const EdgeInsets.fromLTRB(14, 14, 14, 6),
+                                child: Text('Groups',
+                                    style: TextStyle(
+                                        color: _t.primary,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w700)),
+                              );
+                            }
+                            final g = _groups[i - _contacts.length - 1];
+                            return GestureDetector(
+                              onSecondaryTapDown: (details) =>
+                                  _showGroupMenu(g, details.globalPosition),
+                              child: ListTile(
+                                leading: CircleAvatar(
+                                  radius: 17,
+                                  backgroundColor: _t.surface2,
+                                  child: Icon(Icons.groups,
+                                      size: 17, color: _t.primary),
+                                ),
+                                title: Text(g.sidebarLabel,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
                                     style: TextStyle(
-                                      fontSize: 13.5,
-                                      fontWeight:
-                                          on ? FontWeight.w600 : FontWeight.w500,
-                                      color: on ? _t.primary : _t.text,
-                                    )),
+                                        fontSize: 13.5,
+                                        fontWeight: FontWeight.w500,
+                                        color: _t.text)),
+                                subtitle: Text(g.memberSummary,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                        fontSize: 10.5, color: _t.textDim)),
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (_unreadGroups.contains(g.id))
+                                      _unreadDot(),
+                                    PopupMenuButton<String>(
+                                      icon:
+                                          const Icon(Icons.more_vert, size: 17),
+                                      tooltip: 'Group menu',
+                                      color: _t.surface,
+                                      onSelected: (action) async =>
+                                          _handleGroupAction(g, action),
+                                      itemBuilder: (_) => const [
+                                        PopupMenuItem(
+                                            value: 'history',
+                                            child: Text('Show history')),
+                                        PopupMenuItem(
+                                            value: 'clear-history',
+                                            child: Text('Delete history')),
+                                        PopupMenuDivider(),
+                                        PopupMenuItem(
+                                            value: 'edit',
+                                            child: Text('Manage group')),
+                                        PopupMenuItem(
+                                            value: 'delete',
+                                            child: Text('Delete group')),
+                                        PopupMenuDivider(),
+                                        PopupMenuItem(
+                                            value: 'details',
+                                            child: Text('Group details')),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                                selected: _selGroup?.id == g.id,
+                                onTap: () async {
+                                  final h = await _historyVisibleFor(null,
+                                      group: g.id);
+                                  setState(() {
+                                    _sel = null;
+                                    _selGroup = g;
+                                    _msgs = _mergePending(h.msgs);
+                                    _unreadGroups.remove(g.id);
+                                  });
+                                  _scrollToBottom();
+                                },
                               ),
-                              SizedBox(width: 6),
-                              Tooltip(
-                                message: c.securityDescription,
-                                child: Icon(_securityIcon(c),
-                                    size: 13, color: _securityColor(c)),
+                            );
+                          }
+                          final c = _contacts[i];
+                          final on = _sel?.name == c.name;
+                          return GestureDetector(
+                            onSecondaryTapDown: (details) =>
+                                _showContactMenu(c, details.globalPosition),
+                            child: ListTile(
+                              selected: on,
+                              leading: CircleAvatar(
+                                radius: 17,
+                                backgroundColor: c.avatarColor,
+                                child: Text(c.initial,
+                                    style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w700)),
                               ),
-                            ],
-                          ),
-                          subtitle: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                c.shortOnion,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(fontSize: 10.5, color: _t.textDim),
-                              ),
-                              SizedBox(height: 1),
-                              Row(
+                              title: Row(
                                 children: [
-                                  Icon(_securityIcon(c),
-                                      size: 9, color: _securityColor(c)),
-                                  SizedBox(width: 3),
                                   Expanded(
-                                    child: Text(c.securityLabel,
+                                    child: Text(c.name,
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
                                         style: TextStyle(
-                                            fontSize: 10,
-                                            color: _securityColor(c))),
+                                          fontSize: 13.5,
+                                          fontWeight: on
+                                              ? FontWeight.w600
+                                              : FontWeight.w500,
+                                          color: on ? _t.primary : _t.text,
+                                        )),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Tooltip(
+                                    message: c.securityDescription,
+                                    child: Icon(_securityIcon(c),
+                                        size: 13, color: _securityColor(c)),
                                   ),
                                 ],
                               ),
-                            ],
-                          ),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (_unreadContacts.contains(c.name)) _unreadDot(),
-                              PopupMenuButton<String>(
-                                tooltip: 'Contact menu',
-                                icon: Icon(Icons.more_vert, size: 17),
-                                color: _t.surface,
-                                onSelected: (action) async {
-                                  switch (action) {
-                                    case 'history':
-                                      await _runSlashCommand(
-                                          '/history ${c.name}');
-                                      return;
-                                    case 'clear-history':
-                                      await _clearHistoryFor(c);
-                                      return;
-                                    case 'edit':
-                                      await _showEditContactDialog(c);
-                                      return;
-                                    case 'delete':
-                                      await _deleteContact(c);
-                                      return;
-                                    case 'details':
-                                      _showInfo('Contact details',
-                                          '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
-                                      return;
-                                  }
-                                },
-                                itemBuilder: (_) => const [
-                                  PopupMenuItem(
-                                      value: 'history',
-                                      child: Text('Show history')),
-                                  PopupMenuItem(
-                                      value: 'clear-history',
-                                      child: Text('Delete history')),
-                                  PopupMenuDivider(),
-                                  PopupMenuItem(
-                                      value: 'edit',
-                                      child: Text('Edit contact')),
-                                  PopupMenuItem(
-                                      value: 'delete',
-                                      child: Text('Delete contact')),
-                                  PopupMenuDivider(),
-                                  PopupMenuItem(
-                                      value: 'details',
-                                      child: Text('Contact details')),
+                              subtitle: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    c.shortOnion,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                        fontSize: 10.5, color: _t.textDim),
+                                  ),
+                                  const SizedBox(height: 1),
+                                  Row(
+                                    children: [
+                                      Icon(_securityIcon(c),
+                                          size: 9, color: _securityColor(c)),
+                                      const SizedBox(width: 3),
+                                      Expanded(
+                                        child: Text(c.securityLabel,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                                fontSize: 10,
+                                                color: _securityColor(c))),
+                                      ),
+                                    ],
+                                  ),
                                 ],
                               ),
-                            ],
-                          ),
-                          onTap: () async {
-                            setState(() {
-                              _sel = c;
-                              _selGroup = null;
-                              _unreadContacts.remove(c.name);
-                            });
-                            await _refresh();
-                          },
-                        ),
-                      );
-                    },
-                  ),
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (_unreadContacts.contains(c.name))
+                                    _unreadDot(),
+                                  PopupMenuButton<String>(
+                                    tooltip: 'Contact menu',
+                                    icon: const Icon(Icons.more_vert, size: 17),
+                                    color: _t.surface,
+                                    onSelected: (action) async {
+                                      switch (action) {
+                                        case 'history':
+                                          await _runSlashCommand(
+                                              '/history ${c.name}');
+                                          return;
+                                        case 'clear-history':
+                                          await _clearHistoryFor(c);
+                                          return;
+                                        case 'edit':
+                                          await _showEditContactDialog(c);
+                                          return;
+                                        case 'delete':
+                                          await _deleteContact(c);
+                                          return;
+                                        case 'details':
+                                          _showInfo('Contact details',
+                                              '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
+                                          return;
+                                      }
+                                    },
+                                    itemBuilder: (_) => const [
+                                      PopupMenuItem(
+                                          value: 'history',
+                                          child: Text('Show history')),
+                                      PopupMenuItem(
+                                          value: 'clear-history',
+                                          child: Text('Delete history')),
+                                      PopupMenuDivider(),
+                                      PopupMenuItem(
+                                          value: 'edit',
+                                          child: Text('Edit contact')),
+                                      PopupMenuItem(
+                                          value: 'delete',
+                                          child: Text('Delete contact')),
+                                      PopupMenuDivider(),
+                                      PopupMenuItem(
+                                          value: 'details',
+                                          child: Text('Contact details')),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                              onTap: () async {
+                                setState(() {
+                                  _sel = c;
+                                  _selGroup = null;
+                                  _unreadContacts.remove(c.name);
+                                });
+                                await _refresh();
+                              },
+                            ),
+                          );
+                        },
+                      ),
           ),
           // footer
           Container(
@@ -3198,7 +3367,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       color: _listenerRunning ? _t.primary : _t.errorFg,
                       shape: BoxShape.circle),
                 ),
-                SizedBox(width: 6),
+                const SizedBox(width: 6),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -3223,7 +3392,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 ),
                 if (!_listenerRunning)
                   IconButton(
-                    icon: Icon(Icons.power_settings_new, size: 16),
+                    icon: const Icon(Icons.power_settings_new, size: 16),
                     tooltip: 'Start listener',
                     onPressed: _startListener,
                   ),
@@ -3255,7 +3424,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             Row(
               children: [
                 Icon(Icons.warning_amber_rounded, size: 16, color: _t.errorFg),
-                SizedBox(width: 6),
+                const SizedBox(width: 6),
                 Text('Backend error',
                     style: TextStyle(
                         color: _t.errorFg,
@@ -3263,13 +3432,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                         fontWeight: FontWeight.w700)),
               ],
             ),
-            SizedBox(height: 8),
+            const SizedBox(height: 8),
             Text(_error!, style: TextStyle(color: _t.errorFg, fontSize: 11.5)),
-            SizedBox(height: 12),
+            const SizedBox(height: 12),
             OutlinedButton.icon(
               onPressed: _load,
-              icon: Icon(Icons.refresh, size: 14),
-              label: Text('Retry'),
+              icon: const Icon(Icons.refresh, size: 14),
+              label: const Text('Retry'),
             ),
           ],
         ),
@@ -3287,11 +3456,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.send_rounded, size: 42, color: _t.textDim.withAlpha(50)),
-                  SizedBox(height: 14),
+                  Icon(Icons.send_rounded,
+                      size: 42, color: _t.textDim.withAlpha(50)),
+                  const SizedBox(height: 14),
                   Text('No conversation selected',
                       style: TextStyle(color: _t.textDim, fontSize: 14)),
-                  SizedBox(height: 6),
+                  const SizedBox(height: 6),
                   Text('Use slash commands below, for example /add or /help.',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: _t.textDim, fontSize: 12)),
@@ -3338,12 +3508,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             radius: 16,
             backgroundColor: c?.avatarColor ?? _t.primary.withAlpha(110),
             child: Text(c?.initial ?? 'G',
-                style: TextStyle(
+                style: const TextStyle(
                     color: Colors.white,
                     fontSize: 11,
                     fontWeight: FontWeight.w700)),
           ),
-          SizedBox(width: 10),
+          const SizedBox(width: 10),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -3353,16 +3523,21 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                         color: _t.text,
                         fontSize: 14.5,
                         fontWeight: FontWeight.w700)),
-                SizedBox(height: 1),
+                const SizedBox(height: 1),
                 Tooltip(
-                  message: c?.securityDescription ?? 'Group messages are sent separately to each member using their contact crypto.',
+                  message: c?.securityDescription ??
+                      'Group messages are sent separately to each member using their contact crypto.',
                   child: Row(
                     children: [
-                      Icon(c == null ? Icons.groups_rounded : _securityIcon(c), size: 11, color: c == null ? _t.primary : _securityColor(c)),
-                      SizedBox(width: 4),
+                      Icon(c == null ? Icons.groups_rounded : _securityIcon(c),
+                          size: 11,
+                          color: c == null ? _t.primary : _securityColor(c)),
+                      const SizedBox(width: 4),
                       Text(subtitle,
                           style: TextStyle(
-                              fontSize: 10.5, color: c == null ? _t.primary : _securityColor(c))),
+                              fontSize: 10.5,
+                              color:
+                                  c == null ? _t.primary : _securityColor(c))),
                     ],
                   ),
                 ),
@@ -3370,17 +3545,19 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             ),
           ),
           IconButton(
-            icon: Icon(Icons.history, size: 18),
+            icon: const Icon(Icons.history, size: 18),
             tooltip: 'History',
             onPressed: () => c == null
                 ? _runSlashCommand('/history-group ${g!.id}')
                 : _runSlashCommand('/history ${c.name}'),
           ),
           IconButton(
-            icon: Icon(Icons.delete_sweep_outlined, size: 18),
+            icon: const Icon(Icons.delete_sweep_outlined, size: 18),
             tooltip: 'Delete history',
             onPressed: c == null
-                ? (_selGroup == null ? null : () => _clearGroupHistoryFor(_selGroup!))
+                ? (_selGroup == null
+                    ? null
+                    : () => _clearGroupHistoryFor(_selGroup!))
                 : () => _clearHistoryFor(c),
           ),
           Tooltip(
@@ -3409,7 +3586,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         child: Row(
           children: [
             Icon(Icons.error_outline, size: 14, color: _t.errorFg),
-            SizedBox(width: 6),
+            const SizedBox(width: 6),
             Expanded(
               child: Text(_error!,
                   style: TextStyle(color: _t.errorFg, fontSize: 11.5)),
@@ -3442,7 +3619,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           children: [
             if (showDate) _dateLabel(m.ts),
             _bubble(m),
-            SizedBox(height: 3),
+            const SizedBox(height: 3),
           ],
         );
       },
@@ -3481,6 +3658,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final right = m.out;
     final showGroupSender = _selGroup != null;
     final displayText = _displayText(m);
+    final attachment = parseAttachmentText(displayText);
     return Align(
       alignment: right ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -3496,6 +3674,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             bottomLeft: Radius.circular(right ? 14 : 3),
             bottomRight: Radius.circular(right ? 3 : 14),
           ),
+          border: attachment != null
+              ? Border.all(color: _t.primary.withAlpha(70))
+              : null,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -3506,12 +3687,14 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       color: right ? _t.primary : _t.textDim,
                       fontSize: 11,
                       fontWeight: FontWeight.w700)),
-              SizedBox(height: 3),
+              const SizedBox(height: 3),
             ],
-            Text(displayText,
-                style:
-                    TextStyle(color: _t.text, fontSize: 14, height: 1.35)),
-            SizedBox(height: 3),
+            if (attachment == null)
+              SelectableText(displayText,
+                  style: TextStyle(color: _t.text, fontSize: 14, height: 1.35))
+            else
+              _attachmentBubble(attachment),
+            const SizedBox(height: 3),
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -3519,12 +3702,126 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     style: TextStyle(
                         fontSize: 10, color: _t.textDim.withAlpha(153))),
                 if (right) ...[
-                  SizedBox(width: 4),
+                  const SizedBox(width: 4),
                   _statusIcon(m),
                 ],
               ],
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _attachmentBubble(AttachmentInfo attachment) {
+    final path = attachment.path;
+    final canOpen = path.isNotEmpty && File(path).existsSync();
+    final preview = attachment.image && canOpen;
+    return InkWell(
+      onTap: canOpen ? () => _showAttachment(attachment) : null,
+      borderRadius: BorderRadius.circular(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (preview) ...[
+            ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: Image.file(
+                File(path),
+                width: 260,
+                height: 180,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => _fileTile(attachment, canOpen),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+          _fileTile(attachment, canOpen),
+        ],
+      ),
+    );
+  }
+
+  Widget _fileTile(AttachmentInfo attachment, bool canOpen) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          attachment.image
+              ? Icons.image_outlined
+              : Icons.insert_drive_file_outlined,
+          size: 18,
+          color: _t.primary,
+        ),
+        const SizedBox(width: 8),
+        Flexible(
+          child: Text(
+            attachment.label.isEmpty ? 'file' : attachment.label,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: canOpen ? _t.text : _t.textDim,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _showAttachment(AttachmentInfo attachment) {
+    if (!attachment.image ||
+        attachment.path.isEmpty ||
+        !File(attachment.path).existsSync()) {
+      _snack(attachment.path.isEmpty ? attachment.label : attachment.path);
+      return;
+    }
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: _t.bg,
+        insetPadding: const EdgeInsets.all(18),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 900, maxHeight: 720),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(14, 10, 8, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        attachment.label,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: _t.text, fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ],
+                ),
+              ),
+              Flexible(
+                child: InteractiveViewer(
+                  minScale: 0.5,
+                  maxScale: 5,
+                  child: Image.file(File(attachment.path), fit: BoxFit.contain),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(14, 8, 14, 12),
+                child: SelectableText(
+                  attachment.path,
+                  style: TextStyle(color: _t.textDim, fontSize: 11),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -3550,12 +3847,76 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   // ── input ────────────────────────────────────────────────────────────────
 
-  static const _emojis = [
-    '😀','😂','🤣','😊','😍','🥰','😎','🤔','😢','😡',
-    '👍','👎','👋','🙏','💪','🎉','🔥','❤️','💔','⭐',
-    '✅','❌','⚠️','💡','📌','🔒','🔑','💬','📢','🚀',
-    '🐛','🎯','🏆','🎵','🍕','☕','🌙','☀️','🌈','⚡',
-  ];
+  static const Map<String, List<String>> _emojiSections = {
+    'Smileys': [
+      '😀',
+      '😄',
+      '😂',
+      '🙂',
+      '😊',
+      '😍',
+      '😘',
+      '😎',
+      '🤔',
+      '😬',
+      '😢',
+      '😡'
+    ],
+    'Gestures': [
+      '👍',
+      '👎',
+      '👋',
+      '🙏',
+      '🙌',
+      '👏',
+      '🤝',
+      '💪',
+      '🤘',
+      '🫡',
+      '👌',
+      '✌️'
+    ],
+    'Chat': [
+      '❤️',
+      '🔥',
+      '🎉',
+      '✨',
+      '⭐',
+      '✅',
+      '❌',
+      '⚠️',
+      '💡',
+      '📌',
+      '💬',
+      '🚀'
+    ],
+    'Objects': [
+      '🔒',
+      '🔑',
+      '🛡️',
+      '🐛',
+      '🎯',
+      '🏆',
+      '📷',
+      '🖼️',
+      '📎',
+      '📁',
+      '☕',
+      '🌙'
+    ],
+  };
+
+  void _insertEmoji(String emoji) {
+    final sel = _input.selection;
+    final text = _input.text;
+    final start = sel.isValid ? sel.start : text.length;
+    final end = sel.isValid ? sel.end : text.length;
+    final newText = text.replaceRange(start, end, emoji);
+    _input.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: start + emoji.length),
+    );
+  }
 
   void _showEmojiPicker() {
     showModalBottomSheet<void>(
@@ -3565,40 +3926,88 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
-        return Padding(
-          padding: const EdgeInsets.all(16),
-          child: GridView.builder(
-            shrinkWrap: true,
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 8,
-              mainAxisSpacing: 4,
-              crossAxisSpacing: 4,
-            ),
-            itemCount: _emojis.length,
-            itemBuilder: (ctx, i) {
-              final emoji = _emojis[i];
-              return GestureDetector(
-                onTap: () {
-                  final sel = _input.selection;
-                  final text = _input.text;
-                  final newText = text.replaceRange(
-                    sel.start,
-                    sel.end,
-                    emoji,
-                  );
-                  _input.value = TextEditingValue(
-                    text: newText,
-                    selection: TextSelection.collapsed(
-                      offset: sel.start + emoji.length,
+        return SafeArea(
+          child: SizedBox(
+            height: 292,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.emoji_emotions_outlined,
+                          size: 18, color: _t.primary),
+                      const SizedBox(width: 8),
+                      Text('Emoji',
+                          style: TextStyle(
+                              color: _t.text,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 13)),
+                      const Spacer(),
+                      IconButton(
+                        icon: const Icon(Icons.close, size: 18),
+                        onPressed: () => Navigator.pop(ctx),
+                        constraints:
+                            const BoxConstraints(minWidth: 30, minHeight: 30),
+                        padding: EdgeInsets.zero,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Expanded(
+                    child: ListView(
+                      children: _emojiSections.entries.map((entry) {
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Padding(
+                                padding:
+                                    const EdgeInsets.only(left: 4, bottom: 5),
+                                child: Text(entry.key,
+                                    style: TextStyle(
+                                        color: _t.textDim,
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w700,
+                                        letterSpacing: 0.4)),
+                              ),
+                              Wrap(
+                                spacing: 5,
+                                runSpacing: 5,
+                                children: entry.value.map((emoji) {
+                                  return Material(
+                                    color: _t.surface2,
+                                    borderRadius: BorderRadius.circular(9),
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(9),
+                                      onTap: () {
+                                        _insertEmoji(emoji);
+                                        Navigator.pop(ctx);
+                                      },
+                                      child: SizedBox(
+                                        width: 34,
+                                        height: 32,
+                                        child: Center(
+                                          child: Text(emoji,
+                                              style: const TextStyle(
+                                                  fontSize: 20)),
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                }).toList(growable: false),
+                              ),
+                            ],
+                          ),
+                        );
+                      }).toList(growable: false),
                     ),
-                  );
-                  Navigator.pop(ctx);
-                },
-                child: Center(
-                  child: Text(emoji, style: const TextStyle(fontSize: 22)),
-                ),
-              );
-            },
+                  ),
+                ],
+              ),
+            ),
           ),
         );
       },
@@ -3664,7 +4073,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               ),
             ),
           ),
-          SizedBox(width: 8),
+          const SizedBox(width: 8),
           FilledButton(
             onPressed: _sending ? null : _send,
             style: FilledButton.styleFrom(
@@ -3678,7 +4087,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     child: CircularProgressIndicator(
                         strokeWidth: 2, color: _t.bg.withAlpha(140)),
                   )
-                : Icon(Icons.send_rounded, size: 17),
+                : const Icon(Icons.send_rounded, size: 17),
           ),
         ],
       ),
@@ -3717,237 +4126,5 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final y = n.subtract(const Duration(days: 1));
     if (_sameDay(d, y)) return 'Yesterday';
     return '${d.month}/${d.day}/${d.year % 100}';
-  }
-}
-
-// ── flutter file picker (pure Dart, no platform channels) ───────────────────
-
-class _FlutterFilePicker extends StatefulWidget {
-  const _FlutterFilePicker({required this.title, required this.initialPath});
-  final String title;
-  final String initialPath;
-
-  @override
-  State<_FlutterFilePicker> createState() => _FlutterFilePickerState();
-}
-
-class _FlutterFilePickerState extends State<_FlutterFilePicker> {
-  static const int maxFileSize = 100 * 1024 * 1024; // 100 MB
-
-  late String _currentDir;
-  List<FileSystemEntity> _entries = [];
-  final Map<String, int> _fileSizes = {};
-  String? _error;
-  bool _loading = true;
-
-  static String _formatSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    }
-    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _currentDir = widget.initialPath;
-    _loadDir();
-  }
-
-  Future<void> _loadDir() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final dir = Directory(_currentDir);
-      var list = await dir.list().toList();
-      // Hide dotfiles and dotdirs
-      list = list.where((e) {
-        final name = e.path.split('/').last;
-        return !name.startsWith('.');
-      }).toList();
-      list.sort((a, b) {
-        final aIsDir = a is Directory;
-        final bIsDir = b is Directory;
-        if (aIsDir && !bIsDir) return -1;
-        if (!aIsDir && bIsDir) return 1;
-        return a.path.toLowerCase().compareTo(b.path.toLowerCase());
-      });
-      if (mounted) {
-        setState(() {
-          _entries = list;
-          _loading = false;
-        });
-        // Populate file size cache for files only
-        for (final e in list) {
-          if (e is! Directory) {
-            try {
-              _fileSizes[e.path] = File(e.path).lengthSync();
-            } catch (_) {
-              // Permission error or file unavailable — skip
-            }
-          }
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = '$e';
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  void _navigateTo(String path) {
-    setState(() => _currentDir = path);
-    _loadDir();
-  }
-
-  void _goUp() {
-    final parent = Directory(_currentDir).parent.path;
-    if (parent != _currentDir) _navigateTo(parent);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
-    final bg = theme.dialogBackgroundColor;
-    final surface = isDark ? const Color(0xFF1E1E1E) : Colors.grey[100]!;
-    final text = theme.textTheme.bodyMedium?.color ?? Colors.black;
-    final dim = text.withAlpha(128);
-
-    return Dialog(
-      backgroundColor: bg,
-      insetPadding: const EdgeInsets.all(24),
-      child: SizedBox(
-        width: 560,
-        height: 480,
-        child: Column(
-          children: [
-            // title bar
-            Container(
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
-              decoration: BoxDecoration(
-                color: surface,
-                borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(widget.title,
-                        style: TextStyle(
-                            fontWeight: FontWeight.w700,
-                            fontSize: 14,
-                            color: text)),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.close, size: 18),
-                    onPressed: () => Navigator.pop(context),
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                  ),
-                ],
-              ),
-            ),
-            // breadcrumb / path bar
-            Container(
-              color: surface,
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-              child: Row(
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.arrow_upward, size: 16),
-                    onPressed: _goUp,
-                    tooltip: 'Go up',
-                    padding: const EdgeInsets.all(4),
-                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                  ),
-                  const SizedBox(width: 4),
-                  Expanded(
-                    child: Text(_currentDir,
-                        style: TextStyle(fontSize: 11, color: dim),
-                        overflow: TextOverflow.ellipsis),
-                  ),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            // file list
-            Expanded(
-              child: _loading
-                  ? Center(child: CircularProgressIndicator(strokeWidth: 2))
-                  : _error != null
-                      ? Center(
-                          child: Text(_error!,
-                              style: TextStyle(color: Colors.redAccent, fontSize: 12)))
-                      : _entries.isEmpty
-                          ? Center(
-                              child: Text('Empty directory',
-                                  style: TextStyle(color: dim, fontSize: 13)))
-                          : ListView.builder(
-                              itemCount: _entries.length,
-                              itemBuilder: (ctx, i) {
-                                final e = _entries[i];
-                                final isDir = e is Directory;
-                                final name = e.path.split('/').last;
-                                final sizeStr = isDir ? null : _fileSizes[e.path];
-                                return ListTile(
-                                  dense: true,
-                                  leading: Icon(
-                                    isDir ? Icons.folder : Icons.insert_drive_file,
-                                    size: 18,
-                                    color: isDir ? Colors.amber[700] : dim,
-                                  ),
-                                  title: Text(name,
-                                      style: TextStyle(fontSize: 13, color: text)),
-                                  subtitle: sizeStr != null
-                                      ? Text(_formatSize(sizeStr),
-                                          style: TextStyle(
-                                              fontSize: 11, color: dim))
-                                      : null,
-                                  onTap: () {
-                                    if (isDir) {
-                                      _navigateTo(e.path);
-                                    } else {
-                                      final sz = _fileSizes[e.path];
-                                      if (sz != null && sz > maxFileSize) {
-                                        ScaffoldMessenger.of(context)
-                                            .showSnackBar(const SnackBar(
-                                          content: Text(
-                                              'File too large (max 100 MB)'),
-                                          duration: Duration(seconds: 3),
-                                        ));
-                                        return;
-                                      }
-                                      Navigator.pop(context, e.path);
-                                    }
-                                  },
-                                );
-                              },
-                            ),
-            ),
-            const Divider(height: 1),
-            // bottom bar with select/cancel
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(context),
-                    child: const Text('Cancel'),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
   }
 }

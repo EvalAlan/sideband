@@ -42,21 +42,34 @@ void main() {
     expect(group.memberSummary, '3 members');
   });
 
-
   test('known empty contact history does not fall back to global history', () {
-    expect(shouldFallbackToGlobalHistory(
-      groupSelected: false,
-      filteredHistoryEmpty: true,
-      contact: 'alice',
-      knownContacts: const ['alice', 'bob'],
-    ), isFalse);
+    expect(
+        shouldFallbackToGlobalHistory(
+          groupSelected: false,
+          filteredHistoryEmpty: true,
+          contact: 'alice',
+          knownContacts: const ['alice', 'bob'],
+        ),
+        isFalse);
   });
-
 
   test('group create args include title and repeated members', () {
     expect(
-      groupCreateArgs(profile: '/tmp/p', title: 'Ops', members: const ['alice', 'bob']),
-      ['group', 'create', '--profile', '/tmp/p', '--title', 'Ops', '--member', 'alice', '--member', 'bob', '--json'],
+      groupCreateArgs(
+          profile: '/tmp/p', title: 'Ops', members: const ['alice', 'bob']),
+      [
+        'group',
+        'create',
+        '--profile',
+        '/tmp/p',
+        '--title',
+        'Ops',
+        '--member',
+        'alice',
+        '--member',
+        'bob',
+        '--json'
+      ],
     );
   });
 
@@ -67,17 +80,38 @@ void main() {
     );
     expect(
       groupRenameArgs(profile: '/tmp/p', group: 'g1', title: 'Homies'),
-      ['group', 'rename', '--profile', '/tmp/p', '--group', 'g1', '--title', 'Homies', '--json'],
+      [
+        'group',
+        'rename',
+        '--profile',
+        '/tmp/p',
+        '--group',
+        'g1',
+        '--title',
+        'Homies',
+        '--json'
+      ],
     );
     expect(
       groupMemberMutationArgs(
           profile: '/tmp/p', action: 'member-add', group: 'g1', member: 'bob'),
-      ['group', 'member-add', '--profile', '/tmp/p', '--group', 'g1', '--member', 'bob', '--json'],
+      [
+        'group',
+        'member-add',
+        '--profile',
+        '/tmp/p',
+        '--group',
+        'g1',
+        '--member',
+        'bob',
+        '--json'
+      ],
     );
   });
 
   test('raw group payload messages normalize to group chat bodies', () {
-    const raw = '{"kind":"group_message","group_id":"g1","group_title":"SecX","members":["Alan","Zimbro"],"body":"Ping"}';
+    const raw =
+        '{"kind":"group_message","group_id":"g1","group_title":"SecX","members":["Alan","Zimbro"],"body":"Ping"}';
     const msg = ChatMsg(
       id: 1,
       direction: 'in',
@@ -94,8 +128,30 @@ void main() {
     expect(normalized.contact, 'Zimbro');
   });
 
+  test('file attachment parser recognizes received and sent images', () {
+    final received = parseAttachmentText('[file received: /tmp/cat photo.png]');
+    expect(received, isNotNull);
+    expect(received!.label, 'cat photo.png');
+    expect(received.path, '/tmp/cat photo.png');
+    expect(received.image, isTrue);
+
+    final sent = parseAttachmentText(
+        '[file sent: /home/alan/pic.webp (123 bytes, inline)]');
+    expect(sent, isNotNull);
+    expect(sent!.label, 'pic.webp');
+    expect(sent.path, '/home/alan/pic.webp');
+    expect(sent.image, isTrue);
+
+    final doc =
+        parseAttachmentText('[file sent: notes.txt (123 bytes, 2 chunks)]');
+    expect(doc, isNotNull);
+    expect(doc!.label, 'notes.txt');
+    expect(doc.image, isFalse);
+  });
+
   test('contact views hide raw group payload rows and groups recover them', () {
-    const raw = '{"kind":"group_message","group_id":"g1","group_title":"SecX","members":["Alan","Zimbro"],"body":"Ho"}';
+    const raw =
+        '{"kind":"group_message","group_id":"g1","group_title":"SecX","members":["Alan","Zimbro"],"body":"Ho"}';
     const badDm = ChatMsg(
       id: 2,
       direction: 'in',
@@ -115,8 +171,10 @@ void main() {
       tsMs: 300,
     );
 
-    final normalized = [badDm, realDm].map(normalizeRawGroupPayloadMessage).toList();
-    expect(visibleContactMessages(normalized).map((m) => m.text), ['actual dm']);
+    final normalized =
+        [badDm, realDm].map(normalizeRawGroupPayloadMessage).toList();
+    expect(
+        visibleContactMessages(normalized).map((m) => m.text), ['actual dm']);
 
     final recovered = mergeRecoveredGroupMessages(
       groupRows: const [],
