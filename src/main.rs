@@ -1095,29 +1095,41 @@ async fn send_typed_message(
     } else {
         Duration::from_secs(60)
     };
+    let payload_len = payload.len();
     let result = {
         let payload = payload.clone();
         let to_addr = format!("{}:80", to_onion);
         let tc = Arc::clone(&tor_client);
         let connect_fut = async move {
+            tracing::info!(%to_addr, payload_len, "connecting to peer");
             let mut stream = tc
                 .connect(to_addr.as_str())
                 .await
                 .map_err(|e| anyhow!("connect: {e}"))?;
+            tracing::info!(%to_addr, "connected, writing payload");
             use tokio::io::AsyncWriteExt;
             stream
                 .write_all(payload.as_bytes())
                 .await
                 .map_err(|e| anyhow!("write: {e}"))?;
+            tracing::info!(%to_addr, "payload written, flushing");
             stream.flush().await.map_err(|e| anyhow!("flush: {e}"))?;
+            tracing::info!(%to_addr, "stream flushed, shutting down write side");
             stream
                 .shutdown()
                 .await
                 .map_err(|e| anyhow!("shutdown: {e}"))?;
+            tracing::info!(%to_addr, "send complete");
             Ok::<_, anyhow::Error>(())
         };
         tokio::time::timeout(connect_timeout, connect_fut).await
     };
+
+    match &result {
+        Ok(Ok(())) => tracing::info!(%to_onion, message_type, payload_len, "send_typed_message OK"),
+        Ok(Err(e)) => tracing::warn!(%to_onion, message_type, payload_len, error=%e, "send_typed_message failed"),
+        Err(_) => tracing::warn!(%to_onion, message_type, payload_len, "send_typed_message timed out"),
+    }
 
     match result {
         Ok(Ok(())) => Ok(()),
@@ -3934,6 +3946,7 @@ pub(crate) async fn serve(
                         }
                     };
                 if let Some(mut msg) = handler::parse_inbound_line(&body).unwrap_or(None) {
+                    tracing::info!(msg_type=%msg.r#type, from=%msg.from, "inbound message received");
                     // Contacts can be added while the GUI listener is already
                     // running. Sending uses a fresh one-shot process, so a
                     // stale listener contact snapshot creates the dumbest bug:
