@@ -1857,6 +1857,24 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
       });
       _scrollToBottom();
+    } else if (attachPath != null) {
+      // file-only send: show optimistic bubble with file path
+      final pending = ChatMsg(
+          id: -now.millisecondsSinceEpoch,
+          direction: 'out',
+          status: 'sending',
+          contact: c?.name ?? 'You',
+          group: g?.id ?? '',
+          text: '[file sent: $attachPath (sending…)]',
+          tsMs: now.millisecondsSinceEpoch);
+      setState(() {
+        _sending = true;
+        _lastSendStartedAt = now;
+        _error = null;
+        _pendingMsgs.add(pending);
+        _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
+      });
+      _scrollToBottom();
     }
 
     try {
@@ -3731,10 +3749,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Widget _attachmentBubble(AttachmentInfo attachment) {
     final path = attachment.path;
-    final canOpen = path.isNotEmpty && File(path).existsSync();
-    final preview = attachment.image && canOpen;
+    final exists = path.isNotEmpty && File(path).existsSync();
+    final preview = attachment.image && exists;
     return InkWell(
-      onTap: canOpen ? () => _showAttachment(attachment) : null,
+      onTap: () => _showAttachment(attachment),
       borderRadius: BorderRadius.circular(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -3747,12 +3765,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 width: 260,
                 height: 180,
                 fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => _fileTile(attachment, canOpen),
+                errorBuilder: (_, __, ___) => _fileTile(attachment, exists),
               ),
             ),
             const SizedBox(height: 8),
           ],
-          _fileTile(attachment, canOpen),
+          _fileTile(attachment, exists),
         ],
       ),
     );
@@ -3787,60 +3805,76 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   void _showAttachment(AttachmentInfo attachment) {
-    if (!attachment.image ||
-        attachment.path.isEmpty ||
-        !File(attachment.path).existsSync()) {
-      _snack(attachment.path.isEmpty ? attachment.label : attachment.path);
-      return;
-    }
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => Dialog(
-        backgroundColor: _t.bg,
-        insetPadding: const EdgeInsets.all(18),
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 900, maxHeight: 720),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(14, 10, 8, 8),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        attachment.label,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                            color: _t.text, fontWeight: FontWeight.w700),
+    if (attachment.image &&
+        attachment.path.isNotEmpty &&
+        File(attachment.path).existsSync()) {
+      // Image file exists locally — show inline preview with zoom
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => Dialog(
+          backgroundColor: _t.bg,
+          insetPadding: const EdgeInsets.all(18),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 900, maxHeight: 720),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 10, 8, 8),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          attachment.label,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                              color: _t.text, fontWeight: FontWeight.w700),
+                        ),
                       ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.close),
-                      onPressed: () => Navigator.pop(ctx),
-                    ),
-                  ],
+                      IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => Navigator.pop(ctx),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              Flexible(
-                child: InteractiveViewer(
-                  minScale: 0.5,
-                  maxScale: 5,
-                  child: Image.file(File(attachment.path), fit: BoxFit.contain),
+                Flexible(
+                  child: InteractiveViewer(
+                    minScale: 0.5,
+                    maxScale: 5,
+                    child:
+                        Image.file(File(attachment.path), fit: BoxFit.contain),
+                  ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(14, 8, 14, 12),
-                child: SelectableText(
-                  attachment.path,
-                  style: TextStyle(color: _t.textDim, fontSize: 11),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 8, 14, 12),
+                  child: SelectableText(
+                    attachment.path,
+                    style: TextStyle(color: _t.textDim, fontSize: 11),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
-      ),
-    );
+      );
+      return;
+    }
+
+    // File doesn't exist locally or isn't an image — try opening with system
+    if (attachment.path.isNotEmpty && File(attachment.path).existsSync()) {
+      unawaited(Process.run('xdg-open', [attachment.path]).then((r) {
+        if (r.exitCode != 0) {
+          _snack('Could not open: ${attachment.label}');
+        }
+      }).catchError((_) {
+        _snack('Could not open: ${attachment.label}');
+      }));
+      return;
+    }
+
+    // File path is empty or doesn't exist — show path info
+    _snack(attachment.path.isEmpty ? attachment.label : attachment.path);
   }
 
   Widget _statusIcon(ChatMsg m) {
