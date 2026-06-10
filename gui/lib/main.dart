@@ -426,14 +426,19 @@ class AttachmentInfo {
 
 AttachmentInfo? parseAttachmentText(String text) {
   final trimmed = text.trim();
-  final received = RegExp(r'^\[file received: (.+)\]$').firstMatch(trimmed);
-  if (received != null) {
-    final path = received.group(1)!.trim();
+  final receivedMatch = RegExp(r'^\[file received: (.+)\]$').firstMatch(trimmed);
+  if (receivedMatch != null && !trimmed.startsWith('[file received failed')) {
+    final path = receivedMatch.group(1)!.trim();
     return AttachmentInfo(
       label: _basename(path),
       path: path,
       image: isImagePath(path),
     );
+  }
+  if (trimmed.startsWith('[file received failed') ||
+      trimmed.startsWith('[file write failed') ||
+      trimmed.startsWith('[file hash mismatch')) {
+    return AttachmentInfo(label: trimmed, path: '', image: false);
   }
 
   final sent = RegExp(r'^\[file sent: (.+?) \((.+)\)\]$').firstMatch(trimmed);
@@ -1349,6 +1354,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           if (lower.contains('message received') ||
               lower.contains('incoming connection') ||
               lower.contains('message sent') ||
+              lower.contains('file sent') ||
               lower.contains('send error') ||
               lower.contains('resolve error')) {
             unawaited(_refresh());
@@ -1361,7 +1367,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     jsonDecode(line.substring('__sideband_resp__:'.length))
                         as Map<String, dynamic>;
                 final type = decoded['type'];
-                if (type == 'group_sent' ||
+                if (type == 'sent' ||
+                    type == 'file_sent' ||
+                    type == 'group_sent' ||
                     type == 'group_file_sent' ||
                     type == 'left' ||
                     type == 'deleted') {

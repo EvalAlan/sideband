@@ -716,6 +716,7 @@ pub(crate) async fn send_file(
         };
         let inline_json = serde_json::to_string(&inline)?;
 
+        tracing::info!(contact=%contact_name, name=%file_name, size=total_size, "sending file_inline");
         let mut sent = false;
         for attempt in 1..=4 {
             match send_typed_message(
@@ -748,6 +749,7 @@ pub(crate) async fn send_file(
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis();
+        tracing::info!(contact=%contact_name, name=%file_name, size=total_size, "file_inline sent OK");
         crate::store_message(
             profile,
             "out",

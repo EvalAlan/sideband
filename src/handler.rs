@@ -460,12 +460,13 @@ async fn handle_file_inline(
 
     if let Ok(inline) = serde_json::from_str::<FileInlinePayload>(&plaintext) {
         let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+        tracing::info!(name=%inline.name, size=%inline.size, "file_inline received");
         let downloads_dir = profile.join("downloads");
         if let Err(e) = std::fs::create_dir_all(&downloads_dir) {
             tracing::error!(error=%e, "failed to create downloads dir");
         }
 
-        let mut body = format!("[file receive failed: {}]", inline.name);
+        let mut body = format!("[file received failed: {}]", inline.name);
         if let Ok(data) = B64.decode(inline.data_b64.as_bytes()) {
             use sha2::Digest;
             let mut h = sha2::Sha256::new();
@@ -479,13 +480,23 @@ async fn handle_file_inline(
                     .unwrap_or("download.bin")
                     .to_string();
                 let out_path = downloads_dir.join(&safe_name);
+                tracing::info!(path=%out_path.display(), "writing received file");
                 match write_file_atomically(&out_path, &data) {
-                    Ok(_) => body = format!("[file received: {}]", out_path.display()),
-                    Err(e) => body = format!("[file write failed: {e}]"),
+                    Ok(_) => {
+                        tracing::info!(path=%out_path.display(), "file written successfully");
+                        body = format!("[file received: {}]", out_path.display());
+                    }
+                    Err(e) => {
+                        tracing::error!(error=%e, path=%out_path.display(), "file write failed");
+                        body = format!("[file write failed: {e}]");
+                    }
                 }
             } else {
+                tracing::warn!(expected=%inline.hash, actual=%actual_hash, "file hash mismatch");
                 body = format!("[file hash mismatch: {}]", inline.name);
             }
+        } else {
+            tracing::error!("base64 decode failed for file_inline");
         }
 
         store_message(
