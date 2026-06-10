@@ -1404,10 +1404,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   bool _matchesPending(ChatMsg pending, ChatMsg stored) {
-    return stored.out &&
-        stored.contact == pending.contact &&
-        stored.text == pending.text &&
-        (stored.tsMs - pending.tsMs).abs() <= 120000;
+    if (!stored.out || stored.contact != pending.contact) return false;
+    if (stored.text == pending.text) return true;
+    // file sends: the optimistic text is "[file sent: <path> (sending…)]"
+    // while the real stored text is "[file sent: <path> (<size> bytes, inline)]"
+    // match by the file path prefix
+    if (pending.text.startsWith('[file sent: ') && stored.text.startsWith('[file sent: ')) {
+      final pendingPath = pending.text.substring('[file sent: '.length).split(' (').first;
+      final storedPath = stored.text.substring('[file sent: '.length).split(' (').first;
+      return pendingPath == storedPath;
+    }
+    return false;
   }
 
   List<ChatMsg> _mergePending(List<ChatMsg> history) {
@@ -1840,8 +1847,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
     // optimistic
     final now = DateTime.now();
+    ChatMsg? pending;
     if (t.isNotEmpty) {
-      final pending = ChatMsg(
+      pending = ChatMsg(
           id: -now.millisecondsSinceEpoch,
           direction: 'out',
           status: 'sending',
@@ -1853,13 +1861,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         _sending = true;
         _lastSendStartedAt = now;
         _error = null;
-        _pendingMsgs.add(pending);
+        _pendingMsgs.add(pending!);
         _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
       });
       _scrollToBottom();
     } else if (attachPath != null) {
       // file-only send: show optimistic bubble with file path
-      final pending = ChatMsg(
+      pending = ChatMsg(
           id: -now.millisecondsSinceEpoch,
           direction: 'out',
           status: 'sending',
@@ -1871,7 +1879,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         _sending = true;
         _lastSendStartedAt = now;
         _error = null;
-        _pendingMsgs.add(pending);
+        _pendingMsgs.add(pending!);
         _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
       });
       _scrollToBottom();
@@ -1901,6 +1909,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       await _refresh();
       _scrollToBottom();
     } catch (e) {
+      if (pending != null) {
+        _pendingMsgs.removeWhere((m) => m.id == pending!.id);
+      }
       setState(() => _error = '$e');
       await _refresh();
     } finally {
