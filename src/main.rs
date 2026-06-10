@@ -3955,7 +3955,10 @@ pub(crate) async fn serve(
                     // running. Sending uses a fresh one-shot process, so a
                     // stale listener contact snapshot creates the dumbest bug:
                     // outbound works, inbound cannot decrypt/attribute.
-                    let contacts = crate::load_contacts(profile).unwrap_or_default();
+                    let contacts = crate::load_contacts(profile).unwrap_or_else(|e| {
+                        tracing::error!(error=%e, "failed to load contacts for inbound message");
+                        ContactsMap::default()
+                    });
                     if let Err(e) = handler::handle_inbound(
                         profile,
                         &tui_tx,

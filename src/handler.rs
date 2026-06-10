@@ -69,7 +69,7 @@ pub async fn handle_inbound(
     }
 
     if msg.r#type == "file_ack" {
-        handle_file_ack(profile, tui_tx, contacts, msg, transfer_state).await?;
+        handle_file_ack(profile, tui_tx, contacts, msg).await?;
         return Ok(());
     }
 
@@ -556,7 +556,6 @@ async fn handle_file_ack(
     tui_tx: &mpsc::Sender<TuiEvent>,
     contacts: &ContactsMap,
     msg: &mut ChatMessage,
-    transfer_state: &SharedTransferState,
 ) -> Result<()> {
     let (plaintext, verified) = decrypt_and_verify(msg, profile, contacts).unwrap_or_else(|e| {
         tracing::error!(error=%e, "decrypt/verify failed");
@@ -568,8 +567,10 @@ async fn handle_file_ack(
     let mut accepted = false;
     if let Ok(ack) = serde_json::from_str::<FileAckPayload>(&plaintext) {
         if ack_is_acceptable(&ack) {
-            let mut state = transfer_state.lock().await;
-            state.ack_set.insert(crate::ack_key(&ack.hash, ack.chunk_index));
+            let key = crate::ack_key(&ack.hash, ack.chunk_index);
+            if let Ok(mut set) = crate::file_ack_set().lock() {
+                set.insert(key);
+            }
             accepted = true;
         }
     }
