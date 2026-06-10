@@ -718,6 +718,7 @@ pub(crate) async fn send_file(
 
         tracing::info!(contact=%contact_name, name=%file_name, size=total_size, "sending file_inline");
         let mut sent = false;
+        let mut last_error = String::new();
         for attempt in 1..=4 {
             match send_typed_message(
                 profile,
@@ -734,7 +735,8 @@ pub(crate) async fn send_file(
                     break;
                 }
                 Err(e) => {
-                    warn!(attempt, error=%e, "file_inline send failed");
+                    last_error = e.to_string();
+                    warn!(attempt, error=%last_error, "file_inline send failed");
                     if attempt < 4 {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                     }
@@ -743,7 +745,7 @@ pub(crate) async fn send_file(
         }
 
         if !sent {
-            return Err(anyhow!("file_inline send failed to {}", contact_name));
+            return Err(anyhow!("file_inline send failed to {contact_name}: {last_error}"));
         }
 
         let timestamp_ms = std::time::SystemTime::now()
