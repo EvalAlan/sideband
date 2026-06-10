@@ -1031,6 +1031,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   String _selectedTheme = 'Teal';
   String? _pendingAttachmentPath;
   String? _pendingAttachmentName;
+  int _pendingAttachmentSize = 0;
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '${bytes}B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
+  }
 
   ThemeDef get _t => _themeDef(_selectedTheme);
   late _WindowHandler _windowHandler;
@@ -1500,6 +1507,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     setState(() {
       _pendingAttachmentPath = null;
       _pendingAttachmentName = null;
+      _pendingAttachmentSize = 0;
     });
   }
 
@@ -1530,6 +1538,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _snack('File too large (max 100 MB)');
           return null;
         }
+        setState(() { _pendingAttachmentSize = size; });
       } catch (_) {}
       return path;
     } on TimeoutException {
@@ -3771,11 +3780,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Widget _attachmentBubble(AttachmentInfo attachment) {
-    final path = attachment.path;
-    final exists = path.isNotEmpty && File(path).existsSync();
+    final exists = attachment.path.isNotEmpty && File(attachment.path).existsSync();
     final preview = attachment.image && exists;
     return InkWell(
-      onTap: () => _showAttachment(attachment),
+      onTap: exists ? () => _showAttachment(attachment) : null,
       borderRadius: BorderRadius.circular(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -3784,7 +3792,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             ClipRRect(
               borderRadius: BorderRadius.circular(10),
               child: Image.file(
-                File(path),
+                File(attachment.path),
                 width: 260,
                 height: 180,
                 fit: BoxFit.cover,
@@ -4122,6 +4130,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                           color: _t.text, fontSize: 12, fontWeight: FontWeight.w600),
                     ),
                   ),
+                  if (_pendingAttachmentSize > 0)
+                    Text(
+                      _formatBytes(_pendingAttachmentSize),
+                      style: TextStyle(color: _t.textDim, fontSize: 10),
+                    ),
+                  const SizedBox(width: 4),
                   IconButton(
                     icon: const Icon(Icons.close, size: 14),
                     onPressed: _clearPendingAttachment,
