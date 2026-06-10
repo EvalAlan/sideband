@@ -3805,6 +3805,7 @@ pub(crate) async fn serve(
                         });
                         continue;
                     };
+                    println!("DEBUG: file cmd received, path={path}, to={:?}, group={:?}", cmd.to, cmd.group);
                     emit_response(&ServeResponse::Ack { cmd: "file".into() });
                     tracing::info!(path=%path, group=cmd.group.as_deref(), "file send command received");
                     tokio::spawn(async move {
