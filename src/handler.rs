@@ -458,8 +458,34 @@ async fn handle_file_inline(
         (String::new(), false)
     });
 
-    if let Ok(inline) = serde_json::from_str::<FileInlinePayload>(&plaintext) {
-        let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let inline = match serde_json::from_str::<FileInlinePayload>(&plaintext) {
+        Ok(inline) => inline,
+        Err(e) => {
+            tracing::error!(error=%e, plaintext_len=plaintext.len(), "invalid file_inline payload");
+            let body = format!("[file received failed: invalid inline payload: {e}]");
+            store_message(
+                profile,
+                "in",
+                &contact_name,
+                "",
+                &body,
+                msg.timestamp_ms,
+                DeliveryStatus::Failed,
+            )?;
+            let _ = tui_tx
+                .send(TuiEvent::InboundMessage {
+                    contact: contact_name,
+                    body,
+                    timestamp_ms: msg.timestamp_ms,
+                    verified,
+                })
+                .await;
+            return Ok(());
+        }
+    };
+
+    {
         tracing::info!(name=%inline.name, size=%inline.size, "file_inline received");
         let downloads_dir = profile.join("downloads");
         if let Err(e) = std::fs::create_dir_all(&downloads_dir) {

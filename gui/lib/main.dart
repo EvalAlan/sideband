@@ -1876,39 +1876,35 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
     // optimistic
     final now = DateTime.now();
-    ChatMsg? pending;
+    final optimistic = <ChatMsg>[];
     if (t.isNotEmpty) {
-      pending = ChatMsg(
+      optimistic.add(ChatMsg(
           id: -now.millisecondsSinceEpoch,
           direction: 'out',
           status: 'sending',
           contact: c?.name ?? 'You',
           group: g?.id ?? '',
           text: t,
-          tsMs: now.millisecondsSinceEpoch);
-      setState(() {
-        _sending = true;
-        _lastSendStartedAt = now;
-        _error = null;
-        _pendingMsgs.add(pending!);
-        _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
-      });
-      _scrollToBottom();
-    } else if (attachPath != null) {
-      // file-only send: show optimistic bubble with file path
-      pending = ChatMsg(
-          id: -now.millisecondsSinceEpoch,
+          tsMs: now.millisecondsSinceEpoch));
+    }
+    if (attachPath != null) {
+      // Always show the attachment as its own optimistic row, even when text is
+      // sent with it. Otherwise text+file sends look like the file vanished.
+      optimistic.add(ChatMsg(
+          id: -now.millisecondsSinceEpoch - 1,
           direction: 'out',
           status: 'sending',
           contact: c?.name ?? 'You',
           group: g?.id ?? '',
           text: '[file sent: $attachPath (sending…)]',
-          tsMs: now.millisecondsSinceEpoch);
+          tsMs: now.millisecondsSinceEpoch + (t.isNotEmpty ? 1 : 0)));
+    }
+    if (optimistic.isNotEmpty) {
       setState(() {
         _sending = true;
         _lastSendStartedAt = now;
         _error = null;
-        _pendingMsgs.add(pending!);
+        _pendingMsgs.addAll(optimistic);
         _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
       });
       _scrollToBottom();
@@ -1938,9 +1934,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       await _refresh();
       _scrollToBottom();
     } catch (e) {
-      if (pending != null) {
-        _pendingMsgs.removeWhere((m) => m.id == pending!.id);
-      }
+      final optimisticIds = optimistic.map((m) => m.id).toSet();
+      _pendingMsgs.removeWhere((m) => optimisticIds.contains(m.id));
       setState(() => _error = '$e');
       await _refresh();
     } finally {

@@ -147,6 +147,12 @@ void main() {
     expect(doc, isNotNull);
     expect(doc!.label, 'notes.txt');
     expect(doc.image, isFalse);
+
+    final failed = parseAttachmentText('[file received failed: cat.png]');
+    expect(failed, isNotNull);
+    expect(failed!.path, isEmpty);
+    expect(failed.label, '[file received failed: cat.png]');
+    expect(failed.image, isFalse);
   });
 
   test('contact views hide raw group payload rows and groups recover them', () {
