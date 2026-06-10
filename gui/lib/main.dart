@@ -453,6 +453,13 @@ AttachmentInfo? parseAttachmentText(String text) {
     return AttachmentInfo(label: name, path: '', image: isImagePath(name));
   }
 
+  // File transfer errors — show as non-clickable attachment with error label
+  final failed = RegExp(r'^\[file (?:received failed hash|write failed):')
+      .firstMatch(trimmed);
+  if (failed != null) {
+    return AttachmentInfo(label: trimmed, path: '', image: false);
+  }
+
   return null;
 }
 
