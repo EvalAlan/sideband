@@ -1299,6 +1299,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   switch (type) {
                     case 'error':
                       _error = decoded['message'] as String? ?? 'error';
+                      // Remove any optimistic pending messages on send error
+                      final errCmd = decoded['cmd'] as String?;
+                      if (errCmd == 'file' || errCmd == 'send' || errCmd == 'group_send') {
+                        _pendingMsgs.removeWhere((m) => m.out && m.sending);
+                      }
                       if (!_isRecentSendTransient(lower)) {
                         _listenerStatus = 'error: $_error';
                       }
