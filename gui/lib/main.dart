@@ -1022,6 +1022,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   DateTime? _lastSendStartedAt;
   Timer? _poll;
   String _selectedTheme = 'Teal';
+  String? _pendingAttachmentPath;
+  String? _pendingAttachmentName;
 
   ThemeDef get _t => _themeDef(_selectedTheme);
   late _WindowHandler _windowHandler;
@@ -1469,18 +1471,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     if (!mounted) return;
     final path = await _pickFile(target);
     if (path == null || path.isEmpty) return;
-    try {
-      final isGroup = _selGroup != null;
-      await _sendFileViaListener(
-        to: isGroup ? null : target,
-        group: isGroup ? target : null,
-        path: path,
-      );
-      await _refresh();
-      _scrollToBottom();
-    } catch (e) {
-      if (mounted) _snack('Send failed: $e');
-    }
+    setState(() {
+      _pendingAttachmentPath = path;
+      _pendingAttachmentName = path.split('/').last;
+    });
+  }
+
+  void _clearPendingAttachment() {
+    setState(() {
+      _pendingAttachmentPath = null;
+      _pendingAttachmentName = null;
+    });
   }
 
   void _snack(String msg) {
@@ -1823,44 +1824,65 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final c = _sel;
     final g = _selGroup;
     final t = _input.text.trim();
-    if (t.isEmpty) return;
-    _input.clear();
+    final attachPath = _pendingAttachmentPath;
 
-    if (t.startsWith('/')) {
+    if (t.isEmpty && attachPath == null) return;
+
+    if (t.startsWith('/') && attachPath == null) {
       await _runSlashCommand(t);
       return;
     }
 
     if (c == null && g == null) return;
 
+    _input.clear();
+    _clearPendingAttachment();
+
     // optimistic
     final now = DateTime.now();
-    final pending = ChatMsg(
-        id: -now.millisecondsSinceEpoch,
-        direction: 'out',
-        status: 'sending',
-        contact: c?.name ?? 'You',
-        group: g?.id ?? '',
-        text: t,
-        tsMs: now.millisecondsSinceEpoch);
-    setState(() {
-      _sending = true;
-      _lastSendStartedAt = now;
-      _error = null;
-      _pendingMsgs.add(pending);
-      _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
-    });
-    _scrollToBottom();
+    if (t.isNotEmpty) {
+      final pending = ChatMsg(
+          id: -now.millisecondsSinceEpoch,
+          direction: 'out',
+          status: 'sending',
+          contact: c?.name ?? 'You',
+          group: g?.id ?? '',
+          text: t,
+          tsMs: now.millisecondsSinceEpoch);
+      setState(() {
+        _sending = true;
+        _lastSendStartedAt = now;
+        _error = null;
+        _pendingMsgs.add(pending);
+        _msgs = _mergePending(_msgs.where((m) => !m.sending).toList());
+      });
+      _scrollToBottom();
+    }
 
     try {
-      if (g != null) {
-        await _sendViaListener(group: g.id, message: t);
-      } else {
-        await _sendViaListener(to: c!.name, message: t);
+      // send message text first (if any)
+      if (t.isNotEmpty) {
+        if (g != null) {
+          await _sendViaListener(group: g.id, message: t);
+        } else {
+          await _sendViaListener(to: c!.name, message: t);
+        }
       }
+
+      // then send attachment (if any)
+      if (attachPath != null) {
+        final isGroup = g != null;
+        final targetName = c?.name ?? '';
+        await _sendFileViaListener(
+          to: isGroup ? null : targetName,
+          group: isGroup ? g.id : null,
+          path: attachPath,
+        );
+      }
+
       await _refresh();
+      _scrollToBottom();
     } catch (e) {
-      _pendingMsgs.removeWhere((m) => m.id == pending.id);
       setState(() => _error = '$e');
       await _refresh();
     } finally {
@@ -4020,79 +4042,126 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Widget _inputArea() {
+    final hasAttach = _pendingAttachmentPath != null;
     return Container(
       color: _t.surface,
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          // emoji button
-          Padding(
-            padding: const EdgeInsets.only(bottom: 2),
-            child: IconButton(
-              icon: const Text('😊', style: TextStyle(fontSize: 20)),
-              onPressed: _showEmojiPicker,
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-              splashRadius: 18,
-            ),
-          ),
-          const SizedBox(width: 4),
-          // attachment button
-          Padding(
-            padding: const EdgeInsets.only(bottom: 2),
-            child: IconButton(
-              icon: Icon(Icons.attach_file, size: 18, color: _t.textDim),
-              onPressed: _showFileDialog,
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-              splashRadius: 18,
-            ),
-          ),
-          const SizedBox(width: 4),
-          Expanded(
-            child: Shortcuts(
-              shortcuts: const <ShortcutActivator, Intent>{
-                SingleActivator(LogicalKeyboardKey.enter): _SendMessageIntent(),
-              },
-              child: Actions(
-                actions: <Type, Action<Intent>>{
-                  _SendMessageIntent: CallbackAction<_SendMessageIntent>(
-                    onInvoke: (_) {
-                      if (!_sending) unawaited(_send());
-                      return null;
-                    },
+          if (hasAttach)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                children: [
+                  Icon(Icons.attach_file, size: 14, color: _t.primary),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      _pendingAttachmentName ?? '',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          color: _t.text, fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
                   ),
-                },
-                child: TextField(
-                  controller: _input,
-                  enabled: !_sending,
-                  minLines: 1,
-                  maxLines: 4,
-                  keyboardType: TextInputType.multiline,
-                  style: TextStyle(fontSize: 14, color: _t.text),
-                  decoration: const InputDecoration(
-                      hintText: 'Message or /help for commands…'),
-                  textInputAction: TextInputAction.newline,
-                ),
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 14),
+                    onPressed: _clearPendingAttachment,
+                    padding: EdgeInsets.zero,
+                    constraints:
+                        const BoxConstraints(minWidth: 24, minHeight: 24),
+                    splashRadius: 12,
+                  ),
+                ],
               ),
             ),
-          ),
-          const SizedBox(width: 8),
-          FilledButton(
-            onPressed: _sending ? null : _send,
-            style: FilledButton.styleFrom(
-              minimumSize: const Size(42, 42),
-              padding: EdgeInsets.zero,
-            ),
-            child: _sending
-                ? SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 2, color: _t.bg.withAlpha(140)),
-                  )
-                : const Icon(Icons.send_rounded, size: 17),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              // emoji button
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: IconButton(
+                  icon: const Text('😊', style: TextStyle(fontSize: 20)),
+                  onPressed: _showEmojiPicker,
+                  padding: EdgeInsets.zero,
+                  constraints:
+                      const BoxConstraints(minWidth: 32, minHeight: 32),
+                  splashRadius: 18,
+                ),
+              ),
+              const SizedBox(width: 4),
+              // attachment button
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: IconButton(
+                  icon: Icon(
+                    hasAttach ? Icons.attach_file : Icons.attach_file_outlined,
+                    size: 18,
+                    color: hasAttach ? _t.primary : _t.textDim,
+                  ),
+                  onPressed: _showFileDialog,
+                  padding: EdgeInsets.zero,
+                  constraints:
+                      const BoxConstraints(minWidth: 32, minHeight: 32),
+                  splashRadius: 18,
+                ),
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Shortcuts(
+                  shortcuts: const <ShortcutActivator, Intent>{
+                    SingleActivator(LogicalKeyboardKey.enter):
+                        _SendMessageIntent(),
+                  },
+                  child: Actions(
+                    actions: <Type, Action<Intent>>{
+                      _SendMessageIntent:
+                          CallbackAction<_SendMessageIntent>(
+                        onInvoke: (_) {
+                          if (!_sending) unawaited(_send());
+                          return null;
+                        },
+                      ),
+                    },
+                    child: TextField(
+                      controller: _input,
+                      enabled: !_sending,
+                      minLines: 1,
+                      maxLines: 4,
+                      keyboardType: TextInputType.multiline,
+                      style: TextStyle(fontSize: 14, color: _t.text),
+                      decoration: InputDecoration(
+                        hintText: hasAttach
+                            ? 'Add a message or send as-is…'
+                            : 'Message or /help for commands…',
+                        contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 8),
+                      ),
+                      textInputAction: TextInputAction.newline,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: _sending ? null : _send,
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(42, 42),
+                  padding: EdgeInsets.zero,
+                ),
+                child: _sending
+                    ? SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: _t.bg.withAlpha(140)),
+                      )
+                    : const Icon(Icons.send_rounded, size: 17),
+              ),
+            ],
           ),
         ],
       ),
