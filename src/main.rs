@@ -1262,7 +1262,15 @@ fn init_db(profile: &Path) -> Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_kind, conversation_id)",
         [],
     )?;
-    migrate_raw_group_payload_pm_rows(&conn)?;
+    migrate_raw_group_payload_pm_rows(&conn, profile)?;
+    // Cleanup: remove self from group_members if the migration previously
+    // added the local user as a member (the UI already counts self via +1).
+    if let Ok(self_name) = load_display_name(profile) {
+        let _ = conn.execute(
+            "DELETE FROM group_members WHERE contact = ?1",
+            params![self_name],
+        );
+    }
     // Migration: prune duplicate outbound group message rows left over from
     // the old per-member fanout that stored one row per recipient instead of
     // one row per sent message.  Keep the row whose contact is 'You' (the
@@ -1322,7 +1330,8 @@ fn init_db(profile: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn migrate_raw_group_payload_pm_rows(conn: &Connection) -> Result<()> {
+fn migrate_raw_group_payload_pm_rows(conn: &Connection, profile: &Path) -> Result<()> {
+    let self_name = load_display_name(profile).unwrap_or_default();
     let rows = {
         let mut stmt = conn.prepare(
             "SELECT id, contact, body
@@ -1363,7 +1372,7 @@ fn migrate_raw_group_payload_pm_rows(conn: &Connection) -> Result<()> {
 
         let mut members = Vec::new();
         let sender = contact.trim();
-        if !sender.is_empty() {
+        if !sender.is_empty() && sender != self_name {
             members.push(sender.to_string());
         }
         for member in &payload.members {
