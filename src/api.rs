@@ -9,26 +9,26 @@ use crate::transport::tor::TorTransport;
 use crate::types::{ApiContact, ApiMessage, ApiStatus};
 
 fn expand_profile(profile_path: &str) -> PathBuf {
-    crate::shared::expand_home(Path::new(profile_path))
+    crate::expand_home(Path::new(profile_path))
 }
 
 pub fn api_init_profile(profile_path: &str, display_name: &str) -> Result<()> {
     let profile = expand_profile(profile_path);
-    if crate::shared::identity_path(&profile).exists() {
+    if crate::identity_path(&profile).exists() {
         return Ok(());
     }
     let name = display_name.trim();
     let chosen = if name.is_empty() {
-        crate::shared::default_display_name(&profile)
+        crate::default_display_name(&profile)
     } else {
         name.to_string()
     };
-    crate::shared::init_profile_with_name(&profile, &chosen)
+    crate::init_profile_with_name(&profile, &chosen)
 }
 
 pub fn api_list_contacts(profile_path: &str) -> Result<Vec<ApiContact>> {
     let profile = expand_profile(profile_path);
-    let contacts = crate::shared::load_contacts(&profile)?;
+    let contacts = crate::load_contacts(&profile)?;
     let mut out: Vec<ApiContact> = contacts
         .values()
         .map(|c| ApiContact {
@@ -47,7 +47,7 @@ pub fn api_add_contact(profile_path: &str, contact: ApiContact) -> Result<()> {
     let x25519 = contact
         .x25519_pubkey_b64
         .ok_or_else(|| anyhow!("x25519 pubkey is required"))?;
-    crate::shared::contact_add(
+    crate::contact_add(
         &profile,
         &contact.name,
         &contact.onion,
@@ -58,20 +58,20 @@ pub fn api_add_contact(profile_path: &str, contact: ApiContact) -> Result<()> {
 
 pub fn api_delete_contact(profile_path: &str, name: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
-    crate::shared::contact_delete(&profile, name)
+    crate::contact_delete(&profile, name)
 }
 
 pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Result<()> {
     let profile = expand_profile(profile_path);
-    let onion = crate::shared::resolve_to(&profile, to)?;
+    let onion = crate::resolve_to(&profile, to)?;
     let tor_client = TorTransport::bootstrap(&profile).await?;
-    crate::shared::send(&profile, &onion, body, to, None, tor_client, false).await
+    crate::send(&profile, &onion, body, to, None, tor_client, false).await
 }
 
 pub async fn api_send_file(profile_path: &str, to: &str, file_path: &str) -> Result<()> {
     let profile = expand_profile(profile_path);
     let tor_client = TorTransport::bootstrap(&profile).await?;
-    crate::shared::send_file(&profile, to, file_path, None, tor_client).await
+    crate::send_file(&profile, to, file_path, None, tor_client).await
 }
 
 pub fn api_list_messages(
@@ -80,7 +80,7 @@ pub fn api_list_messages(
     limit: usize,
 ) -> Result<Vec<ApiMessage>> {
     let profile = expand_profile(profile_path);
-    let rows = crate::shared::load_history(&profile, contact, limit)?;
+    let rows = crate::load_history(&profile, contact, limit)?;
     Ok(rows
         .into_iter()
         .map(|r| ApiMessage {
@@ -102,16 +102,16 @@ pub fn api_list_messages(
 
 pub fn api_list_transfers(profile_path: &str) -> Result<Vec<String>> {
     let profile = expand_profile(profile_path);
-    crate::shared::list_transfers(&profile)
+    crate::list_transfers(&profile)
 }
 
 pub async fn api_resume_transfer(profile_path: &str, hash: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
-    let Some((contact, file_path)) = crate::shared::outbound_transfer_target(&profile, hash)? else {
+    let Some((contact, file_path)) = crate::outbound_transfer_target(&profile, hash)? else {
         return Ok(false);
     };
     let tor_client = TorTransport::bootstrap(&profile).await?;
-    crate::shared::send_file(
+    crate::send_file(
         &profile,
         &contact,
         &file_path,
@@ -124,16 +124,16 @@ pub async fn api_resume_transfer(profile_path: &str, hash: &str) -> Result<bool>
 
 pub fn api_cancel_transfer(profile_path: &str, hash: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
-    crate::shared::cancel_outbound_transfer(&profile, hash)
+    crate::cancel_outbound_transfer(&profile, hash)
 }
 
 pub fn api_status(profile_path: &str) -> Result<ApiStatus> {
     let profile = expand_profile(profile_path);
-    let contacts = crate::shared::load_contacts(&profile)?;
-    let transfers = crate::shared::list_transfers(&profile)?;
+    let contacts = crate::load_contacts(&profile)?;
+    let transfers = crate::list_transfers(&profile)?;
     Ok(ApiStatus {
         profile: profile.display().to_string(),
-        display_name: crate::shared::load_display_name(&profile)?,
+        display_name: crate::load_display_name(&profile)?,
         contact_count: contacts.len(),
         transfer_count: transfers.len(),
     })

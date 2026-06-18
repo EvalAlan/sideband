@@ -461,7 +461,6 @@ struct OutboundTransferState {
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-mod shared;
 
 // Global file transfer statics — restored after incomplete SharedTransferState refactor.
 static INCOMING_FILES: LazyLock<std::sync::Mutex<HashMap<String, IncomingFileState>>> =
