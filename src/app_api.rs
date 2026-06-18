@@ -115,10 +115,9 @@ pub fn list_messages(
             body: r.body,
             timestamp_ms: r.timestamp_ms,
             status: match r.status {
-                0 => "sent".to_string(),
-                1 => "delivered".to_string(),
                 2 => "failed".to_string(),
-                _ => "unknown".to_string(),
+                1 => "delivered".to_string(),
+                _ => "sent".to_string(),
             },
             created_at: r.created_at,
         })

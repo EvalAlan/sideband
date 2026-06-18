@@ -75,7 +75,7 @@ fn default_profile_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".sideband"))
 }
 
-fn expand_home(path: &Path) -> PathBuf {
+pub fn expand_home(path: &Path) -> PathBuf {
     if path == Path::new("~") {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home);
@@ -306,7 +306,7 @@ struct IdentityFile {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct ContactFile {
+pub struct ContactFile {
     name: String,
     onion: String,
     pubkey_b64: String,
@@ -315,17 +315,17 @@ struct ContactFile {
 }
 
 /// On-disk format: name -> ContactFile
-pub(crate) type ContactsMap = HashMap<String, ContactFile>;
+pub type ContactsMap = HashMap<String, ContactFile>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct GroupMember {
+pub struct GroupMember {
     pub(crate) contact: String,
     pub(crate) role: String,
     pub(crate) added_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct GroupInfo {
+pub struct GroupInfo {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) created_at_ms: i64,
@@ -338,7 +338,7 @@ pub(crate) struct GroupInfo {
 /// In v3 `body` and `enc_body` are empty; ratchet_header_b64, ratchet_nonce_hex,
 /// and ratchet_ct_hex carry the Double Ratchet payload.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct ChatMessage {
+pub struct ChatMessage {
     v: u32,
     r#type: String,
     from: String,
@@ -365,7 +365,7 @@ pub(crate) struct ChatMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub(crate) struct GroupMessagePayload {
+pub struct GroupMessagePayload {
     pub(crate) kind: String,
     pub(crate) group_id: String,
     pub(crate) group_title: String,
@@ -387,14 +387,14 @@ impl GroupMessagePayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct GroupLeavePayload {
+pub struct GroupLeavePayload {
     pub(crate) kind: String,
     pub(crate) group_id: String,
     pub(crate) group_title: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct GroupDeletePayload {
+pub struct GroupDeletePayload {
     pub(crate) kind: String,
     pub(crate) group_id: String,
     pub(crate) group_title: String,
@@ -408,7 +408,7 @@ const FILE_CHUNK_SIZE: usize = 8 * 1024; // 8 KB chunks (smaller HS payload for 
 const FILE_INLINE_MAX_SIZE: usize = 96 * 1024; // auto-inline small/medium files; no mode switching for users
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct FileOfferPayload {
+pub struct FileOfferPayload {
     name: String,
     size: usize,
     hash: String,
@@ -416,7 +416,7 @@ pub(crate) struct FileOfferPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct FileChunkPayload {
+pub struct FileChunkPayload {
     name: String,
     hash: String,
     chunk_index: usize,
@@ -425,7 +425,7 @@ pub(crate) struct FileChunkPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct FileAckPayload {
+pub struct FileAckPayload {
     hash: String,
     chunk_index: usize,
     total_chunks: usize,
@@ -605,7 +605,7 @@ fn load_outbound_state(profile: &Path, hash: &str) -> Result<Option<OutboundTran
     }))
 }
 
-pub(crate) fn outbound_transfer_target(
+pub fn outbound_transfer_target(
     profile: &Path,
     hash: &str,
 ) -> Result<Option<(String, String)>> {
@@ -624,7 +624,7 @@ fn clear_outbound_state(profile: &Path, hash: &str) {
     }
 }
 
-pub(crate) fn list_transfers(profile: &Path) -> Result<Vec<String>> {
+pub fn list_transfers(profile: &Path) -> Result<Vec<String>> {
     let mut rows = Vec::new();
     let conn = init_db(profile)?;
 
@@ -663,7 +663,7 @@ pub(crate) fn list_transfers(profile: &Path) -> Result<Vec<String>> {
     Ok(rows)
 }
 
-pub(crate) fn cancel_outbound_transfer(profile: &Path, hash: &str) -> Result<bool> {
+pub fn cancel_outbound_transfer(profile: &Path, hash: &str) -> Result<bool> {
     let conn = init_db(profile)?;
     let affected = conn.execute(
         "DELETE FROM outbound_transfers WHERE hash = ?1",
@@ -673,7 +673,7 @@ pub(crate) fn cancel_outbound_transfer(profile: &Path, hash: &str) -> Result<boo
 }
 
 /// Send a file to a contact. Sends `file_offer` then all `file_chunk` messages.
-pub(crate) async fn send_file(
+pub async fn send_file(
     profile: &Path,
     contact_name: &str,
     file_path: &str,
@@ -1497,7 +1497,7 @@ pub(crate) struct HistoryRow {
     conversation_id: String,
 }
 
-pub(crate) fn load_history(
+pub fn load_history(
     profile: &Path,
     contact_filter: Option<&str>,
     limit: usize,
@@ -2464,7 +2464,7 @@ async fn main() -> Result<()> {
 // Parse `to` field: onion address or contact name
 // ---------------------------------------------------------------------------
 
-pub(crate) fn resolve_to(profile: &Path, to: &str) -> Result<String> {
+pub fn resolve_to(profile: &Path, to: &str) -> Result<String> {
     if to.ends_with(".onion") {
         return Ok(to.to_string());
     }
@@ -2492,7 +2492,7 @@ pub(crate) fn resolve_contact_name_by_pubkey(
 // Profile / Identity
 // ---------------------------------------------------------------------------
 
-fn default_display_name(profile: &Path) -> String {
+pub fn default_display_name(profile: &Path) -> String {
     profile
         .file_name()
         .and_then(|n| n.to_str())
@@ -2502,7 +2502,7 @@ fn default_display_name(profile: &Path) -> String {
         .to_string()
 }
 
-fn identity_path(profile: &Path) -> PathBuf {
+pub fn identity_path(profile: &Path) -> PathBuf {
     profile.join("identity.toml")
 }
 
@@ -2516,7 +2516,7 @@ fn save_identity(profile: &Path, id: &IdentityFile) -> Result<()> {
     fs::write(identity_path(profile), toml::to_string_pretty(id)?).context("write identity")
 }
 
-pub(crate) fn load_display_name(profile: &Path) -> Result<String> {
+pub fn load_display_name(profile: &Path) -> Result<String> {
     let mut id = load_identity(profile)?;
     if id.display_name.trim().is_empty() {
         id.display_name = default_display_name(profile);
@@ -2622,7 +2622,7 @@ fn run_wizard(profile: &Path) -> Result<()> {
     init_profile_with_name(profile, &name)
 }
 
-pub(crate) fn init_profile_with_name(profile: &Path, display_name: &str) -> Result<()> {
+pub fn init_profile_with_name(profile: &Path, display_name: &str) -> Result<()> {
     fs::create_dir_all(profile).context("create profile dir")?;
 
     let signing = SigningKey::generate(&mut OsRng);
@@ -2741,7 +2741,7 @@ fn contacts_path(profile: &Path) -> PathBuf {
     profile.join("contacts.toml")
 }
 
-pub(crate) fn load_contacts(profile: &Path) -> Result<ContactsMap> {
+pub fn load_contacts(profile: &Path) -> Result<ContactsMap> {
     let p = contacts_path(profile);
     if !p.exists() {
         return Ok(HashMap::new());
@@ -2751,14 +2751,14 @@ pub(crate) fn load_contacts(profile: &Path) -> Result<ContactsMap> {
     Ok(map)
 }
 
-fn save_contacts(profile: &Path, contacts: &ContactsMap) -> Result<()> {
+pub fn save_contacts(profile: &Path, contacts: &ContactsMap) -> Result<()> {
     let p = contacts_path(profile);
     fs::write(&p, toml::to_string_pretty(contacts)?)
         .with_context(|| format!("write {}", p.display()))?;
     Ok(())
 }
 
-fn validate_contact_fields(onion: &str, pubkey_b64: &str, x25519_pubkey_b64: &str) -> Result<()> {
+pub fn validate_contact_fields(onion: &str, pubkey_b64: &str, x25519_pubkey_b64: &str) -> Result<()> {
     onion
         .parse::<tor_hsservice::HsId>()
         .map_err(|e| anyhow!("invalid v3 onion address '{}': {}", onion, e))?;
@@ -2780,7 +2780,7 @@ fn validate_contact_fields(onion: &str, pubkey_b64: &str, x25519_pubkey_b64: &st
     Ok(())
 }
 
-pub(crate) fn contact_add(
+pub fn contact_add(
     profile: &Path,
     name: &str,
     onion: &str,
@@ -2856,7 +2856,7 @@ fn save_autodiscovered_contact(profile: &Path, msg: &ChatMessage) -> Result<Opti
     Ok(Some(name))
 }
 
-pub(crate) fn contact_delete(profile: &Path, name: &str) -> Result<bool> {
+pub fn contact_delete(profile: &Path, name: &str) -> Result<bool> {
     let mut contacts = load_contacts(profile)?;
     if contacts.remove(name).is_some() {
         save_contacts(profile, &contacts)?;
@@ -4009,7 +4009,7 @@ pub(crate) async fn serve(
 // Send
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn send(
+pub async fn send(
     profile: &Path,
     to: &str,
     message: &str,
