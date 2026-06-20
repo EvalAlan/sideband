@@ -14,8 +14,15 @@ use crate::types::{ApiContact, ApiGroup, ApiMessage, ApiStatus};
 
 type ListenerStatusCallback = extern "C" fn(status: *const c_char, onion: *const c_char);
 
+struct MobileSendCommand {
+    to: String,
+    body: String,
+    response: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
 struct ListenerState {
     quit_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    send_tx: Option<tokio::sync::mpsc::Sender<MobileSendCommand>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -114,6 +121,29 @@ pub fn api_delete_contact(profile_path: &str, name: &str) -> Result<bool> {
 
 pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Result<()> {
     let profile = expand_profile(profile_path);
+    let listener_send_tx = {
+        let guard = LISTENER_STATE
+            .lock()
+            .map_err(|_| anyhow!("listener mutex poisoned"))?;
+        guard.as_ref().and_then(|state| state.send_tx.clone())
+    };
+
+    if let Some(send_tx) = listener_send_tx {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        send_tx
+            .send(MobileSendCommand {
+                to: to.to_string(),
+                body: body.to_string(),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| anyhow!("mobile listener send channel is closed"))?;
+        return response_rx
+            .await
+            .map_err(|_| anyhow!("mobile listener send response was dropped"))?
+            .map_err(|e| anyhow!(e));
+    }
+
     let onion = crate::resolve_to(&profile, to)?;
     let tor_client = TorTransport::bootstrap(&profile).await?;
     crate::send(&profile, &onion, body, to, None, tor_client, false).await
@@ -483,6 +513,7 @@ pub extern "C" fn sideband_api_listener_start(
         }
 
         let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<MobileSendCommand>(64);
         let profile_for_task = profile_buf.clone();
         set_listener_status("listener starting", "");
         let handle = std::thread::spawn(move || {
@@ -499,6 +530,31 @@ pub extern "C" fn sideband_api_listener_start(
                     }
                 };
                 set_listener_status("tor bootstrapping", "");
+                let send_profile = profile_for_task.clone();
+                let send_client = tor_client.clone();
+                let send_lock = Arc::new(tokio::sync::Mutex::new(()));
+                let send_task = tokio::spawn(async move {
+                    while let Some(cmd) = send_rx.recv().await {
+                        let result = match crate::resolve_to(&send_profile, &cmd.to) {
+                            Ok(onion) => {
+                                let _guard = send_lock.lock().await;
+                                crate::send(
+                                    &send_profile,
+                                    &onion,
+                                    &cmd.body,
+                                    &cmd.to,
+                                    None,
+                                    send_client.clone(),
+                                    false,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        };
+                        let _ = cmd.response.send(result);
+                    }
+                });
                 let (tui_tx, mut tui_rx) = tokio::sync::mpsc::channel::<crate::TuiEvent>(256);
                 let status_task = tokio::spawn(async move {
                     while let Some(event) = tui_rx.recv().await {
@@ -525,12 +581,14 @@ pub extern "C" fn sideband_api_listener_start(
                     Ok(()) => set_listener_status("listener stopped", ""),
                     Err(e) => set_listener_status(&format!("listener failed: {e}"), ""),
                 }
+                send_task.abort();
                 status_task.abort();
             });
         });
 
         *guard = Some(ListenerState {
             quit_tx: Some(quit_tx),
+            send_tx: Some(send_tx),
             handle: Some(handle),
         });
         Ok(())
