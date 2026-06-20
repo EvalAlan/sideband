@@ -319,18 +319,18 @@ pub type ContactsMap = HashMap<String, ContactFile>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GroupMember {
-    pub(crate) contact: String,
-    pub(crate) role: String,
-    pub(crate) added_at_ms: i64,
+    pub contact: String,
+    pub role: String,
+    pub added_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GroupInfo {
-    pub(crate) id: String,
-    pub(crate) title: String,
-    pub(crate) created_at_ms: i64,
-    pub(crate) updated_at_ms: i64,
-    pub(crate) members: Vec<GroupMember>,
+    pub id: String,
+    pub title: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub members: Vec<GroupMember>,
 }
 
 /// Chat message format (v1 = signed plaintext, v2 = signed + encrypted, v3 = double ratchet).

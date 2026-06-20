@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -969,44 +968,6 @@ class _Cli {
   }
 }
 
-// Global callback holder for the listener status callback.
-// FFI requires a top-level static function, so we route through this.
-// The callback from Rust arrives on a background thread, so we use a
-// ReceivePort to bridge to the main Dart isolate.
-void Function(String status, String onion)? _activeListenerCallback;
-ReceivePort? _listenerReceivePort;
-
-void _listenerStatusCallback(ffi.Pointer<Utf8> statusPtr, ffi.Pointer<Utf8> onionPtr) {
-  final cb = _activeListenerCallback;
-  if (cb == null) return;
-  final status = statusPtr.toDartString();
-  final onion = onionPtr.toDartString();
-  cb(status, onion);
-}
-
-/// Bridge that receives listener status on the main isolate via ReceivePort.
-/// This avoids the "Cannot invoke native callback outside an isolate" crash
-/// because the FFI callback sends data through the port instead of calling
-/// Dart code directly from a background thread.
-void _listenerPortHandler(dynamic message) {
-  if (message is! List || message.length != 2) return;
-  final status = message[0] as String;
-  final onion = message[1] as String;
-  final cb = _activeListenerCallback;
-  if (cb == null) return;
-  cb(status, onion);
-}
-
-/// FFI callback that sends status through a ReceivePort instead of
-/// invoking Dart code directly.
-void _listenerStatusCallbackPort(ffi.Pointer<Utf8> statusPtr, ffi.Pointer<Utf8> onionPtr) {
-  final port = _listenerReceivePort;
-  if (port == null) return;
-  final status = statusPtr.toDartString();
-  final onion = onionPtr.toDartString();
-  port.sendPort.send([status, onion]);
-}
-
 class _MobileApi {
   _MobileApi()
       : _initProfile = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
@@ -1060,13 +1021,24 @@ class _MobileApi {
             ffi.Void Function(ffi.Pointer<Utf8>),
             void Function(ffi.Pointer<Utf8>)>('sideband_api_free_string'),
         _listenerStart = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-                ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>>),
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-                ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>>)>('sideband_api_listener_start'),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>('sideband_api_listener_start'),
         _listenerStop = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(),
             ffi.Pointer<Utf8> Function()>('sideband_api_listener_stop'),
+        _createGroup = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_create_group'),
+        _deleteGroup = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_delete_group'),
+        _clearHistory = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_clear_history'),
         _shareCommand = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
             ffi.Pointer<Utf8> Function(
@@ -1093,11 +1065,14 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
       _deleteContact;
   final void Function(ffi.Pointer<Utf8>) _freeString;
-  final ffi.Pointer<Utf8> Function(
-      ffi.Pointer<Utf8>,
-      ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>>)
-      _listenerStart;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _listenerStart;
   final ffi.Pointer<Utf8> Function() _listenerStop;
+  final ffi.Pointer<Utf8> Function(
+      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _createGroup;
+  final ffi.Pointer<Utf8> Function(
+      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _deleteGroup;
+  final ffi.Pointer<Utf8> Function(
+      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _clearHistory;
   final ffi.Pointer<Utf8> Function(
       ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _shareCommand;
 
@@ -1292,19 +1267,10 @@ class _MobileApi {
     _withCString2<Object?>(await profilePath(), name, _deleteContact);
   }
 
-  Future<void> startListener(void Function(String status, String onion) onStatus) async {
+  Future<void> startListener() async {
     final profile = (await profilePath()).toNativeUtf8();
-    _activeListenerCallback = onStatus;
-    // Create a ReceivePort to bridge the FFI callback (which arrives on a
-    // background thread) to the main Dart isolate.
-    _listenerReceivePort?.close();
-    _listenerReceivePort = ReceivePort()..listen(_listenerPortHandler);
-    final callback = ffi.Pointer.fromFunction<
-        ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>(
-      _listenerStatusCallbackPort,
-    );
     try {
-      _decode<Object?>(_listenerStart(profile, callback));
+      _decode<Object?>(_listenerStart(profile));
     } finally {
       calloc.free(profile);
     }
@@ -1312,8 +1278,44 @@ class _MobileApi {
 
   void stopListener() {
     _decode<Object?>(_listenerStop());
-    _listenerReceivePort?.close();
-    _listenerReceivePort = null;
+  }
+
+  Future<void> createGroup({
+    required String title,
+    required List<String> members,
+  }) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final ctitle = title.toNativeUtf8();
+    final cmembers = jsonEncode(members).toNativeUtf8();
+    try {
+      _decode<Object?>(_createGroup(profile, ctitle, cmembers));
+    } finally {
+      calloc.free(profile);
+      calloc.free(ctitle);
+      calloc.free(cmembers);
+    }
+  }
+
+  Future<void> deleteGroup(String groupId) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cgroup = groupId.toNativeUtf8();
+    try {
+      _decode<Object?>(_deleteGroup(profile, cgroup));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cgroup);
+    }
+  }
+
+  Future<void> clearHistory({String? contact}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final ccontact = contact?.toNativeUtf8() ?? ffi.nullptr;
+    try {
+      _decode<Object?>(_clearHistory(profile, ccontact));
+    } finally {
+      calloc.free(profile);
+      if (ccontact != ffi.nullptr) calloc.free(ccontact);
+    }
   }
 
   Future<ShareInfo> share(String onion) async {
@@ -1408,6 +1410,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   DateTime? _lastSendStartedAt;
   Timer? _poll;
   String _selectedTheme = 'Teal';
+  String? _mobileProfilePath;
   String? _pendingAttachmentPath;
   String? _pendingAttachmentName;
   int _pendingAttachmentSize = 0;
@@ -1473,6 +1476,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Future<void> _bootstrapMobile() async {
     final mobile = _mobile;
     if (mobile == null) throw Exception('Android backend unavailable');
+    _mobileProfilePath = await mobile.profilePath();
     try {
       await mobile.status();
     } catch (_) {
@@ -1528,7 +1532,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         _sel = selected;
         _selGroup = selectedGroup;
         _msgs = _mergePending(history.msgs);
-        _listenerRunning = true;
+        _listenerRunning = false;
         _listenerStatus = 'mobile backend ready';
         _loading = false;
       });
@@ -1550,20 +1554,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       return;
     }
     try {
-      await mobile.startListener((status, onion) {
-        if (!mounted) return;
-        setState(() {
-          _listenerStatus = status;
-          if (onion.isNotEmpty) {
-            _mobileOnion = onion;
-            _listenerRunning = true;
-            _error = null;
-          }
-        });
-      });
+      await mobile.startListener();
+      await _syncMobileListenerStatus();
       setState(() {
         _listenerRunning = true;
-        _listenerStatus = 'mobile listener starting';
       });
     } catch (e) {
       if (!mounted) return;
@@ -1572,6 +1566,26 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         _error = '$e';
       });
     }
+  }
+
+  Future<void> _syncMobileListenerStatus() async {
+    final mobile = _mobile;
+    if (mobile == null || !mounted) return;
+    final status = await mobile.status();
+    if (!mounted) return;
+    setState(() {
+      _mobileProfilePath = status['profile'] as String? ?? _mobileProfilePath;
+      _listenerStatus = status['listener_status'] as String? ?? _listenerStatus;
+      final onion = status['listener_onion'] as String? ?? '';
+      if (onion.isNotEmpty) {
+        _mobileOnion = onion;
+      }
+      _listenerRunning =
+          status['listener_running'] as bool? ?? _listenerRunning;
+      if (_listenerRunning) {
+        _error = null;
+      }
+    });
   }
 
 
@@ -1661,6 +1675,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   String _expandedProfilePath() {
+    if (_canUseMobileBackend) {
+      final p = _mobileProfilePath;
+      if (p != null && p.isNotEmpty) return p;
+    }
     return _cli.expandedProfilePath();
   }
 
@@ -2170,6 +2188,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
       if (s == null && sg == null) {
         await _checkUnread();
+        if (_canUseMobileBackend && _mobile != null) {
+          await _syncMobileListenerStatus();
+        }
         if (mounted) setState(() {});
         return;
       }
@@ -2178,6 +2199,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           ? await _historyVisibleForMobile(s?.name, group: sg?.id, knownContacts: c.map((x) => x.name))
           : await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((x) => x.name));
       await _checkUnread();
+      if (_canUseMobileBackend && _mobile != null) {
+        await _syncMobileListenerStatus();
+      }
       setState(() {
         _msgs = _mergePending(h.msgs);
       });
@@ -2516,27 +2540,42 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           }
           final contact = parts[1];
           final msg = raw.split(RegExp(r'\s+')).skip(2).join(' ');
-          await _cli.send(to: contact, message: msg);
-          await _load();
+          if (_canUseMobileBackend && _mobile != null) {
+            await _mobile!.send(to: contact, message: msg);
+          } else {
+            await _cli.send(to: contact, message: msg);
+          }
+          await _refresh();
           return;
         case 'group-create':
           if (parts.length < 3) {
             throw Exception(
                 'usage: /group-create <title> <member> [member...]');
           }
-          final group = await _cli.createGroup(
-            title: parts[1],
-            members: parts.skip(2).toList(),
-          );
-          await _load();
-          _showInfo('Group created', group.details);
+          if (_canUseMobileBackend && _mobile != null) {
+            await _mobile!.createGroup(
+              title: parts[1],
+              members: parts.skip(2).toList(),
+            );
+          } else {
+            final group = await _cli.createGroup(
+              title: parts[1],
+              members: parts.skip(2).toList(),
+            );
+            _showInfo('Group created', group.details);
+          }
+          await _refresh();
           return;
         case 'group-delete':
           if (parts.length != 2) {
             throw Exception('usage: /group-delete <id-or-title>');
           }
-          _showInfo('Group deleted', await _cli.deleteGroup(parts[1]));
-          await _load();
+          if (_canUseMobileBackend && _mobile != null) {
+            await _mobile!.deleteGroup(parts[1]);
+          } else {
+            _showInfo('Group deleted', await _cli.deleteGroup(parts[1]));
+          }
+          await _refresh();
           if (_selGroup?.id == parts[1] || _selGroup?.title == parts[1]) {
             setState(() {
               _selGroup = null;
@@ -2597,7 +2636,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           return;
         case 'history':
           final contact = parts.length > 1 ? parts[1] : null;
-          final h = await _cli.history(contact: contact, limit: 200);
+          final h = _canUseMobileBackend && _mobile != null
+              ? await _mobile!.history(contact: contact, limit: 200)
+              : await _cli.history(contact: contact, limit: 200);
           final lines = h.msgs.reversed.map((m) {
             final arrow = m.direction == 'out' ? '→' : '←';
             return '${_hm(m.ts)} $arrow ${m.contact}: ${m.text}';
@@ -2612,7 +2653,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           await _loadGroupHistory(parts[1]);
           return;
         case 'contacts':
-          await _load();
+          await _refresh();
           _showInfo(
               'Contacts',
               _contacts.isEmpty
@@ -2623,7 +2664,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       .join('\n\n'));
           return;
         case 'groups':
-          await _load();
+          await _refresh();
           _showInfo(
               'Groups',
               _groups.isEmpty
@@ -2657,18 +2698,31 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             throw Exception(
                 'usage: /add <name> <onion> <ed25519_pubkey_b64> <x25519_pubkey_b64>');
           }
-          await _cli.addContact(
-            name: parts[1],
-            onion: parts[2],
-            pubkey: parts[3],
-            x25519Pubkey: parts[4],
-          );
-          await _load();
+          if (_canUseMobileBackend && _mobile != null) {
+            await _mobile!.addContact(
+              name: parts[1],
+              onion: parts[2],
+              pubkey: parts[3],
+              x25519Pubkey: parts[4],
+            );
+          } else {
+            await _cli.addContact(
+              name: parts[1],
+              onion: parts[2],
+              pubkey: parts[3],
+              x25519Pubkey: parts[4],
+            );
+          }
+          await _refresh();
           return;
         case 'delete':
           if (parts.length < 2) throw Exception('usage: /delete <contact>');
-          _showInfo('Contact deleted', await _cli.deleteContact(parts[1]));
-          await _load();
+          if (_canUseMobileBackend && _mobile != null) {
+            await _mobile!.deleteContact(parts[1]);
+          } else {
+            _showInfo('Contact deleted', await _cli.deleteContact(parts[1]));
+          }
+          await _refresh();
           return;
         case 'name':
           _showInfo('Name', await _cli.name(arg.isEmpty ? null : arg));
@@ -2677,27 +2731,27 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _showInfo('Identity', await _cli.identity());
           return;
         case 'share':
-          final identity = await _cli.identity();
-          String value(String prefix) {
-            final line = identity
-                .split('\n')
-                .firstWhere((l) => l.startsWith(prefix), orElse: () => '');
-            return line.isEmpty ? '' : line.substring(prefix.length).trim();
+          final onion = _currentOnion() ?? '(waiting for Tor)';
+          if (_canUseMobileBackend && _mobile != null) {
+            final share = await _mobile!.share(onion);
+            _showInfo('Share contact', share.command);
+          } else {
+            final identity = await _cli.identity();
+            String value(String prefix) {
+              final line = identity
+                  .split('\n')
+                  .firstWhere((l) => l.startsWith(prefix), orElse: () => '');
+              return line.isEmpty ? '' : line.substring(prefix.length).trim();
+            }
+            final name = value('name:');
+            final ed = value('pubkey(ed25519,b64):');
+            final x = value('pubkey(x25519,b64):');
+            _showInfo('Share contact', '/add $name $onion $ed $x');
           }
-          final name = value('name:');
-          final ed = value('pubkey(ed25519,b64):');
-          final x = value('pubkey(x25519,b64):');
-          final onion = _listenerStatus.startsWith('listening ')
-              ? _listenerStatus.substring('listening '.length)
-              : '(waiting for Tor)';
-          _showInfo('Share contact', '/add $name $onion $ed $x');
           return;
         case 'onion':
-          _showInfo(
-              'Onion',
-              _listenerStatus.startsWith('listening ')
-                  ? _listenerStatus.substring('listening '.length)
-                  : '(waiting for Tor)');
+          final onion = _currentOnion() ?? '(waiting for Tor)';
+          _showInfo('Onion', onion);
           return;
         case 'ratchet':
           if (parts.length < 2) throw Exception('usage: /ratchet <contact>');
@@ -2707,7 +2761,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           return;
         case 'status':
           _showInfo('Status',
-              'listener: $_listenerStatus\nprofile: ${_cli.profile}\nbinary: ${_cli.bin}\ncontacts: ${_contacts.length}\ngroups: ${_groups.length}\nmessages visible: ${_msgs.length}');
+              'listener: $_listenerStatus\nprofile: ${_runtimeProfileLabel()}\nbackend: ${_runtimeBackendLabel()}\ncontacts: ${_contacts.length}\ngroups: ${_groups.length}\nmessages visible: ${_msgs.length}');
           return;
         case 'clear':
           setState(() => _msgs = []);
@@ -2809,16 +2863,28 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
       final newName = name.text.trim();
       if (newName.isEmpty) throw Exception('contact name is required');
-      await _cli.addContact(
-        name: newName,
-        onion: onion.text.trim(),
-        pubkey: pubkey.text.trim(),
-        x25519Pubkey: x25519.text.trim(),
-      );
-      if (editing && contact.name != newName) {
-        await _cli.deleteContact(contact.name);
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.addContact(
+          name: newName,
+          onion: onion.text.trim(),
+          pubkey: pubkey.text.trim(),
+          x25519Pubkey: x25519.text.trim(),
+        );
+        if (editing && contact.name != newName) {
+          await _mobile!.deleteContact(contact.name);
+        }
+      } else {
+        await _cli.addContact(
+          name: newName,
+          onion: onion.text.trim(),
+          pubkey: pubkey.text.trim(),
+          x25519Pubkey: x25519.text.trim(),
+        );
+        if (editing && contact.name != newName) {
+          await _cli.deleteContact(contact.name);
+        }
       }
-      await _load();
+      await _refresh();
       if (editing) {
         for (final updated in _contacts.where((c) => c.name == newName)) {
           setState(() => _sel = updated);
@@ -2909,21 +2975,19 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       final groupTitle = title.text.trim();
       if (groupTitle.isEmpty) throw Exception('group title is required');
       if (selected.isEmpty) throw Exception('select at least one group member');
-      final group = await _cli.createGroup(
-        title: groupTitle,
-        members: selected.toList()..sort(),
-      );
-      await _load();
-      for (final loaded in _groups.where((g) => g.id == group.id)) {
-        final h = await _historyVisibleFor(null, group: loaded.id);
-        setState(() {
-          _sel = null;
-          _selGroup = loaded;
-          _msgs = _mergePending(h.msgs);
-        });
-        break;
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.createGroup(
+          title: groupTitle,
+          members: selected.toList()..sort(),
+        );
+      } else {
+        final group = await _cli.createGroup(
+          title: groupTitle,
+          members: selected.toList()..sort(),
+        );
+        _showInfo('Group created', group.details);
       }
-      _showInfo('Group created', group.details);
+      await _refresh();
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     } finally {
@@ -2933,7 +2997,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Future<void> _loadGroupHistory(String group) async {
     try {
-      final h = await _cli.history(group: group);
+      final h = _canUseMobileBackend && _mobile != null
+          ? await _mobile!.history(group: group)
+          : await _cli.history(group: group);
       setState(() => _msgs = _mergePending(h.msgs));
       _scrollToBottom();
     } catch (e) {
@@ -2947,8 +3013,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       return;
     }
     try {
-      _showInfo('Contact deleted', await _cli.deleteContact(contact.name));
-      await _load();
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.deleteContact(contact.name);
+      } else {
+        _showInfo('Contact deleted', await _cli.deleteContact(contact.name));
+      }
+      await _refresh();
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     }
@@ -2960,9 +3030,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       return;
     }
     try {
-      _showInfo(
-          'History deleted', await _cli.clearHistory(contact: contact.name));
-      await _load();
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.clearHistory(contact: contact.name);
+      } else {
+        _showInfo(
+            'History deleted', await _cli.clearHistory(contact: contact.name));
+      }
+      await _refresh();
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     }
@@ -2974,8 +3048,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       return;
     }
     try {
-      _showInfo('History deleted', await _cli.clearHistory(group: group.id));
-      await _loadGroupHistory(group.id);
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.clearHistory(contact: group.id);
+      } else {
+        _showInfo('History deleted', await _cli.clearHistory(group: group.id));
+      }
+      await _refresh();
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     }
@@ -2987,8 +3065,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       return;
     }
     try {
-      _showInfo('Group deleted', await _cli.deleteGroup(group.id));
-      await _load();
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.deleteGroup(group.id);
+      } else {
+        _showInfo('Group deleted', await _cli.deleteGroup(group.id));
+      }
+      await _refresh();
       if (_selGroup?.id == group.id) {
         setState(() {
           _selGroup = null;
@@ -3239,10 +3321,22 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     return onion.trim();
   }
 
+  String _runtimeProfileLabel() {
+    return _expandedProfilePath();
+  }
+
+  String _runtimeBackendLabel() {
+    if (_canUseMobileBackend) return 'libsideband.so (Android FFI)';
+    return _cli.bin;
+  }
+
   Future<ShareInfo> _shareInfo() async {
     final onion = _currentOnion();
     if (onion == null) {
       throw Exception('onion address is not ready yet');
+    }
+    if (_canUseMobileBackend && _mobile != null) {
+      return _mobile!.share(onion);
     }
     return _cli.share(onion);
   }
@@ -3455,7 +3549,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     leading: const Icon(Icons.info_outline),
                     title: const Text('Runtime status'),
                     subtitle:
-                        Text('${_cli.profile} • ${_contacts.length} contacts'),
+                        Text('${_runtimeProfileLabel()} • ${_contacts.length} contacts'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_runSlashCommand('/status'));
@@ -3477,7 +3571,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       subtitle: const Text('Bring the onion service back up'),
                       onTap: () {
                         Navigator.pop(dialogContext);
-                        unawaited(_startListener());
+                        unawaited(_canUseMobileBackend ? _startMobileListener() : _startListener());
                       },
                     ),
                 ],
@@ -3966,7 +4060,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                         overflow: TextOverflow.ellipsis,
                       ),
                       Text(
-                        _cli.profile,
+                        _runtimeProfileLabel(),
                         style: TextStyle(fontSize: 10, color: _t.textDim),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -3978,7 +4072,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   IconButton(
                     icon: const Icon(Icons.power_settings_new, size: 16),
                     tooltip: 'Start listener',
-                    onPressed: _startListener,
+                    onPressed:
+                        _canUseMobileBackend ? _startMobileListener : _startListener,
                   ),
               ],
             ),

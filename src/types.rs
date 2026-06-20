@@ -28,6 +28,9 @@ pub struct ApiStatus {
     pub display_name: String,
     pub contact_count: usize,
     pub transfer_count: usize,
+    pub listener_status: String,
+    pub listener_onion: String,
+    pub listener_running: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

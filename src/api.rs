@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use rusqlite::params;
+use serde::Serialize;
 
 use crate::transport::tor::TorTransport;
 use crate::transport::Transport;
@@ -242,11 +243,18 @@ pub fn api_status(profile_path: &str) -> Result<ApiStatus> {
     let profile = expand_profile(profile_path);
     let contacts = crate::load_contacts(&profile)?;
     let transfers = crate::list_transfers(&profile)?;
+    let (listener_status, listener_onion) = get_listener_status();
     Ok(ApiStatus {
         profile: profile.display().to_string(),
         display_name: crate::load_display_name(&profile)?,
         contact_count: contacts.len(),
         transfer_count: transfers.len(),
+        listener_status,
+        listener_onion,
+        listener_running: LISTENER_STATE
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false),
     })
 }
 
@@ -403,6 +411,53 @@ pub extern "C" fn sideband_api_delete_contact(
 }
 
 #[no_mangle]
+pub extern "C" fn sideband_api_create_group(
+    profile_path: *const c_char,
+    title: *const c_char,
+    members_json: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        let profile = cstr_arg(profile_path, "profile_path")?;
+        let title = cstr_arg(title, "title")?;
+        let members_raw = cstr_arg(members_json, "members_json")?;
+        let members: Vec<String> = serde_json::from_str(members_raw)
+            .map_err(|e| anyhow!("parse members JSON: {e}"))?;
+        let group = crate::create_group(Path::new(profile), title, &members)?;
+        serde_json::to_string(&group).map_err(|e| anyhow!("serialize group: {e}"))
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_delete_group(
+    profile_path: *const c_char,
+    group_id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        let profile = cstr_arg(profile_path, "profile_path")?;
+        let group_id = cstr_arg(group_id, "group_id")?;
+        let group = crate::delete_group(Path::new(profile), group_id)?;
+        serde_json::to_string(&group).map_err(|e| anyhow!("serialize group: {e}"))
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_clear_history(
+    profile_path: *const c_char,
+    contact: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        let profile = cstr_arg(profile_path, "profile_path")?;
+        let contact = if contact.is_null() {
+            None
+        } else {
+            Some(cstr_arg(contact, "contact")?)
+        };
+        crate::clear_history(Path::new(profile), contact)?;
+        Ok(())
+    })())
+}
+
+#[no_mangle]
 pub extern "C" fn sideband_api_share_command(
     profile_path: *const c_char,
     onion: *const c_char,
@@ -417,20 +472,9 @@ pub extern "C" fn sideband_api_share_command(
     })())
 }
 
-fn emit_listener_status(cb: ListenerStatusCallback, status: &str, onion: &str) {
-    let cstatus = CString::new(status).unwrap_or_default();
-    let conion = CString::new(onion).unwrap_or_default();
-    cb(cstatus.as_ptr(), conion.as_ptr());
-}
-
-fn emit_status_str(cb: ListenerStatusCallback, status: &str) {
-    emit_listener_status(cb, status, "");
-}
-
 #[no_mangle]
 pub extern "C" fn sideband_api_listener_start(
     profile_path: *const c_char,
-    cb: ListenerStatusCallback,
 ) -> *mut c_char {
     json_response((|| {
         let profile = cstr_arg(profile_path, "profile_path")?;
@@ -443,22 +487,21 @@ pub extern "C" fn sideband_api_listener_start(
 
         let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
         let profile_for_task = profile_buf.clone();
+        set_listener_status("listener starting", "");
         let handle = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime for listener");
-            let local_cb = cb;
             runtime.block_on(async move {
-                emit_status_str(local_cb, "listener starting");
                 let tor_client = match TorTransport::bootstrap(&profile_for_task).await {
                     Ok(c) => c,
                     Err(e) => {
-                        emit_status_str(local_cb, &format!("listener failed: {e}"));
+                        set_listener_status(&format!("listener failed: {e}"), "");
                         return;
                     }
                 };
-                emit_status_str(local_cb, "tor bootstrapping");
+                set_listener_status("tor bootstrapping", "");
                 let transport = Arc::new(TorTransport::new(None, tor_client.clone()));
                 let transport_for_loop = transport.clone();
                 let loop_task = tokio::spawn(async move {
@@ -472,13 +515,13 @@ pub extern "C" fn sideband_api_listener_start(
                         _ = status_interval.tick() => {
                             let onion = Transport::local_addr(&*transport).unwrap_or_default();
                             if onion.is_empty() {
-                                emit_status_str(local_cb, "onion pending");
+                                set_listener_status("onion pending", "");
                             } else {
-                                emit_listener_status(local_cb, "listening", &onion);
+                                set_listener_status("listening", &onion);
                             }
                         }
                         _ = &mut loop_task => {
-                            emit_status_str(local_cb, "listener stopped");
+                            set_listener_status("listener stopped", "");
                             return;
                         }
                     }
@@ -503,6 +546,7 @@ pub extern "C" fn sideband_api_listener_stop() -> *mut c_char {
         if let Some(tx) = quit_tx {
             let _ = tx.send(());
         }
+        set_listener_status("listener stopped", "");
         drop(state);
         Ok(())
     })())
