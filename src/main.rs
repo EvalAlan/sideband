@@ -1486,16 +1486,16 @@ pub(crate) fn store_message_for_conversation(
 #[allow(dead_code)]
 #[derive(Serialize)]
 pub(crate) struct HistoryRow {
-    id: i64,
-    direction: String,
-    contact: String,
-    onion: String,
-    body: String,
-    timestamp_ms: i64,
-    status: i64,
-    created_at: String,
-    conversation_kind: String,
-    conversation_id: String,
+    pub(crate) id: i64,
+    pub(crate) direction: String,
+    pub(crate) contact: String,
+    pub(crate) onion: String,
+    pub(crate) body: String,
+    pub(crate) timestamp_ms: i64,
+    pub(crate) status: i64,
+    pub(crate) created_at: String,
+    pub(crate) conversation_kind: String,
+    pub(crate) conversation_id: String,
 }
 
 pub fn load_history(

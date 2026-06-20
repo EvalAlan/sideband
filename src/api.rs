@@ -1,12 +1,26 @@
 // FFI-friendly API wrappers — take &str, convert to &Path internally
 // Function names are prefixed with api_ to avoid shadowing crate-internal functions
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
+use rusqlite::params;
 
 use crate::transport::tor::TorTransport;
-use crate::types::{ApiContact, ApiMessage, ApiStatus};
+use crate::transport::Transport;
+use crate::types::{ApiContact, ApiGroup, ApiMessage, ApiStatus};
+
+type ListenerStatusCallback = extern "C" fn(status: *const c_char, onion: *const c_char);
+
+struct ListenerState {
+    quit_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+static LISTENER_STATE: Mutex<Option<ListenerState>> = Mutex::new(None);
 
 fn expand_profile(profile_path: &str) -> PathBuf {
     crate::expand_home(Path::new(profile_path))
@@ -39,6 +53,21 @@ pub fn api_list_contacts(profile_path: &str) -> Result<Vec<ApiContact>> {
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+pub fn api_list_groups(profile_path: &str) -> Result<Vec<ApiGroup>> {
+    let profile = expand_profile(profile_path);
+    let groups = crate::load_groups(&profile)?;
+    let mut out: Vec<ApiGroup> = groups
+        .into_iter()
+        .map(|g| ApiGroup {
+            id: g.id,
+            title: g.title,
+            members: g.members.into_iter().map(|m| m.contact).collect(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.title.cmp(&b.title));
     Ok(out)
 }
 
@@ -96,8 +125,67 @@ pub fn api_list_messages(
                 _ => "sent".to_string(),
             },
             created_at: r.created_at,
+            group_id: if r.conversation_kind == "group" {
+                r.conversation_id
+            } else {
+                String::new()
+            },
         })
         .collect())
+}
+
+pub fn api_list_group_messages(
+    profile_path: &str,
+    group_id: &str,
+    limit: usize,
+) -> Result<Vec<ApiMessage>> {
+    let profile = expand_profile(profile_path);
+    let conn = crate::init_db(&profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at, conversation_kind, conversation_id
+         FROM messages
+         WHERE conversation_kind = 'group' AND conversation_id = ?1
+         ORDER BY timestamp_ms DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![group_id, limit as i64], |r| {
+        Ok(crate::HistoryRow {
+            id: r.get(0)?,
+            direction: r.get(1)?,
+            contact: r.get(2)?,
+            onion: r.get(3)?,
+            body: r.get(4)?,
+            timestamp_ms: r.get(5)?,
+            status: r.get(6)?,
+            created_at: r.get(7)?,
+            conversation_kind: r.get(8)?,
+            conversation_id: r.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let r = row?;
+        out.push(ApiMessage {
+            id: r.id,
+            direction: r.direction,
+            contact: r.contact,
+            onion: r.onion,
+            body: r.body,
+            timestamp_ms: r.timestamp_ms,
+            status: match r.status {
+                2 => "failed".to_string(),
+                1 => "delivered".to_string(),
+                _ => "sent".to_string(),
+            },
+            created_at: r.created_at,
+            group_id: if r.conversation_kind == "group" {
+                r.conversation_id
+            } else {
+                String::new()
+            },
+        });
+    }
+    out.reverse();
+    Ok(out)
 }
 
 pub fn api_list_transfers(profile_path: &str) -> Result<Vec<String>> {
@@ -137,4 +225,262 @@ pub fn api_status(profile_path: &str) -> Result<ApiStatus> {
         contact_count: contacts.len(),
         transfer_count: transfers.len(),
     })
+}
+
+fn cstr_arg<'a>(ptr: *const c_char, name: &str) -> Result<&'a str> {
+    if ptr.is_null() {
+        return Err(anyhow!("{name} is null"));
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|e| anyhow!("{name} is not valid UTF-8: {e}"))
+}
+
+fn json_response<T: serde::Serialize>(result: Result<T>) -> *mut c_char {
+    let value = match result {
+        Ok(data) => serde_json::json!({ "ok": true, "data": data }),
+        Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }),
+    };
+    let text = value.to_string().replace('\0', "");
+    CString::new(text)
+        .expect("JSON response contains no NUL bytes")
+        .into_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_free_string(ptr: *mut c_char) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = CString::from_raw(ptr);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_init_profile(
+    profile_path: *const c_char,
+    display_name: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_init_profile(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(display_name, "display_name")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_status(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| api_status(cstr_arg(profile_path, "profile_path")?))())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_list_contacts(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_list_contacts(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_list_groups(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_list_groups(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_list_group_messages(
+    profile_path: *const c_char,
+    group_id: *const c_char,
+    limit: usize,
+) -> *mut c_char {
+    json_response((|| {
+        api_list_group_messages(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(group_id, "group_id")?,
+            limit,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_list_messages(
+    profile_path: *const c_char,
+    contact: *const c_char,
+    limit: usize,
+) -> *mut c_char {
+    json_response((|| {
+        let contact = cstr_arg(contact, "contact")?;
+        api_list_messages(
+            cstr_arg(profile_path, "profile_path")?,
+            if contact.trim().is_empty() {
+                None
+            } else {
+                Some(contact)
+            },
+            limit,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_send_message(
+    profile_path: *const c_char,
+    to: *const c_char,
+    body: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(api_send_message(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(to, "to")?,
+            cstr_arg(body, "body")?,
+        ))
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_add_contact(
+    profile_path: *const c_char,
+    name: *const c_char,
+    onion: *const c_char,
+    ed25519_pubkey_b64: *const c_char,
+    x25519_pubkey_b64: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_add_contact(
+            cstr_arg(profile_path, "profile_path")?,
+            ApiContact {
+                name: cstr_arg(name, "name")?.to_string(),
+                onion: cstr_arg(onion, "onion")?.to_string(),
+                ed25519_pubkey_b64: cstr_arg(ed25519_pubkey_b64, "ed25519_pubkey_b64")?
+                    .to_string(),
+                x25519_pubkey_b64: Some(
+                    cstr_arg(x25519_pubkey_b64, "x25519_pubkey_b64")?.to_string(),
+                ),
+            },
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_delete_contact(
+    profile_path: *const c_char,
+    name: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_delete_contact(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(name, "name")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_share_command(
+    profile_path: *const c_char,
+    onion: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        let profile = expand_profile(cstr_arg(profile_path, "profile_path")?);
+        let onion = cstr_arg(onion, "onion")?;
+        let command = crate::share_command(&profile, onion)?;
+        let qr = crate::qr_matrix(&command)?;
+        let share = crate::ShareInfo { command, qr };
+        serde_json::to_string(&share).map_err(|e| anyhow!("serialize share: {e}"))
+    })())
+}
+
+fn emit_listener_status(cb: ListenerStatusCallback, status: &str, onion: &str) {
+    let cstatus = CString::new(status).unwrap_or_default();
+    let conion = CString::new(onion).unwrap_or_default();
+    cb(cstatus.as_ptr(), conion.as_ptr());
+}
+
+fn emit_status_str(cb: ListenerStatusCallback, status: &str) {
+    emit_listener_status(cb, status, "");
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_listener_start(
+    profile_path: *const c_char,
+    cb: ListenerStatusCallback,
+) -> *mut c_char {
+    json_response((|| {
+        let profile = cstr_arg(profile_path, "profile_path")?;
+        let profile_buf = PathBuf::from(profile);
+
+        let mut guard = LISTENER_STATE.lock().map_err(|_| anyhow!("listener mutex poisoned"))?;
+        if guard.is_some() {
+            return Err(anyhow!("listener already running"));
+        }
+
+        let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
+        let profile_for_task = profile_buf.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime for listener");
+            let local_cb = cb;
+            runtime.block_on(async move {
+                emit_status_str(local_cb, "listener starting");
+                let tor_client = match TorTransport::bootstrap(&profile_for_task).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        emit_status_str(local_cb, &format!("listener failed: {e}"));
+                        return;
+                    }
+                };
+                emit_status_str(local_cb, "tor bootstrapping");
+                let transport = Arc::new(TorTransport::new(None, tor_client.clone()));
+                let transport_for_loop = transport.clone();
+                let loop_task = tokio::spawn(async move {
+                    let _ = transport_for_loop.run_inbound_loop(quit_rx).await;
+                });
+
+                let mut status_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+                let mut loop_task = loop_task;
+                loop {
+                    tokio::select! {
+                        _ = status_interval.tick() => {
+                            let onion = Transport::local_addr(&*transport).unwrap_or_default();
+                            if onion.is_empty() {
+                                emit_status_str(local_cb, "onion pending");
+                            } else {
+                                emit_listener_status(local_cb, "listening", &onion);
+                            }
+                        }
+                        _ = &mut loop_task => {
+                            emit_status_str(local_cb, "listener stopped");
+                            return;
+                        }
+                    }
+                }
+            });
+        });
+
+        *guard = Some(ListenerState {
+            quit_tx: Some(quit_tx),
+            handle: Some(handle),
+        });
+        Ok(())
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_listener_stop() -> *mut c_char {
+    json_response((|| {
+        let mut guard = LISTENER_STATE.lock().map_err(|_| anyhow!("listener mutex poisoned"))?;
+        let mut state = guard.take().ok_or_else(|| anyhow!("listener not running"))?;
+        let quit_tx = state.quit_tx.take();
+        if let Some(tx) = quit_tx {
+            let _ = tx.send(());
+        }
+        drop(state);
+        Ok(())
+    })())
 }

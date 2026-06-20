@@ -19,6 +19,7 @@ pub struct ApiMessage {
     pub timestamp_ms: i64,
     pub status: String,
     pub created_at: String,
+    pub group_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,4 +28,11 @@ pub struct ApiStatus {
     pub display_name: String,
     pub contact_count: usize,
     pub transfer_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiGroup {
+    pub id: String,
+    pub title: String,
+    pub members: Vec<String>,
 }

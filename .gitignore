@@ -7,3 +7,4 @@
 # CI AppImage artifacts (should never be committed)
 sideband-appimage-*
 dist/Sideband-*.AppImage
+gui/android/app/src/main/jniLibs/

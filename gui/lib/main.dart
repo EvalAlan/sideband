@@ -7,6 +7,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
+import 'dart:ffi' as ffi;
+import 'package:ffi/ffi.dart';
 
 // ── theme definitions ───────────────────────────────────────────────────────
 
@@ -225,6 +227,13 @@ class _WindowHandler extends WindowListener {
   }
 }
 
+
+bool get _isDesktop => Platform.isLinux || Platform.isWindows || Platform.isMacOS;
+bool get _canUseCliBackend => _isDesktop;
+bool get _canUseMobileBackend => Platform.isAndroid;
+bool get _canUseLocalBackend => _canUseCliBackend || _canUseMobileBackend;
+
+const _nativeChannel = MethodChannel('sideband/native');
 // ── app ─────────────────────────────────────────────────────────────────────
 
 Future<void> main() async {
@@ -959,6 +968,335 @@ class _Cli {
   }
 }
 
+// Global callback holder for the listener status callback.
+// FFI requires a top-level static function, so we route through this.
+void Function(String status, String onion)? _activeListenerCallback;
+
+void _listenerStatusCallback(ffi.Pointer<Utf8> statusPtr, ffi.Pointer<Utf8> onionPtr) {
+  final cb = _activeListenerCallback;
+  if (cb == null) return;
+  final status = statusPtr.toDartString();
+  final onion = onionPtr.toDartString();
+  cb(status, onion);
+}
+
+class _MobileApi {
+  _MobileApi()
+      : _initProfile = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_init_profile'),
+        _status = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>('sideband_api_status'),
+        _listContacts = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>)>('sideband_api_list_contacts'),
+        _listGroups = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>)>('sideband_api_list_groups'),
+        _listMessages = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.UintPtr),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                int)>('sideband_api_list_messages'),
+        _listGroupMessages = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.UintPtr),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                int)>('sideband_api_list_group_messages'),
+        _sendMessage = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>)>('sideband_api_send_message'),
+        _addContact = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>)>('sideband_api_add_contact'),
+        _deleteContact = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_delete_contact'),
+        _freeString = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Void Function(ffi.Pointer<Utf8>),
+            void Function(ffi.Pointer<Utf8>)>('sideband_api_free_string'),
+        _listenerStart = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>>),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>>)>('sideband_api_listener_start'),
+        _listenerStop = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(),
+            ffi.Pointer<Utf8> Function()>('sideband_api_listener_stop'),
+        _shareCommand = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_share_command');
+
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _initProfile;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _status;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _listContacts;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _listGroups;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
+      _listMessages;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
+      _listGroupMessages;
+  final ffi.Pointer<Utf8> Function(
+      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _sendMessage;
+  final ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+  ) _addContact;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _deleteContact;
+  final void Function(ffi.Pointer<Utf8>) _freeString;
+  final ffi.Pointer<Utf8> Function(
+      ffi.Pointer<Utf8>,
+      ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>>)
+      _listenerStart;
+  final ffi.Pointer<Utf8> Function() _listenerStop;
+  final ffi.Pointer<Utf8> Function(
+      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _shareCommand;
+
+  String? _profilePath;
+
+  Future<String> profilePath() async {
+    final cached = _profilePath;
+    if (cached != null) return cached;
+    final filesProfile = await _nativeChannel.invokeMethod<String>('profilePath');
+    if (filesProfile == null || filesProfile.trim().isEmpty) {
+      throw Exception('Android profile path unavailable');
+    }
+    return _profilePath = filesProfile;
+  }
+
+  T _decode<T>(ffi.Pointer<Utf8> ptr) {
+    try {
+      final decoded = jsonDecode(ptr.toDartString());
+      if (decoded is! Map) throw Exception('native response was not an object');
+      if (decoded['ok'] != true) {
+        throw Exception(decoded['error']?.toString() ?? 'native backend failed');
+      }
+      return decoded['data'] as T;
+    } finally {
+      _freeString(ptr);
+    }
+  }
+
+  R _withCString1<R>(
+      String a, ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) call) {
+    final ca = a.toNativeUtf8();
+    try {
+      return _decode<R>(call(ca));
+    } finally {
+      calloc.free(ca);
+    }
+  }
+
+  R _withCString2<R>(
+      String a,
+      String b,
+      ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) call) {
+    final ca = a.toNativeUtf8();
+    final cb = b.toNativeUtf8();
+    try {
+      return _decode<R>(call(ca, cb));
+    } finally {
+      calloc.free(ca);
+      calloc.free(cb);
+    }
+  }
+
+  Future<void> initProfile(String displayName) async {
+    _withCString2<Object?>(await profilePath(), displayName, _initProfile);
+  }
+
+  Future<Map<String, dynamic>> status() async {
+    return Map<String, dynamic>.from(
+        _withCString1<Map<dynamic, dynamic>>(await profilePath(), _status));
+  }
+
+  Future<List<Contact>> contacts() async {
+    final raw = _withCString1<List<dynamic>>(await profilePath(), _listContacts);
+    final contacts = <Contact>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      contacts.add(Contact(
+        name: item['name'] as String? ?? '',
+        onion: item['onion'] as String? ?? '',
+        pubkey: item['ed25519_pubkey_b64'] as String? ?? '',
+        x25519Pubkey: item['x25519_pubkey_b64'] as String? ?? '',
+        ratchetActive: false,
+      ));
+    }
+    contacts.sort((a, b) => a.name.compareTo(b.name));
+    return contacts;
+  }
+
+  Future<List<GroupInfo>> groups() async {
+    final raw = _withCString1<List<dynamic>>(await profilePath(), _listGroups);
+    final groups = <GroupInfo>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final members = <String>[];
+      final rawMembers = item['members'];
+      if (rawMembers is List) {
+        for (final m in rawMembers) {
+          if (m is String) members.add(m);
+        }
+      }
+      groups.add(GroupInfo(
+        id: item['id'] as String? ?? '',
+        title: item['title'] as String? ?? '',
+        members: members,
+      ));
+    }
+    groups.sort((a, b) => a.sidebarLabel.compareTo(b.sidebarLabel));
+    return groups;
+  }
+
+  Future<_History> history({String? contact, String? group, int limit = 80}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    if (group != null && group.isNotEmpty) {
+      final cgroup = group.toNativeUtf8();
+      try {
+        final raw = _decode<List<dynamic>>(_listGroupMessages(profile, cgroup, limit));
+        final parsed = <ChatMsg>[];
+        for (final item in raw) {
+          if (item is! Map) continue;
+          parsed.add(ChatMsg(
+            id: (item['id'] as num).toInt(),
+            direction: item['direction'] as String? ?? '',
+            status: item['status'] as String? ?? '',
+            contact: item['contact'] as String? ?? '',
+            group: item['group_id'] as String? ?? '',
+            text: item['body'] as String? ?? '',
+            tsMs: (item['timestamp_ms'] as num?)?.toInt() ?? 0,
+          ));
+        }
+        parsed.sort((a, b) => a.tsMs.compareTo(b.tsMs));
+        final maxId = parsed.isEmpty
+            ? null
+            : parsed.map((m) => m.id).reduce((a, b) => a > b ? a : b);
+        return _History(msgs: parsed, maxId: maxId, bin: 'libsideband.so');
+      } finally {
+        calloc.free(cgroup);
+      }
+    }
+    final ccontact = (contact ?? '').toNativeUtf8();
+    try {
+      final raw = _decode<List<dynamic>>(_listMessages(profile, ccontact, limit));
+      final parsed = <ChatMsg>[];
+      for (final item in raw) {
+        if (item is! Map) continue;
+        parsed.add(ChatMsg(
+          id: (item['id'] as num).toInt(),
+          direction: item['direction'] as String? ?? '',
+          status: item['status'] as String? ?? '',
+          contact: item['contact'] as String? ?? '',
+          group: '',
+          text: item['body'] as String? ?? '',
+          tsMs: (item['timestamp_ms'] as num?)?.toInt() ?? 0,
+        ));
+      }
+      parsed.sort((a, b) => a.tsMs.compareTo(b.tsMs));
+      final maxId = parsed.isEmpty
+          ? null
+          : parsed.map((m) => m.id).reduce((a, b) => a > b ? a : b);
+      return _History(msgs: parsed, maxId: maxId, bin: 'libsideband.so');
+    } finally {
+      calloc.free(profile);
+      calloc.free(ccontact);
+    }
+  }
+
+  Future<void> send({required String to, required String message}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cto = to.toNativeUtf8();
+    final cmessage = message.toNativeUtf8();
+    try {
+      _decode<Object?>(_sendMessage(profile, cto, cmessage));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cto);
+      calloc.free(cmessage);
+    }
+  }
+
+  Future<void> addContact({
+    required String name,
+    required String onion,
+    required String pubkey,
+    required String x25519Pubkey,
+  }) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cname = name.toNativeUtf8();
+    final conion = onion.toNativeUtf8();
+    final cpubkey = pubkey.toNativeUtf8();
+    final cx25519 = x25519Pubkey.toNativeUtf8();
+    try {
+      _decode<Object?>(_addContact(profile, cname, conion, cpubkey, cx25519));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cname);
+      calloc.free(conion);
+      calloc.free(cpubkey);
+      calloc.free(cx25519);
+    }
+  }
+
+  Future<void> deleteContact(String name) async {
+    _withCString2<Object?>(await profilePath(), name, _deleteContact);
+  }
+
+  Future<void> startListener(void Function(String status, String onion) onStatus) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    _activeListenerCallback = onStatus;
+    final callback = ffi.Pointer.fromFunction<
+        ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>(
+      _listenerStatusCallback,);
+    try {
+      _decode<Object?>(_listenerStart(profile, callback));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  void stopListener() {
+    _decode<Object?>(_listenerStop());
+  }
+
+  Future<ShareInfo> share(String onion) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final conion = onion.toNativeUtf8();
+    try {
+      final raw = _decode<Map<String, dynamic>>(_shareCommand(profile, conion));
+      final command = raw['command'] as String? ?? '';
+      final qr = (raw['qr'] as List?)?.map((e) => e.toString()).toList() ?? [];
+      return ShareInfo(command: command, qr: qr);
+    } finally {
+      calloc.free(profile);
+      calloc.free(conion);
+    }
+  }
+}
+
 class _QrPainter extends CustomPainter {
   const _QrPainter(this.rows);
 
@@ -1002,6 +1340,8 @@ class _ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   final _cli = _Cli();
+  final _MobileApi? _mobile = Platform.isAndroid ? _MobileApi() : null;
+  String? _mobileOnion;
   final _input = TextEditingController();
   final _scroll = ScrollController();
   final scaffoldKey = GlobalKey<ScaffoldState>();
@@ -1059,12 +1399,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   void _initWindowListeners() {
     _windowHandler = _WindowHandler(this);
+    if (!_isDesktop) return;
     windowManager.setPreventClose(true);
     windowManager.addListener(_windowHandler);
   }
 
   Future<void> _bootstrap() async {
     try {
+      if (_canUseMobileBackend) {
+        await _bootstrapMobile();
+        return;
+      }
       if (!_cli.identityConfigured()) {
         final name = await _promptDisplayName();
         if (name == null || name.trim().isEmpty) {
@@ -1090,6 +1435,111 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       }
     }
   }
+
+  Future<void> _bootstrapMobile() async {
+    final mobile = _mobile;
+    if (mobile == null) throw Exception('Android backend unavailable');
+    try {
+      await mobile.status();
+    } catch (_) {
+      final name = await _promptDisplayName();
+      if (name == null || name.trim().isEmpty) {
+        if (mounted) {
+          setState(() {
+            _loading = false;
+            _error = 'Profile setup cancelled';
+          });
+        }
+        return;
+      }
+      await mobile.initProfile(name.trim());
+    }
+    await _loadMobile();
+    await _startMobileListener();
+    _poll ??= Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
+  }
+
+  Future<void> _loadMobile() async {
+    final mobile = _mobile;
+    if (mobile == null) throw Exception('Android backend unavailable');
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final c = await mobile.contacts();
+      final g = await mobile.groups();
+      Contact? selected = _sel;
+      GroupInfo? selectedGroup = _selGroup;
+      if (selectedGroup != null) {
+        final idx = g.indexWhere((x) => x.id == selectedGroup!.id);
+        selectedGroup = idx >= 0 ? g[idx] : null;
+      }
+      if (selected == null && c.isNotEmpty && selectedGroup == null) {
+        selected = c.first;
+      } else if (selected != null) {
+        final idx = c.indexWhere((x) => x.name == selected!.name);
+        selected = idx >= 0 ? c[idx] : (c.isNotEmpty ? c.first : null);
+      }
+      if (!mounted) return;
+      final history = selectedGroup != null
+          ? await mobile.history(group: selectedGroup.id)
+          : (selected == null
+              ? const _History(msgs: [], maxId: null, bin: 'libsideband.so')
+              : await mobile.history(contact: selected.name));
+      if (!mounted) return;
+      setState(() {
+        _contacts = c;
+        _groups = g;
+        _sel = selected;
+        _selGroup = selectedGroup;
+        _msgs = _mergePending(history.msgs);
+        _listenerRunning = true;
+        _listenerStatus = 'mobile backend ready';
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _listenerRunning = false;
+        _listenerStatus = 'mobile backend failed';
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _startMobileListener() async {
+    final mobile = _mobile;
+    if (mobile == null) {
+      _snack('Android backend unavailable');
+      return;
+    }
+    try {
+      await mobile.startListener((status, onion) {
+        if (!mounted) return;
+        setState(() {
+          _listenerStatus = status;
+          if (onion.isNotEmpty) {
+            _mobileOnion = onion;
+            _listenerRunning = true;
+            _error = null;
+          }
+        });
+      });
+      setState(() {
+        _listenerRunning = true;
+        _listenerStatus = 'mobile listener starting';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _listenerStatus = 'mobile listener failed';
+        _error = '$e';
+      });
+    }
+  }
+
 
   Future<String?> _promptDisplayName() async {
     final controller = TextEditingController();
@@ -1658,8 +2108,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Future<void> _refresh() async {
     try {
-      final c = await _cli.contacts();
-      final g = await _cli.groups();
+      final Future<List<Contact>> cFut;
+      final Future<List<GroupInfo>> gFut;
+      if (_canUseMobileBackend && _mobile != null) {
+        cFut = _mobile.contacts();
+        gFut = _mobile.groups();
+      } else {
+        cFut = _cli.contacts();
+        gFut = _cli.groups();
+      }
+      final c = await cFut;
+      final g = await gFut;
       var s = _sel;
       var sg = _selGroup;
       if (sg != null) {
@@ -1681,8 +2140,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         return;
       }
 
-      final h = await _historyVisibleFor(s?.name,
-          group: sg?.id, knownContacts: c.map((c) => c.name));
+      final h = _canUseMobileBackend && _mobile != null
+          ? await _historyVisibleForMobile(s?.name, group: sg?.id, knownContacts: c.map((x) => x.name))
+          : await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((x) => x.name));
       await _checkUnread();
       setState(() {
         _msgs = _mergePending(h.msgs);
@@ -1694,9 +2154,27 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     }
   }
 
+  Future<_History> _historyVisibleForMobile(
+    String? contact, {
+    String? group,
+    Iterable<String>? knownContacts,
+  }) async {
+    final mobile = _mobile;
+    if (mobile == null) return const _History(msgs: [], maxId: null, bin: '');
+    if (group != null && group.isNotEmpty) {
+      return mobile.history(group: group);
+    }
+    if (contact != null && contact.isNotEmpty) {
+      return mobile.history(contact: contact);
+    }
+    return mobile.history(limit: 80);
+  }
+
   Future<void> _checkUnread() async {
     try {
-      final global = await _cli.history(limit: 200);
+      final global = _canUseMobileBackend && _mobile != null
+          ? await _mobile!.history(limit: 200)
+          : await _cli.history(limit: 200);
       final currentContact = _sel?.name;
       final currentGroup = _selGroup?.id;
       int newUnread = 0;
@@ -2722,7 +3200,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   String? _currentOnion() {
-    final onion = _listenerOnion;
+    final onion = _listenerOnion ?? _mobileOnion;
     if (onion == null || onion.trim().isEmpty) return null;
     return onion.trim();
   }
@@ -2739,13 +3217,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     try {
       final share = await _shareInfo();
       if (!mounted) return;
+      final screenWidth = MediaQuery.of(context).size.width;
+      final dialogWidth = screenWidth < 600 ? screenWidth * 0.9 : 520.0;
+      final qrSize = dialogWidth < 400 ? 200.0 : 280.0;
       await showDialog<void>(
         context: context,
         builder: (dialogContext) => AlertDialog(
           backgroundColor: _t.surface,
           title: Text('Share contact', style: TextStyle(color: _t.text)),
           content: SizedBox(
-            width: 520,
+            width: dialogWidth,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -2756,8 +3237,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: SizedBox(
-                    width: 280,
-                    height: 280,
+                    width: qrSize,
+                    height: qrSize,
                     child: CustomPaint(painter: _QrPainter(share.qr)),
                   ),
                 ),
@@ -3059,7 +3540,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
                 if (constraints.maxWidth < 720) {
                   return _sel == null && _selGroup == null
-                      ? _emptyChat()
+                      ? _sidebar()
                       : _chat();
                 }
 
@@ -3568,11 +4049,23 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final g = _selGroup;
     final title = c?.name ?? g!.sidebarLabel;
     final subtitle = c?.securityLabel ?? 'Group fan-out to ${g!.memberSummary}';
+    final isNarrow = MediaQuery.of(context).size.width < 720;
     return Container(
       color: _t.surface,
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+      padding: EdgeInsets.symmetric(horizontal: isNarrow ? 8 : 18, vertical: 10),
       child: Row(
         children: [
+          if (isNarrow)
+            IconButton(
+              icon: const Icon(Icons.arrow_back, size: 20),
+              onPressed: () {
+                setState(() {
+                  _sel = null;
+                  _selGroup = null;
+                  _msgs = const [];
+                });
+              },
+            ),
           CircleAvatar(
             radius: 16,
             backgroundColor: c?.avatarColor ?? _t.primary.withAlpha(110),
