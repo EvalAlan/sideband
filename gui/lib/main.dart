@@ -349,6 +349,20 @@ class Contact {
   }
 }
 
+Contact? parseAddCommandContact(String raw) {
+  final trimmed = raw.trim();
+  if (!trimmed.startsWith('/add ')) return null;
+  final parts = trimmed.split(RegExp(r'\s+'));
+  if (parts.length < 5) return null;
+  return Contact(
+    name: parts[1],
+    onion: parts[2],
+    pubkey: parts[3],
+    x25519Pubkey: parts[4],
+    ratchetActive: false,
+  );
+}
+
 class GroupInfo {
   const GroupInfo({
     required this.id,
@@ -2861,14 +2875,18 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       );
       if (ok != true) return;
 
-      final newName = name.text.trim();
+      final pasted = !editing ? parseAddCommandContact(name.text) : null;
+      final newName = (pasted?.name ?? name.text).trim();
+      final newOnion = (pasted?.onion ?? onion.text).trim();
+      final newPubkey = (pasted?.pubkey ?? pubkey.text).trim();
+      final newX25519 = (pasted?.x25519Pubkey ?? x25519.text).trim();
       if (newName.isEmpty) throw Exception('contact name is required');
       if (_canUseMobileBackend && _mobile != null) {
         await _mobile!.addContact(
           name: newName,
-          onion: onion.text.trim(),
-          pubkey: pubkey.text.trim(),
-          x25519Pubkey: x25519.text.trim(),
+          onion: newOnion,
+          pubkey: newPubkey,
+          x25519Pubkey: newX25519,
         );
         if (editing && contact.name != newName) {
           await _mobile!.deleteContact(contact.name);
@@ -2876,9 +2894,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       } else {
         await _cli.addContact(
           name: newName,
-          onion: onion.text.trim(),
-          pubkey: pubkey.text.trim(),
-          x25519Pubkey: x25519.text.trim(),
+          onion: newOnion,
+          pubkey: newPubkey,
+          x25519Pubkey: newX25519,
         );
         if (editing && contact.name != newName) {
           await _cli.deleteContact(contact.name);

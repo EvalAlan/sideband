@@ -422,7 +422,7 @@ pub extern "C" fn sideband_api_create_group(
         let members: Vec<String> = serde_json::from_str(members_raw)
             .map_err(|e| anyhow!("parse members JSON: {e}"))?;
         let group = crate::create_group(Path::new(profile), title, &members)?;
-        serde_json::to_string(&group).map_err(|e| anyhow!("serialize group: {e}"))
+        Ok(group)
     })())
 }
 
@@ -435,7 +435,7 @@ pub extern "C" fn sideband_api_delete_group(
         let profile = cstr_arg(profile_path, "profile_path")?;
         let group_id = cstr_arg(group_id, "group_id")?;
         let group = crate::delete_group(Path::new(profile), group_id)?;
-        serde_json::to_string(&group).map_err(|e| anyhow!("serialize group: {e}"))
+        Ok(group)
     })())
 }
 
