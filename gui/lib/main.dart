@@ -3318,7 +3318,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   String? _currentOnion() {
     final onion = _listenerOnion ?? _mobileOnion;
     if (onion == null || onion.trim().isEmpty) return null;
-    return onion.trim();
+    final trimmed = onion.trim();
+    if (trimmed.startsWith('(') || !trimmed.endsWith('.onion')) return null;
+    return trimmed;
   }
 
   String _runtimeProfileLabel() {
@@ -3331,6 +3333,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<ShareInfo> _shareInfo() async {
+    if (_canUseMobileBackend && _mobile != null) {
+      await _syncMobileListenerStatus();
+    }
     final onion = _currentOnion();
     if (onion == null) {
       throw Exception('onion address is not ready yet');
@@ -3409,7 +3414,15 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         ),
       );
     } catch (e) {
-      if (mounted) setState(() => _error = '$e');
+      if (!mounted) return;
+      final message = '$e';
+      final notReady = message.contains('onion address is not ready yet');
+      _showInfo(
+        'Share contact',
+        notReady
+            ? 'Your Tor onion address is not ready yet. Wait for the listener status to change from onion pending to listening, then try Share again.'
+            : message,
+      );
     }
   }
 
@@ -4097,7 +4110,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
             Text(_error!, style: TextStyle(color: _t.errorFg, fontSize: 11.5)),
             const SizedBox(height: 12),
             OutlinedButton.icon(
-              onPressed: _load,
+              onPressed: _refresh,
               icon: const Icon(Icons.refresh, size: 14),
               label: const Text('Retry'),
             ),
