@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -970,7 +971,10 @@ class _Cli {
 
 // Global callback holder for the listener status callback.
 // FFI requires a top-level static function, so we route through this.
+// The callback from Rust arrives on a background thread, so we use a
+// ReceivePort to bridge to the main Dart isolate.
 void Function(String status, String onion)? _activeListenerCallback;
+ReceivePort? _listenerReceivePort;
 
 void _listenerStatusCallback(ffi.Pointer<Utf8> statusPtr, ffi.Pointer<Utf8> onionPtr) {
   final cb = _activeListenerCallback;
@@ -978,6 +982,29 @@ void _listenerStatusCallback(ffi.Pointer<Utf8> statusPtr, ffi.Pointer<Utf8> onio
   final status = statusPtr.toDartString();
   final onion = onionPtr.toDartString();
   cb(status, onion);
+}
+
+/// Bridge that receives listener status on the main isolate via ReceivePort.
+/// This avoids the "Cannot invoke native callback outside an isolate" crash
+/// because the FFI callback sends data through the port instead of calling
+/// Dart code directly from a background thread.
+void _listenerPortHandler(dynamic message) {
+  if (message is! List || message.length != 2) return;
+  final status = message[0] as String;
+  final onion = message[1] as String;
+  final cb = _activeListenerCallback;
+  if (cb == null) return;
+  cb(status, onion);
+}
+
+/// FFI callback that sends status through a ReceivePort instead of
+/// invoking Dart code directly.
+void _listenerStatusCallbackPort(ffi.Pointer<Utf8> statusPtr, ffi.Pointer<Utf8> onionPtr) {
+  final port = _listenerReceivePort;
+  if (port == null) return;
+  final status = statusPtr.toDartString();
+  final onion = onionPtr.toDartString();
+  port.sendPort.send([status, onion]);
 }
 
 class _MobileApi {
@@ -1268,9 +1295,14 @@ class _MobileApi {
   Future<void> startListener(void Function(String status, String onion) onStatus) async {
     final profile = (await profilePath()).toNativeUtf8();
     _activeListenerCallback = onStatus;
+    // Create a ReceivePort to bridge the FFI callback (which arrives on a
+    // background thread) to the main Dart isolate.
+    _listenerReceivePort?.close();
+    _listenerReceivePort = ReceivePort()..listen(_listenerPortHandler);
     final callback = ffi.Pointer.fromFunction<
         ffi.Void Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>(
-      _listenerStatusCallback,);
+      _listenerStatusCallbackPort,
+    );
     try {
       _decode<Object?>(_listenerStart(profile, callback));
     } finally {
@@ -1280,6 +1312,8 @@ class _MobileApi {
 
   void stopListener() {
     _decode<Object?>(_listenerStop());
+    _listenerReceivePort?.close();
+    _listenerReceivePort = null;
   }
 
   Future<ShareInfo> share(String onion) async {

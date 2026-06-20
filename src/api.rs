@@ -20,7 +20,30 @@ struct ListenerState {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+struct ListenerStatus {
+    status: String,
+    onion: String,
+}
+
 static LISTENER_STATE: Mutex<Option<ListenerState>> = Mutex::new(None);
+static LISTENER_STATUS: Mutex<ListenerStatus> = Mutex::new(ListenerStatus {
+    status: String::new(),
+    onion: String::new(),
+});
+
+fn set_listener_status(status: &str, onion: &str) {
+    if let Ok(mut guard) = LISTENER_STATUS.lock() {
+        guard.status = status.to_string();
+        guard.onion = onion.to_string();
+    }
+}
+
+fn get_listener_status() -> (String, String) {
+    if let Ok(guard) = LISTENER_STATUS.lock() {
+        return (guard.status.clone(), guard.onion.clone());
+    }
+    (String::new(), String::new())
+}
 
 fn expand_profile(profile_path: &str) -> PathBuf {
     crate::expand_home(Path::new(profile_path))
