@@ -8,7 +8,6 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use rusqlite::params;
-use serde::Serialize;
 
 use crate::transport::tor::TorTransport;
 use crate::transport::Transport;

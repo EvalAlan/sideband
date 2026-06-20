@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -39,7 +39,7 @@ impl FileTransferState {
 pub(crate) type SharedTransferState = Arc<tokio::sync::Mutex<FileTransferState>>;
 
 pub struct TorTransport {
-    local_onion: Option<String>,
+    local_onion: Arc<Mutex<Option<String>>>,
     pub client: Arc<TorClient<PreferredRuntime>>,
     status_tx: Option<mpsc::Sender<TuiEvent>>,
     /// Inbound envelope channel.  The receive half is held by `try_recv`.
@@ -61,7 +61,7 @@ impl TorTransport {
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         Self {
-            local_onion,
+            local_onion: Arc::new(Mutex::new(local_onion)),
             client,
             status_tx,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
@@ -129,6 +129,9 @@ impl TorTransport {
             .onion_address()
             .context("onion service has no address — key may not be ready")?;
         let onion = onion_hsid.display_unredacted().to_string();
+        if let Ok(mut local_onion) = self.local_onion.lock() {
+            *local_onion = Some(onion.clone());
+        }
         std::env::set_var("SIDEBAND_REPLY_ONION", &onion);
         if let Some(status_tx) = &self.status_tx {
             let _ = status_tx
@@ -256,7 +259,7 @@ impl Transport for TorTransport {
     }
 
     fn local_addr(&self) -> Option<String> {
-        self.local_onion.clone()
+        self.local_onion.lock().ok().and_then(|onion| onion.clone())
     }
 
     fn capabilities(&self) -> TransportCapabilities {
@@ -271,7 +274,7 @@ impl Transport for TorTransport {
     fn status(&self) -> TransportStatus {
         TransportStatus {
             connected: true,
-            local_addr: self.local_onion.clone(),
+            local_addr: self.local_addr(),
             detail: "tor transport".to_string(),
         }
     }
