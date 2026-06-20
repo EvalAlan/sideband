@@ -466,8 +466,7 @@ pub extern "C" fn sideband_api_share_command(
         let onion = cstr_arg(onion, "onion")?;
         let command = crate::share_command(&profile, onion)?;
         let qr = crate::qr_matrix(&command)?;
-        let share = crate::ShareInfo { command, qr };
-        serde_json::to_string(&share).map_err(|e| anyhow!("serialize share: {e}"))
+        Ok(crate::ShareInfo { command, qr })
     })())
 }
 
