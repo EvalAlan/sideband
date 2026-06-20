@@ -1982,6 +1982,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Future<void> _sendViaListener(
       {String? to, String? group, required String message}) async {
+    if (_canUseMobileBackend && _mobile != null) {
+      if (group != null) {
+        throw Exception('group sends are not wired through the Android backend yet');
+      }
+      if (to == null || to.isEmpty) {
+        throw Exception('missing contact for Android send');
+      }
+      await _mobile!.send(to: to, message: message);
+      return;
+    }
     final listener = _listener;
     if (listener == null) {
       throw Exception(
@@ -1998,6 +2008,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Future<void> _sendFileViaListener(
       {String? to, String? group, required String path}) async {
+    if (_canUseMobileBackend && _mobile != null) {
+      throw Exception('file sends are not wired through the Android backend yet');
+    }
     final listener = _listener;
     if (listener == null) {
       throw Exception(

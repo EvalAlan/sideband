@@ -10,7 +10,6 @@ use anyhow::{anyhow, Result};
 use rusqlite::params;
 
 use crate::transport::tor::TorTransport;
-use crate::transport::Transport;
 use crate::types::{ApiContact, ApiGroup, ApiMessage, ApiStatus};
 
 type ListenerStatusCallback = extern "C" fn(status: *const c_char, onion: *const c_char);
@@ -500,30 +499,33 @@ pub extern "C" fn sideband_api_listener_start(
                     }
                 };
                 set_listener_status("tor bootstrapping", "");
-                let transport = Arc::new(TorTransport::new(None, tor_client.clone()));
-                let transport_for_loop = transport.clone();
-                let loop_task = tokio::spawn(async move {
-                    let _ = transport_for_loop.run_inbound_loop(quit_rx).await;
-                });
-
-                let mut status_interval = tokio::time::interval(std::time::Duration::from_secs(2));
-                let mut loop_task = loop_task;
-                loop {
-                    tokio::select! {
-                        _ = status_interval.tick() => {
-                            let onion = Transport::local_addr(&*transport).unwrap_or_default();
-                            if onion.is_empty() {
-                                set_listener_status("onion pending", "");
-                            } else {
-                                set_listener_status("listening", &onion);
+                let (tui_tx, mut tui_rx) = tokio::sync::mpsc::channel::<crate::TuiEvent>(256);
+                let status_task = tokio::spawn(async move {
+                    while let Some(event) = tui_rx.recv().await {
+                        match event {
+                            crate::TuiEvent::StatusUpdate(text) => {
+                                if let Some(onion) = text.strip_prefix("onion=") {
+                                    set_listener_status("listening", onion);
+                                } else {
+                                    let (_, onion) = get_listener_status();
+                                    set_listener_status(&text, &onion);
+                                }
                             }
-                        }
-                        _ = &mut loop_task => {
-                            set_listener_status("listener stopped", "");
-                            return;
+                            crate::TuiEvent::InboundMessage { .. }
+                            | crate::TuiEvent::InboundGroupMessage { .. } => {
+                                let (_, onion) = get_listener_status();
+                                set_listener_status("message received", &onion);
+                            }
+                            crate::TuiEvent::OutboundMessage { .. } => {}
                         }
                     }
+                });
+
+                match crate::serve(&profile_for_task, tui_tx, quit_rx, tor_client, false).await {
+                    Ok(()) => set_listener_status("listener stopped", ""),
+                    Err(e) => set_listener_status(&format!("listener failed: {e}"), ""),
                 }
+                status_task.abort();
             });
         });
 
