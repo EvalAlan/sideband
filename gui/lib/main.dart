@@ -3632,60 +3632,62 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Widget build(BuildContext context) {
     return Scaffold(
       key: scaffoldKey,
-      body: Column(
-        children: [
-          _notificationBanner(),
-          Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                // GTK can hand Flutter a 1x1 surface before the first real frame.
-                // Rendering the full layout there just trips Flex overflow asserts.
-                if (constraints.maxWidth < 80 || constraints.maxHeight < 80) {
-                  return ColoredBox(color: _t.bg);
-                }
+      body: SafeArea(
+        child: Column(
+          children: [
+            _notificationBanner(),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  // GTK can hand Flutter a 1x1 surface before the first real frame.
+                  // Rendering the full layout there just trips Flex overflow asserts.
+                  if (constraints.maxWidth < 80 || constraints.maxHeight < 80) {
+                    return ColoredBox(color: _t.bg);
+                  }
 
-                if (_loading) {
-                  return Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        SizedBox(
-                          width: 28,
-                          height: 28,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2.5, color: _t.primary),
-                        ),
-                        const SizedBox(height: 16),
-                        Text('Connecting…',
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(color: _t.textDim)),
-                      ],
-                    ),
+                  if (_loading) {
+                    return Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          SizedBox(
+                            width: 28,
+                            height: 28,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 2.5, color: _t.primary),
+                          ),
+                          const SizedBox(height: 16),
+                          Text('Connecting…',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodyMedium
+                                  ?.copyWith(color: _t.textDim)),
+                        ],
+                      ),
+                    );
+                  }
+
+                  if (constraints.maxWidth < 720) {
+                    return _sel == null && _selGroup == null
+                        ? _sidebar()
+                        : _chat();
+                  }
+
+                  return Row(
+                    children: [
+                      SizedBox(width: 320, child: _sidebar()),
+                      Container(width: 1, color: _t.border),
+                      Expanded(
+                          child: _sel == null && _selGroup == null
+                              ? _emptyChat()
+                              : _chat()),
+                    ],
                   );
-                }
-
-                if (constraints.maxWidth < 720) {
-                  return _sel == null && _selGroup == null
-                      ? _sidebar()
-                      : _chat();
-                }
-
-                return Row(
-                  children: [
-                    SizedBox(width: 320, child: _sidebar()),
-                    Container(width: 1, color: _t.border),
-                    Expanded(
-                        child: _sel == null && _selGroup == null
-                            ? _emptyChat()
-                            : _chat()),
-                  ],
-                );
-              },
+                },
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -3717,77 +3719,57 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   ),
                 ),
                 SizedBox(
-                  width: 34,
+                  width: 44,
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints:
-                        const BoxConstraints.tightFor(width: 34, height: 34),
-                    style: IconButton.styleFrom(
-                      minimumSize: Size.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                    icon: const Icon(Icons.person_add_alt_1, size: 19),
+                        const BoxConstraints.tightFor(width: 44, height: 44),
+                    icon: const Icon(Icons.person_add_alt_1, size: 20),
                     onPressed: _showAddContactDialog,
                     tooltip: 'Add contact',
                   ),
                 ),
                 SizedBox(
-                  width: 34,
+                  width: 44,
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints:
-                        const BoxConstraints.tightFor(width: 34, height: 34),
-                    style: IconButton.styleFrom(
-                      minimumSize: Size.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                    icon: const Icon(Icons.group_add, size: 19),
+                        const BoxConstraints.tightFor(width: 44, height: 44),
+                    icon: const Icon(Icons.group_add, size: 20),
                     onPressed: _showCreateGroupDialog,
                     tooltip: 'Create group',
                   ),
                 ),
                 SizedBox(
-                  width: 34,
+                  width: 44,
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints:
-                        const BoxConstraints.tightFor(width: 34, height: 34),
-                    style: IconButton.styleFrom(
-                      minimumSize: Size.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                    icon: const Icon(Icons.qr_code, size: 19),
+                        const BoxConstraints.tightFor(width: 44, height: 44),
+                    icon: const Icon(Icons.qr_code, size: 20),
                     onPressed: _showShareDialog,
                     tooltip: 'Share contact',
                   ),
                 ),
                 SizedBox(
-                  width: 34,
+                  width: 44,
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints:
-                        const BoxConstraints.tightFor(width: 34, height: 34),
-                    style: IconButton.styleFrom(
-                      minimumSize: Size.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                    icon: const Icon(Icons.settings, size: 19),
+                        const BoxConstraints.tightFor(width: 44, height: 44),
+                    icon: const Icon(Icons.settings, size: 20),
                     onPressed: _showSettings,
                     tooltip: 'Settings',
                   ),
                 ),
                 SizedBox(
-                  width: 34,
+                  width: 44,
                   child: IconButton(
                     padding: EdgeInsets.zero,
                     constraints:
-                        const BoxConstraints.tightFor(width: 34, height: 34),
-                    style: IconButton.styleFrom(
-                      minimumSize: Size.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                    icon: const Icon(Icons.refresh, size: 19),
-                    onPressed: _load,
+                        const BoxConstraints.tightFor(width: 44, height: 44),
+                    icon: const Icon(Icons.refresh, size: 20),
+                    onPressed: _refresh,
                     tooltip: 'Refresh',
                   ),
                 ),
