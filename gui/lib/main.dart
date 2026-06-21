@@ -6,6 +6,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 import 'dart:ffi' as ffi;
@@ -2994,6 +2995,23 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Future<void> _scanContactQr() async {
     if (!_canUseMobileBackend) {
       _snack('QR scanning is only wired on Android right now');
+      return;
+    }
+    try {
+      final status = await Permission.camera.request();
+      if (status.isPermanentlyDenied) {
+        final opened = await openAppSettings();
+        if (!opened) {
+          _snack('Camera permission permanently denied — enable it in Settings');
+        }
+        return;
+      }
+      if (!status.isGranted) {
+        _snack('Camera permission denied');
+        return;
+      }
+    } catch (e) {
+      _snack('camera permission check failed: $e');
       return;
     }
     final controller = MobileScannerController();
