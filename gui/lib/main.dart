@@ -1143,10 +1143,14 @@ class _MobileApi {
     if (cached != null) return cached;
     final filesProfile =
         await _nativeChannel.invokeMethod<String>('profilePath');
-    if (filesProfile == null || filesProfile.trim().isEmpty) {
+    if (filesProfile == null || filesProfile.isEmpty) {
       throw Exception('Android profile path unavailable');
     }
     return _profilePath = filesProfile;
+  }
+
+  Future<bool> identityConfigured() async {
+    return File('${await profilePath()}/identity.toml').exists();
   }
 
   T _decode<T>(ffi.Pointer<Utf8> ptr) {
@@ -1555,9 +1559,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final mobile = _mobile;
     if (mobile == null) throw Exception('Android backend unavailable');
     _mobileProfilePath = await mobile.profilePath();
-    try {
-      await mobile.status();
-    } catch (_) {
+    if (!await mobile.identityConfigured()) {
       final name = await _promptDisplayName();
       if (name == null || name.trim().isEmpty) {
         if (mounted) {
@@ -1569,13 +1571,19 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         return;
       }
       await mobile.initProfile(name.trim());
+      if (mounted) {
+        setState(() {
+          _error = null;
+          _listenerStatus = 'profile created';
+        });
+      }
     }
-    await _loadMobile();
+    if (!await _loadMobile()) return;
     await _startMobileListener();
     _poll ??= Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
   }
 
-  Future<void> _loadMobile() async {
+  Future<bool> _loadMobile() async {
     final mobile = _mobile;
     if (mobile == null) throw Exception('Android backend unavailable');
     setState(() {
@@ -1597,13 +1605,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         final idx = c.indexWhere((x) => x.name == selected!.name);
         selected = idx >= 0 ? c[idx] : (c.isNotEmpty ? c.first : null);
       }
-      if (!mounted) return;
+      if (!mounted) return false;
       final history = selectedGroup != null
           ? await mobile.history(group: selectedGroup.id)
           : (selected == null
               ? const _History(msgs: [], maxId: null, bin: 'libsideband.so')
               : await mobile.history(contact: selected.name));
-      if (!mounted) return;
+      if (!mounted) return false;
       setState(() {
         _contacts = c;
         _groups = g;
@@ -1614,14 +1622,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         _listenerStatus = 'mobile backend ready';
         _loading = false;
       });
+      return true;
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted) return false;
       setState(() {
         _error = '$e';
         _listenerRunning = false;
         _listenerStatus = 'mobile backend failed';
         _loading = false;
       });
+      return false;
     }
   }
 
