@@ -37,6 +37,14 @@ static LISTENER_STATUS: Mutex<ListenerStatus> = Mutex::new(ListenerStatus {
     onion: String::new(),
 });
 
+fn listener_is_running(state: &ListenerState) -> bool {
+    state
+        .handle
+        .as_ref()
+        .map(|handle| !handle.is_finished())
+        .unwrap_or(false)
+}
+
 fn set_listener_status(status: &str, onion: &str) {
     if let Ok(mut guard) = LISTENER_STATUS.lock() {
         guard.status = status.to_string();
@@ -298,7 +306,7 @@ pub fn api_status(profile_path: &str) -> Result<ApiStatus> {
         listener_onion,
         listener_running: LISTENER_STATE
             .lock()
-            .map(|guard| guard.is_some())
+            .map(|guard| guard.as_ref().map(listener_is_running).unwrap_or(false))
             .unwrap_or(false),
     })
 }
@@ -432,8 +440,7 @@ pub extern "C" fn sideband_api_add_contact(
             ApiContact {
                 name: cstr_arg(name, "name")?.to_string(),
                 onion: cstr_arg(onion, "onion")?.to_string(),
-                ed25519_pubkey_b64: cstr_arg(ed25519_pubkey_b64, "ed25519_pubkey_b64")?
-                    .to_string(),
+                ed25519_pubkey_b64: cstr_arg(ed25519_pubkey_b64, "ed25519_pubkey_b64")?.to_string(),
                 x25519_pubkey_b64: Some(
                     cstr_arg(x25519_pubkey_b64, "x25519_pubkey_b64")?.to_string(),
                 ),
@@ -506,8 +513,8 @@ pub extern "C" fn sideband_api_create_group(
         let profile = cstr_arg(profile_path, "profile_path")?;
         let title = cstr_arg(title, "title")?;
         let members_raw = cstr_arg(members_json, "members_json")?;
-        let members: Vec<String> = serde_json::from_str(members_raw)
-            .map_err(|e| anyhow!("parse members JSON: {e}"))?;
+        let members: Vec<String> =
+            serde_json::from_str(members_raw).map_err(|e| anyhow!("parse members JSON: {e}"))?;
         let group = crate::create_group(Path::new(profile), title, &members)?;
         Ok(group)
     })())
@@ -558,16 +565,19 @@ pub extern "C" fn sideband_api_share_command(
 }
 
 #[no_mangle]
-pub extern "C" fn sideband_api_listener_start(
-    profile_path: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn sideband_api_listener_start(profile_path: *const c_char) -> *mut c_char {
     json_response((|| {
         let profile = cstr_arg(profile_path, "profile_path")?;
         let profile_buf = PathBuf::from(profile);
 
-        let mut guard = LISTENER_STATE.lock().map_err(|_| anyhow!("listener mutex poisoned"))?;
-        if guard.is_some() {
+        let mut guard = LISTENER_STATE
+            .lock()
+            .map_err(|_| anyhow!("listener mutex poisoned"))?;
+        if guard.as_ref().map(listener_is_running).unwrap_or(false) {
             return Err(anyhow!("listener already running"));
+        }
+        if guard.is_some() {
+            *guard = None;
         }
 
         let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
@@ -642,6 +652,9 @@ pub extern "C" fn sideband_api_listener_start(
                 send_task.abort();
                 status_task.abort();
             });
+            if let Ok(mut guard) = LISTENER_STATE.lock() {
+                *guard = None;
+            }
         });
 
         *guard = Some(ListenerState {
@@ -656,8 +669,12 @@ pub extern "C" fn sideband_api_listener_start(
 #[no_mangle]
 pub extern "C" fn sideband_api_listener_stop() -> *mut c_char {
     json_response((|| {
-        let mut guard = LISTENER_STATE.lock().map_err(|_| anyhow!("listener mutex poisoned"))?;
-        let mut state = guard.take().ok_or_else(|| anyhow!("listener not running"))?;
+        let mut guard = LISTENER_STATE
+            .lock()
+            .map_err(|_| anyhow!("listener mutex poisoned"))?;
+        let mut state = guard
+            .take()
+            .ok_or_else(|| anyhow!("listener not running"))?;
         let quit_tx = state.quit_tx.take();
         if let Some(tx) = quit_tx {
             let _ = tx.send(());
@@ -667,4 +684,3 @@ pub extern "C" fn sideband_api_listener_stop() -> *mut c_char {
         Ok(())
     })())
 }
-
