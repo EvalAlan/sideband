@@ -2740,7 +2740,31 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               x25519Pubkey: parts[4],
             );
           }
-          await _refresh();
+          final updatedContact = Contact(
+            name: parts[1],
+            onion: parts[2],
+            pubkey: parts[3],
+            x25519Pubkey: parts[4],
+            ratchetActive: false,
+          );
+          if (mounted) {
+            setState(() {
+              _contacts = [
+                for (final c in _contacts)
+                  if (c.name != updatedContact.name) c,
+                updatedContact,
+              ]..sort((a, b) => a.name.compareTo(b.name));
+              _sel = updatedContact;
+              _selGroup = null;
+              _msgs = const [];
+              _error = null;
+            });
+          }
+          try {
+            await _refresh();
+          } catch (refreshError) {
+            _snack('Contact saved; refresh failed: $refreshError');
+          }
           return;
         case 'delete':
           if (parts.length < 2) throw Exception('usage: /delete <contact>');
@@ -2901,7 +2925,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           pubkey: newPubkey,
           x25519Pubkey: newX25519,
         );
-        if (editing && contact.name != newName) {
+        if (editing && contact!.name != newName) {
           await _mobile!.deleteContact(contact.name);
         }
       } else {
@@ -2911,16 +2935,34 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           pubkey: newPubkey,
           x25519Pubkey: newX25519,
         );
-        if (editing && contact.name != newName) {
+        if (editing && contact!.name != newName) {
           await _cli.deleteContact(contact.name);
         }
       }
-      await _refresh();
-      if (editing) {
-        for (final updated in _contacts.where((c) => c.name == newName)) {
-          setState(() => _sel = updated);
-          break;
-        }
+      final updatedContact = Contact(
+        name: newName,
+        onion: newOnion,
+        pubkey: newPubkey,
+        x25519Pubkey: newX25519,
+        ratchetActive: false,
+      );
+      if (mounted) {
+        setState(() {
+          _contacts = [
+            for (final c in _contacts)
+              if (c.name != (contact?.name ?? '') && c.name != newName) c,
+            updatedContact,
+          ]..sort((a, b) => a.name.compareTo(b.name));
+          _sel = updatedContact;
+          _selGroup = null;
+          _msgs = const [];
+          _error = null;
+        });
+      }
+      try {
+        await _refresh();
+      } catch (refreshError) {
+        _snack('Contact saved; refresh failed: $refreshError');
       }
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
