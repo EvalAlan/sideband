@@ -312,6 +312,12 @@ pub struct ContactFile {
     pubkey_b64: String,
     /// X25519 public key for encrypting messages to this contact.
     x25519_pubkey_b64: Option<String>,
+    /// Unknown verified sender awaiting explicit user trust.
+    #[serde(default)]
+    pending: bool,
+    /// Blocked contacts are retained so inbound can be dropped and unblock remains possible.
+    #[serde(default)]
+    blocked: bool,
 }
 
 /// On-disk format: name -> ContactFile
@@ -1857,6 +1863,8 @@ pub(crate) fn add_group_member(profile: &Path, group_ref: &str, member: &str) ->
                 onion: String::new(),
                 pubkey_b64: String::new(),
                 x25519_pubkey_b64: None,
+                pending: false,
+                blocked: false,
             },
         );
         save_contacts(profile, &contacts)?;
@@ -1951,6 +1959,8 @@ pub(crate) fn discover_or_update_group(
                     onion: String::new(),
                     pubkey_b64: String::new(),
                     x25519_pubkey_b64: None,
+                    pending: false,
+                    blocked: false,
                 },
             );
         }
@@ -2471,6 +2481,10 @@ pub fn resolve_to(profile: &Path, to: &str) -> Result<String> {
     }
     let contacts = load_contacts(profile)?;
     match contacts.get(to) {
+        Some(c) if c.blocked => Err(anyhow!("contact '{to}' is blocked")),
+        Some(c) if c.pending => Err(anyhow!(
+            "contact '{to}' is pending; accept or delete it first"
+        )),
         Some(c) => Ok(c.onion.clone()),
         None => Err(anyhow!(
             "unknown contact '{to}'. Add with: sideband contact add --name {to} --onion <addr>.onion --pubkey <b64>"
@@ -2798,6 +2812,8 @@ pub fn contact_add(
             onion: onion.to_string(),
             pubkey_b64: pubkey_b64.to_string(),
             x25519_pubkey_b64: Some(x25519_pubkey_b64.to_string()),
+            pending: false,
+            blocked: false,
         },
     );
     save_contacts(profile, &contacts)?;
@@ -2851,10 +2867,52 @@ fn save_autodiscovered_contact(profile: &Path, msg: &ChatMessage) -> Result<Opti
             onion: msg.sender_onion.clone(),
             pubkey_b64: msg.from.clone(),
             x25519_pubkey_b64: Some(msg.sender_x25519_pubkey_b64.clone()),
+            pending: true,
+            blocked: false,
         },
     );
     save_contacts(profile, &contacts)?;
     Ok(Some(name))
+}
+
+pub fn contact_accept(profile: &Path, name: &str) -> Result<bool> {
+    let mut contacts = load_contacts(profile)?;
+    let Some(contact) = contacts.get_mut(name) else {
+        return Ok(false);
+    };
+    contact.pending = false;
+    contact.blocked = false;
+    save_contacts(profile, &contacts)?;
+    Ok(true)
+}
+
+pub fn contact_block(profile: &Path, name: &str) -> Result<bool> {
+    let mut contacts = load_contacts(profile)?;
+    let Some(contact) = contacts.get_mut(name) else {
+        return Ok(false);
+    };
+    contact.pending = false;
+    contact.blocked = true;
+    save_contacts(profile, &contacts)?;
+    Ok(true)
+}
+
+pub fn contact_unblock(profile: &Path, name: &str) -> Result<bool> {
+    let mut contacts = load_contacts(profile)?;
+    let Some(contact) = contacts.get_mut(name) else {
+        return Ok(false);
+    };
+    contact.blocked = false;
+    save_contacts(profile, &contacts)?;
+    Ok(true)
+}
+
+pub fn contact_is_blocked(contacts: &ContactsMap, msg: &ChatMessage) -> bool {
+    contacts.values().any(|contact| {
+        contact.blocked
+            && (contact.pubkey_b64 == msg.from
+                || (!msg.sender_onion.trim().is_empty() && contact.onion == msg.sender_onion))
+    })
 }
 
 pub fn contact_delete(profile: &Path, name: &str) -> Result<bool> {
@@ -2876,6 +2934,8 @@ fn contact_list(profile: &Path, json: bool) -> Result<()> {
             onion: &'a str,
             pubkey_b64: &'a str,
             x25519_pubkey_b64: Option<&'a str>,
+            pending: bool,
+            blocked: bool,
         }
 
         let mut rows: Vec<_> = contacts
@@ -2885,6 +2945,8 @@ fn contact_list(profile: &Path, json: bool) -> Result<()> {
                 onion: &c.onion,
                 pubkey_b64: &c.pubkey_b64,
                 x25519_pubkey_b64: c.x25519_pubkey_b64.as_deref(),
+                pending: c.pending,
+                blocked: c.blocked,
             })
             .collect();
         rows.sort_by(|a, b| a.name.cmp(b.name));
@@ -3555,6 +3617,8 @@ fn verify_message_with_sender_metadata(msg: &ChatMessage) -> Result<bool> {
             onion: msg.sender_onion.clone(),
             pubkey_b64: msg.from.clone(),
             x25519_pubkey_b64: Some(msg.sender_x25519_pubkey_b64.clone()),
+            pending: false,
+            blocked: false,
         },
     );
     verify_message(msg, &contacts)
@@ -4822,6 +4886,8 @@ mod tests {
                 onion: "fake.onion".into(),
                 pubkey_b64: B64.encode(vk.to_bytes()),
                 x25519_pubkey_b64: Some(B64.encode([2u8; 32])),
+                pending: false,
+                blocked: false,
             },
         );
 
@@ -4859,6 +4925,8 @@ mod tests {
                 onion: "fake.onion".into(),
                 pubkey_b64: B64.encode(vk.to_bytes()),
                 x25519_pubkey_b64: Some(B64.encode([2u8; 32])),
+                pending: false,
+                blocked: false,
             },
         );
 

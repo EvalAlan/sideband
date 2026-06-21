@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 import 'dart:ffi' as ffi;
@@ -227,8 +228,8 @@ class _WindowHandler extends WindowListener {
   }
 }
 
-
-bool get _isDesktop => Platform.isLinux || Platform.isWindows || Platform.isMacOS;
+bool get _isDesktop =>
+    Platform.isLinux || Platform.isWindows || Platform.isMacOS;
 bool get _canUseCliBackend => _isDesktop;
 bool get _canUseMobileBackend => Platform.isAndroid;
 bool get _canUseLocalBackend => _canUseCliBackend || _canUseMobileBackend;
@@ -305,12 +306,16 @@ class Contact {
     required this.pubkey,
     required this.x25519Pubkey,
     required this.ratchetActive,
+    this.pending = false,
+    this.blocked = false,
   });
   final String name;
   final String onion;
   final String pubkey;
   final String x25519Pubkey;
   final bool ratchetActive;
+  final bool pending;
+  final bool blocked;
 
   String get initial => name.isNotEmpty ? name[0].toUpperCase() : '?';
 
@@ -333,12 +338,16 @@ class Contact {
   }
 
   String get securityLabel {
+    if (blocked) return 'Blocked';
+    if (pending) return 'Pending approval';
     if (ratchetActive) return 'Double Ratchet';
     if (staticKeyActive) return 'Static key';
     return 'Signed only';
   }
 
   String get securityDescription {
+    if (blocked) return 'Blocked: inbound messages are dropped.';
+    if (pending) return 'Unknown verified sender. Add or block this contact.';
     if (ratchetActive) {
       return 'Double Ratchet active: encrypted with forward secrecy.';
     }
@@ -360,6 +369,8 @@ Contact? parseAddCommandContact(String raw) {
     pubkey: parts[3],
     x25519Pubkey: parts[4],
     ratchetActive: false,
+    pending: false,
+    blocked: false,
   );
 }
 
@@ -449,7 +460,8 @@ class AttachmentInfo {
 
 AttachmentInfo? parseAttachmentText(String text) {
   final trimmed = text.trim();
-  final receivedMatch = RegExp(r'^\[file received: (.+)\]$').firstMatch(trimmed);
+  final receivedMatch =
+      RegExp(r'^\[file received: (.+)\]$').firstMatch(trimmed);
   if (receivedMatch != null && !trimmed.startsWith('[file received failed')) {
     final path = receivedMatch.group(1)!.trim();
     return AttachmentInfo(
@@ -843,6 +855,8 @@ class _Cli {
         pubkey: item['pubkey_b64'] as String? ?? '',
         x25519Pubkey: item['x25519_pubkey_b64'] as String? ?? '',
         ratchetActive: _ratchetActive(item['name'] as String),
+        pending: item['pending'] == true,
+        blocked: item['blocked'] == true,
       ));
     }
     parsed.sort((a, b) => a.name.compareTo(b.name));
@@ -986,77 +1000,103 @@ class _MobileApi {
   _MobileApi()
       : _initProfile = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_init_profile'),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>)>('sideband_api_init_profile'),
         _status = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>('sideband_api_status'),
-        _listContacts = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
             ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>)>('sideband_api_list_contacts'),
+                ffi.Pointer<Utf8>)>('sideband_api_status'),
+        _listContacts = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>)>('sideband_api_list_contacts'),
         _listGroups = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
             ffi.Pointer<Utf8> Function(
                 ffi.Pointer<Utf8>)>('sideband_api_list_groups'),
-        _listMessages = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.UintPtr),
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
-                int)>('sideband_api_list_messages'),
-        _listGroupMessages = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.UintPtr),
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
-                int)>('sideband_api_list_group_messages'),
+        _listMessages = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.UintPtr),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                    int)>('sideband_api_list_messages'),
+        _listGroupMessages = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.UintPtr),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                    int)>('sideband_api_list_group_messages'),
         _sendMessage = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(
                 ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
                 ffi.Pointer<Utf8>)>('sideband_api_send_message'),
         _addContact = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>,
-                ffi.Pointer<Utf8>,
-                ffi.Pointer<Utf8>,
-                ffi.Pointer<Utf8>,
-                ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
             ffi.Pointer<Utf8> Function(
                 ffi.Pointer<Utf8>,
                 ffi.Pointer<Utf8>,
                 ffi.Pointer<Utf8>,
                 ffi.Pointer<Utf8>,
                 ffi.Pointer<Utf8>)>('sideband_api_add_contact'),
-        _deleteContact = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_delete_contact'),
+        _deleteContact = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>)>('sideband_api_delete_contact'),
+        _acceptContact = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>)>('sideband_api_accept_contact'),
+        _blockContact = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>)>('sideband_api_block_contact'),
+        _unblockContact = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>)>('sideband_api_unblock_contact'),
         _freeString = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Void Function(ffi.Pointer<Utf8>),
             void Function(ffi.Pointer<Utf8>)>('sideband_api_free_string'),
-        _listenerStart = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>('sideband_api_listener_start'),
-        _listenerStop = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(),
-            ffi.Pointer<Utf8> Function()>('sideband_api_listener_stop'),
+        _listenerStart = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>)>('sideband_api_listener_start'),
+        _listenerStop = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<ffi.Pointer<Utf8> Function(),
+                ffi.Pointer<Utf8> Function()>('sideband_api_listener_stop'),
         _createGroup = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(
                 ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_create_group'),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>)>('sideband_api_create_group'),
         _deleteGroup = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_delete_group'),
-        _clearHistory = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_clear_history'),
-        _shareCommand = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>('sideband_api_share_command');
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>)>('sideband_api_delete_group'),
+        _clearHistory = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>)>('sideband_api_clear_history'),
+        _shareCommand = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>)>('sideband_api_share_command');
 
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
       _initProfile;
@@ -1078,24 +1118,31 @@ class _MobileApi {
   ) _addContact;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
       _deleteContact;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _acceptContact;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _blockContact;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _unblockContact;
   final void Function(ffi.Pointer<Utf8>) _freeString;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _listenerStart;
   final ffi.Pointer<Utf8> Function() _listenerStop;
   final ffi.Pointer<Utf8> Function(
       ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _createGroup;
-  final ffi.Pointer<Utf8> Function(
-      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _deleteGroup;
-  final ffi.Pointer<Utf8> Function(
-      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _clearHistory;
-  final ffi.Pointer<Utf8> Function(
-      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _shareCommand;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _deleteGroup;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _clearHistory;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _shareCommand;
 
   String? _profilePath;
 
   Future<String> profilePath() async {
     final cached = _profilePath;
     if (cached != null) return cached;
-    final filesProfile = await _nativeChannel.invokeMethod<String>('profilePath');
+    final filesProfile =
+        await _nativeChannel.invokeMethod<String>('profilePath');
     if (filesProfile == null || filesProfile.trim().isEmpty) {
       throw Exception('Android profile path unavailable');
     }
@@ -1107,7 +1154,8 @@ class _MobileApi {
       final decoded = jsonDecode(ptr.toDartString());
       if (decoded is! Map) throw Exception('native response was not an object');
       if (decoded['ok'] != true) {
-        throw Exception(decoded['error']?.toString() ?? 'native backend failed');
+        throw Exception(
+            decoded['error']?.toString() ?? 'native backend failed');
       }
       return decoded['data'] as T;
     } finally {
@@ -1125,9 +1173,7 @@ class _MobileApi {
     }
   }
 
-  R _withCString2<R>(
-      String a,
-      String b,
+  R _withCString2<R>(String a, String b,
       ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) call) {
     final ca = a.toNativeUtf8();
     final cb = b.toNativeUtf8();
@@ -1149,7 +1195,8 @@ class _MobileApi {
   }
 
   Future<List<Contact>> contacts() async {
-    final raw = _withCString1<List<dynamic>>(await profilePath(), _listContacts);
+    final raw =
+        _withCString1<List<dynamic>>(await profilePath(), _listContacts);
     final contacts = <Contact>[];
     for (final item in raw) {
       if (item is! Map) continue;
@@ -1159,6 +1206,8 @@ class _MobileApi {
         pubkey: item['ed25519_pubkey_b64'] as String? ?? '',
         x25519Pubkey: item['x25519_pubkey_b64'] as String? ?? '',
         ratchetActive: false,
+        pending: item['pending'] == true,
+        blocked: item['blocked'] == true,
       ));
     }
     contacts.sort((a, b) => a.name.compareTo(b.name));
@@ -1187,12 +1236,14 @@ class _MobileApi {
     return groups;
   }
 
-  Future<_History> history({String? contact, String? group, int limit = 80}) async {
+  Future<_History> history(
+      {String? contact, String? group, int limit = 80}) async {
     final profile = (await profilePath()).toNativeUtf8();
     if (group != null && group.isNotEmpty) {
       final cgroup = group.toNativeUtf8();
       try {
-        final raw = _decode<List<dynamic>>(_listGroupMessages(profile, cgroup, limit));
+        final raw =
+            _decode<List<dynamic>>(_listGroupMessages(profile, cgroup, limit));
         final parsed = <ChatMsg>[];
         for (final item in raw) {
           if (item is! Map) continue;
@@ -1217,7 +1268,8 @@ class _MobileApi {
     }
     final ccontact = (contact ?? '').toNativeUtf8();
     try {
-      final raw = _decode<List<dynamic>>(_listMessages(profile, ccontact, limit));
+      final raw =
+          _decode<List<dynamic>>(_listMessages(profile, ccontact, limit));
       final parsed = <ChatMsg>[];
       for (final item in raw) {
         if (item is! Map) continue;
@@ -1279,6 +1331,18 @@ class _MobileApi {
 
   Future<void> deleteContact(String name) async {
     _withCString2<Object?>(await profilePath(), name, _deleteContact);
+  }
+
+  Future<void> acceptContact(String name) async {
+    _withCString2<Object?>(await profilePath(), name, _acceptContact);
+  }
+
+  Future<void> blockContact(String name) async {
+    _withCString2<Object?>(await profilePath(), name, _blockContact);
+  }
+
+  Future<void> unblockContact(String name) async {
+    _withCString2<Object?>(await profilePath(), name, _unblockContact);
   }
 
   Future<void> startListener() async {
@@ -1602,7 +1666,6 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     });
   }
 
-
   Future<String?> _promptDisplayName() async {
     final controller = TextEditingController();
     try {
@@ -1836,7 +1899,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       _error = decoded['message'] as String? ?? 'error';
                       // Remove any optimistic pending messages on send error
                       final errCmd = decoded['cmd'] as String?;
-                      if (errCmd == 'file' || errCmd == 'send' || errCmd == 'group_send') {
+                      if (errCmd == 'file' ||
+                          errCmd == 'send' ||
+                          errCmd == 'group_send') {
                         _pendingMsgs.removeWhere((m) => m.out && m.sending);
                       }
                       if (!_isRecentSendTransient(lower)) {
@@ -1952,9 +2017,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     // file sends: the optimistic text is "[file sent: <path> (sending…)]"
     // while the real stored text is "[file sent: <path> (<size> bytes, inline)]"
     // match by the file path prefix
-    if (pending.text.startsWith('[file sent: ') && stored.text.startsWith('[file sent: ')) {
-      final pendingPath = pending.text.substring('[file sent: '.length).split(' (').first;
-      final storedPath = stored.text.substring('[file sent: '.length).split(' (').first;
+    if (pending.text.startsWith('[file sent: ') &&
+        stored.text.startsWith('[file sent: ')) {
+      final pendingPath =
+          pending.text.substring('[file sent: '.length).split(' (').first;
+      final storedPath =
+          stored.text.substring('[file sent: '.length).split(' (').first;
       return pendingPath == storedPath;
     }
     return false;
@@ -1968,23 +2036,32 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     return merged;
   }
 
-  Color _securityColor(Contact c) => c.ratchetActive
-      ? _t.primary
-      : c.staticKeyActive
-          ? const Color(0xFF9CDCFE)
-          : _t.textDim;
+  Color _securityColor(Contact c) => c.blocked
+      ? _t.errorFg
+      : c.pending
+          ? const Color(0xFFFFC857)
+          : c.ratchetActive
+              ? _t.primary
+              : c.staticKeyActive
+                  ? const Color(0xFF9CDCFE)
+                  : _t.textDim;
 
-  IconData _securityIcon(Contact c) => c.ratchetActive
-      ? Icons.lock_rounded
-      : c.staticKeyActive
-          ? Icons.lock_outline
-          : Icons.edit_outlined;
+  IconData _securityIcon(Contact c) => c.blocked
+      ? Icons.block
+      : c.pending
+          ? Icons.person_add_disabled_outlined
+          : c.ratchetActive
+              ? Icons.lock_rounded
+              : c.staticKeyActive
+                  ? Icons.lock_outline
+                  : Icons.edit_outlined;
 
   Future<void> _sendViaListener(
       {String? to, String? group, required String message}) async {
     if (_canUseMobileBackend && _mobile != null) {
       if (group != null) {
-        throw Exception('group sends are not wired through the Android backend yet');
+        throw Exception(
+            'group sends are not wired through the Android backend yet');
       }
       if (to == null || to.isEmpty) {
         throw Exception('missing contact for Android send');
@@ -2009,7 +2086,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Future<void> _sendFileViaListener(
       {String? to, String? group, required String path}) async {
     if (_canUseMobileBackend && _mobile != null) {
-      throw Exception('file sends are not wired through the Android backend yet');
+      throw Exception(
+          'file sends are not wired through the Android backend yet');
     }
     final listener = _listener;
     if (listener == null) {
@@ -2075,7 +2153,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _snack('File too large (max 100 MB)');
           return null;
         }
-        setState(() { _pendingAttachmentSize = size; });
+        setState(() {
+          _pendingAttachmentSize = size;
+        });
       } catch (_) {}
       return path;
     } on TimeoutException {
@@ -2223,8 +2303,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       }
 
       final h = _canUseMobileBackend && _mobile != null
-          ? await _historyVisibleForMobile(s?.name, group: sg?.id, knownContacts: c.map((x) => x.name))
-          : await _historyVisibleFor(s?.name, group: sg?.id, knownContacts: c.map((x) => x.name));
+          ? await _historyVisibleForMobile(s?.name,
+              group: sg?.id, knownContacts: c.map((x) => x.name))
+          : await _historyVisibleFor(s?.name,
+              group: sg?.id, knownContacts: c.map((x) => x.name));
       await _checkUnread();
       if (_canUseMobileBackend && _mobile != null) {
         await _syncMobileListenerStatus();
@@ -2794,6 +2876,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   .firstWhere((l) => l.startsWith(prefix), orElse: () => '');
               return line.isEmpty ? '' : line.substring(prefix.length).trim();
             }
+
             final name = value('name:');
             final ed = value('pubkey(ed25519,b64):');
             final x = value('pubkey(x25519,b64):');
@@ -2857,6 +2940,100 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<void> _showAddContactDialog() => _showContactDialog();
+
+  Future<void> _addParsedContact(Contact contact) async {
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.addContact(
+          name: contact.name,
+          onion: contact.onion,
+          pubkey: contact.pubkey,
+          x25519Pubkey: contact.x25519Pubkey,
+        );
+      } else {
+        await _cli.addContact(
+          name: contact.name,
+          onion: contact.onion,
+          pubkey: contact.pubkey,
+          x25519Pubkey: contact.x25519Pubkey,
+        );
+      }
+      if (mounted) {
+        setState(() {
+          _contacts = [
+            for (final c in _contacts)
+              if (c.name != contact.name) c,
+            contact,
+          ]..sort((a, b) => a.name.compareTo(b.name));
+          _sel = contact;
+          _selGroup = null;
+          _msgs = const [];
+          _error = null;
+        });
+      }
+      try {
+        await _refresh();
+      } catch (refreshError) {
+        _snack('Contact saved; refresh failed: $refreshError');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _scanContactQr() async {
+    if (!_canUseMobileBackend) {
+      _snack('QR scanning is only wired on Android right now');
+      return;
+    }
+    final controller = MobileScannerController();
+    var handled = false;
+    try {
+      final raw = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          backgroundColor: _t.surface,
+          title: Text('Scan contact QR', style: TextStyle(color: _t.text)),
+          content: SizedBox(
+            width: 320,
+            height: 360,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: MobileScanner(
+                controller: controller,
+                onDetect: (capture) {
+                  if (handled) return;
+                  for (final barcode in capture.barcodes) {
+                    final value = barcode.rawValue;
+                    if (value == null || value.trim().isEmpty) continue;
+                    handled = true;
+                    Navigator.pop(dialogContext, value);
+                    break;
+                  }
+                },
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+          ],
+        ),
+      );
+      if (raw == null) return;
+      final parsed = parseAddCommandContact(raw);
+      if (parsed == null) {
+        throw Exception('QR did not contain a Sideband /add contact command');
+      }
+      await _addParsedContact(parsed);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      await controller.dispose();
+    }
+  }
 
   Future<void> _showEditContactDialog(Contact contact) =>
       _showContactDialog(contact: contact);
@@ -3097,6 +3274,50 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     }
   }
 
+  Future<void> _acceptContact(Contact contact) async {
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.acceptContact(contact.name);
+      } else {
+        throw Exception(
+            'accept pending contact is only wired on Android right now');
+      }
+      await _refresh();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _blockContact(Contact contact) async {
+    if (!await _confirm('Block contact',
+        'Block ${contact.name}? Future inbound messages from this key/onion will be dropped.')) {
+      return;
+    }
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.blockContact(contact.name);
+      } else {
+        throw Exception('blocking is only wired on Android right now');
+      }
+      await _refresh();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _unblockContact(Contact contact) async {
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.unblockContact(contact.name);
+      } else {
+        throw Exception('unblocking is only wired on Android right now');
+      }
+      await _refresh();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
   Future<void> _clearHistoryFor(Contact contact) async {
     if (!await _confirm(
         'Delete history', 'Delete all message history for ${contact.name}?')) {
@@ -3326,6 +3547,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         PopupMenuItem(value: 'history', child: Text('Show history')),
         PopupMenuItem(value: 'clear-history', child: Text('Delete history')),
         PopupMenuDivider(),
+        PopupMenuItem(value: 'accept', child: Text('Add pending contact')),
+        PopupMenuItem(value: 'block', child: Text('Block contact')),
+        PopupMenuItem(value: 'unblock', child: Text('Unblock contact')),
+        PopupMenuDivider(),
         PopupMenuItem(value: 'edit', child: Text('Edit contact')),
         PopupMenuItem(value: 'delete', child: Text('Delete contact')),
         PopupMenuDivider(),
@@ -3339,6 +3564,15 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         return;
       case 'clear-history':
         await _clearHistoryFor(contact);
+        return;
+      case 'accept':
+        await _acceptContact(contact);
+        return;
+      case 'block':
+        await _blockContact(contact);
+        return;
+      case 'unblock':
+        await _unblockContact(contact);
         return;
       case 'edit':
         await _showEditContactDialog(contact);
@@ -3604,6 +3838,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     },
                   ),
                   ListTile(
+                    leading: const Icon(Icons.qr_code_scanner),
+                    title: const Text('Scan contact QR'),
+                    subtitle: const Text(
+                        'Use the camera to scan a shared Sideband QR'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_scanContactQr());
+                    },
+                  ),
+                  ListTile(
                     leading: const Icon(Icons.group_add),
                     title: const Text('Create group'),
                     subtitle: const Text(
@@ -3634,8 +3878,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   ListTile(
                     leading: const Icon(Icons.info_outline),
                     title: const Text('Runtime status'),
-                    subtitle:
-                        Text('${_runtimeProfileLabel()} • ${_contacts.length} contacts'),
+                    subtitle: Text(
+                        '${_runtimeProfileLabel()} • ${_contacts.length} contacts'),
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_runSlashCommand('/status'));
@@ -3657,7 +3901,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       subtitle: const Text('Bring the onion service back up'),
                       onTap: () {
                         Navigator.pop(dialogContext);
-                        unawaited(_canUseMobileBackend ? _startMobileListener() : _startListener());
+                        unawaited(_canUseMobileBackend
+                            ? _startMobileListener()
+                            : _startListener());
                       },
                     ),
                 ],
@@ -3824,6 +4070,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     icon: const Icon(Icons.group_add, size: 20),
                     onPressed: _showCreateGroupDialog,
                     tooltip: 'Create group',
+                  ),
+                ),
+                SizedBox(
+                  width: 44,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    constraints:
+                        const BoxConstraints.tightFor(width: 44, height: 44),
+                    icon: const Icon(Icons.qr_code_scanner, size: 20),
+                    onPressed: _scanContactQr,
+                    tooltip: 'Scan contact QR',
                   ),
                 ),
                 SizedBox(
@@ -4051,6 +4308,15 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                                         case 'clear-history':
                                           await _clearHistoryFor(c);
                                           return;
+                                        case 'accept':
+                                          await _acceptContact(c);
+                                          return;
+                                        case 'block':
+                                          await _blockContact(c);
+                                          return;
+                                        case 'unblock':
+                                          await _unblockContact(c);
+                                          return;
                                         case 'edit':
                                           await _showEditContactDialog(c);
                                           return;
@@ -4070,6 +4336,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                                       PopupMenuItem(
                                           value: 'clear-history',
                                           child: Text('Delete history')),
+                                      PopupMenuDivider(),
+                                      PopupMenuItem(
+                                          value: 'accept',
+                                          child: Text('Add pending contact')),
+                                      PopupMenuItem(
+                                          value: 'block',
+                                          child: Text('Block contact')),
+                                      PopupMenuItem(
+                                          value: 'unblock',
+                                          child: Text('Unblock contact')),
                                       PopupMenuDivider(),
                                       PopupMenuItem(
                                           value: 'edit',
@@ -4140,8 +4416,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   IconButton(
                     icon: const Icon(Icons.power_settings_new, size: 16),
                     tooltip: 'Start listener',
-                    onPressed:
-                        _canUseMobileBackend ? _startMobileListener : _startListener,
+                    onPressed: _canUseMobileBackend
+                        ? _startMobileListener
+                        : _startListener,
                   ),
               ],
             ),
@@ -4233,9 +4510,59 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _chatHeader(),
           Container(height: 1, color: _t.border),
           if (_error != null) _errorBanner(),
+          if (_sel?.pending == true) _pendingContactBanner(_sel!),
+          if (_sel?.blocked == true) _blockedContactBanner(_sel!),
           Expanded(child: _msgList()),
           Container(height: 1, color: _t.border),
           _inputArea(),
+        ],
+      ),
+    );
+  }
+
+  Widget _pendingContactBanner(Contact contact) {
+    return Container(
+      width: double.infinity,
+      color: const Color(0xFF3D320F),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      child: Row(
+        children: [
+          const Icon(Icons.person_add_disabled_outlined,
+              size: 16, color: Color(0xFFFFC857)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Unknown sender. Add this contact to trust future messages, or block it.',
+              style: TextStyle(color: _t.text, fontSize: 11.5),
+            ),
+          ),
+          TextButton(
+              onPressed: () => _acceptContact(contact),
+              child: const Text('Add')),
+          TextButton(
+              onPressed: () => _blockContact(contact),
+              child: const Text('Block')),
+        ],
+      ),
+    );
+  }
+
+  Widget _blockedContactBanner(Contact contact) {
+    return Container(
+      width: double.infinity,
+      color: _t.errorBg,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      child: Row(
+        children: [
+          Icon(Icons.block, size: 16, color: _t.errorFg),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('Blocked contact. Inbound messages are dropped.',
+                style: TextStyle(color: _t.errorFg, fontSize: 11.5)),
+          ),
+          TextButton(
+              onPressed: () => _unblockContact(contact),
+              child: const Text('Unblock')),
         ],
       ),
     );
@@ -4249,7 +4576,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final isNarrow = MediaQuery.of(context).size.width < 720;
     return Container(
       color: _t.surface,
-      padding: EdgeInsets.symmetric(horizontal: isNarrow ? 8 : 18, vertical: 10),
+      padding:
+          EdgeInsets.symmetric(horizontal: isNarrow ? 8 : 18, vertical: 10),
       child: Row(
         children: [
           if (isNarrow)
@@ -4473,7 +4801,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Widget _attachmentBubble(AttachmentInfo attachment) {
-    final exists = attachment.path.isNotEmpty && File(attachment.path).existsSync();
+    final exists =
+        attachment.path.isNotEmpty && File(attachment.path).existsSync();
     final preview = attachment.image && exists;
     return InkWell(
       onTap: exists ? () => _showAttachment(attachment) : null,
@@ -4728,8 +5057,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                         IconButton(
                           icon: const Icon(Icons.close, size: 16),
                           onPressed: () => Navigator.pop(ctx),
-                          constraints: const BoxConstraints(
-                              minWidth: 28, minHeight: 28),
+                          constraints:
+                              const BoxConstraints(minWidth: 28, minHeight: 28),
                           padding: EdgeInsets.zero,
                         ),
                       ],
@@ -4744,8 +5073,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Padding(
-                                  padding: const EdgeInsets.only(
-                                      left: 4, bottom: 4),
+                                  padding:
+                                      const EdgeInsets.only(left: 4, bottom: 4),
                                   child: Text(entry.key,
                                       style: TextStyle(
                                           color: _t.textDim,
@@ -4759,11 +5088,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                                   children: entry.value.map((emoji) {
                                     return Material(
                                       color: _t.surface2,
-                                      borderRadius:
-                                          BorderRadius.circular(6),
+                                      borderRadius: BorderRadius.circular(6),
                                       child: InkWell(
-                                        borderRadius:
-                                            BorderRadius.circular(6),
+                                        borderRadius: BorderRadius.circular(6),
                                         onTap: () {
                                           _insertEmoji(emoji);
                                           Navigator.pop(ctx);
@@ -4801,6 +5128,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Widget _inputArea() {
     final hasAttach = _pendingAttachmentPath != null;
+    final contactBlocked = _sel?.blocked == true;
+    final contactPending = _sel?.pending == true;
+    final canSend = !_sending && !contactBlocked && !contactPending;
     return Container(
       color: _t.surface,
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
@@ -4820,7 +5150,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                          color: _t.text, fontSize: 12, fontWeight: FontWeight.w600),
+                          color: _t.text,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600),
                     ),
                   ),
                   if (_pendingAttachmentSize > 0)
@@ -4881,17 +5213,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                   },
                   child: Actions(
                     actions: <Type, Action<Intent>>{
-                      _SendMessageIntent:
-                          CallbackAction<_SendMessageIntent>(
+                      _SendMessageIntent: CallbackAction<_SendMessageIntent>(
                         onInvoke: (_) {
-                          if (!_sending) unawaited(_send());
+                          if (canSend) unawaited(_send());
                           return null;
                         },
                       ),
                     },
                     child: TextField(
                       controller: _input,
-                      enabled: !_sending,
+                      enabled: canSend,
                       minLines: 1,
                       maxLines: 4,
                       keyboardType: TextInputType.multiline,
@@ -4899,7 +5230,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       decoration: InputDecoration(
                         hintText: hasAttach
                             ? 'Add a message or send as-is…'
-                            : 'Message or /help for commands…',
+                            : contactBlocked
+                                ? 'Contact is blocked'
+                                : contactPending
+                                    ? 'Add or block this contact first'
+                                    : 'Message or /help for commands…',
                         contentPadding: const EdgeInsets.symmetric(
                             horizontal: 12, vertical: 8),
                       ),
@@ -4910,7 +5245,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               ),
               const SizedBox(width: 8),
               FilledButton(
-                onPressed: _sending ? null : _send,
+                onPressed: canSend ? _send : null,
                 style: FilledButton.styleFrom(
                   minimumSize: const Size(42, 42),
                   padding: EdgeInsets.zero,
@@ -4920,8 +5255,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                         width: 16,
                         height: 16,
                         child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: _t.bg.withAlpha(140)),
+                            strokeWidth: 2, color: _t.bg.withAlpha(140)),
                       )
                     : const Icon(Icons.send_rounded, size: 17),
               ),

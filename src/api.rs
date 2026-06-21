@@ -79,6 +79,8 @@ pub fn api_list_contacts(profile_path: &str) -> Result<Vec<ApiContact>> {
             onion: c.onion.clone(),
             ed25519_pubkey_b64: c.pubkey_b64.clone(),
             x25519_pubkey_b64: c.x25519_pubkey_b64.clone(),
+            pending: c.pending,
+            blocked: c.blocked,
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -117,6 +119,21 @@ pub fn api_add_contact(profile_path: &str, contact: ApiContact) -> Result<()> {
 pub fn api_delete_contact(profile_path: &str, name: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
     crate::contact_delete(&profile, name)
+}
+
+pub fn api_accept_contact(profile_path: &str, name: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::contact_accept(&profile, name)
+}
+
+pub fn api_block_contact(profile_path: &str, name: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::contact_block(&profile, name)
+}
+
+pub fn api_unblock_contact(profile_path: &str, name: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::contact_unblock(&profile, name)
 }
 
 pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Result<()> {
@@ -420,6 +437,8 @@ pub extern "C" fn sideband_api_add_contact(
                 x25519_pubkey_b64: Some(
                     cstr_arg(x25519_pubkey_b64, "x25519_pubkey_b64")?.to_string(),
                 ),
+                pending: false,
+                blocked: false,
             },
         )
     })())
@@ -432,6 +451,45 @@ pub extern "C" fn sideband_api_delete_contact(
 ) -> *mut c_char {
     json_response((|| {
         api_delete_contact(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(name, "name")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_accept_contact(
+    profile_path: *const c_char,
+    name: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_accept_contact(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(name, "name")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_block_contact(
+    profile_path: *const c_char,
+    name: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_block_contact(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(name, "name")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_unblock_contact(
+    profile_path: *const c_char,
+    name: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_unblock_contact(
             cstr_arg(profile_path, "profile_path")?,
             cstr_arg(name, "name")?,
         )
@@ -609,3 +667,4 @@ pub extern "C" fn sideband_api_listener_stop() -> *mut c_char {
         Ok(())
     })())
 }
+

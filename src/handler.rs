@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::transport::tor::TorTransport;
 use crate::transport::tor::SharedTransferState;
 use crate::{
-    decrypt_and_verify, discover_or_update_group, resolve_contact_name_by_pubkey,
+    contact_is_blocked, decrypt_and_verify, discover_or_update_group, resolve_contact_name_by_pubkey,
     send_typed_message, store_message, store_message_for_conversation, ChatMessage, ContactsMap,
     DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload, FileOfferPayload,
     GroupMessagePayload, IncomingFileState, TuiEvent,
@@ -53,6 +53,11 @@ pub async fn handle_inbound(
     tor_client: Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>,
     transfer_state: &SharedTransferState,
 ) -> Result<()> {
+    if contact_is_blocked(contacts, msg) {
+        tracing::info!(from=%msg.from, "dropping message from blocked contact");
+        return Ok(());
+    }
+
     if msg.r#type == "file_offer" {
         handle_file_offer(profile, tui_tx, contacts, msg, transfer_state).await?;
         return Ok(());

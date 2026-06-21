@@ -7,6 +7,10 @@ pub struct ApiContact {
     pub onion: String,
     pub ed25519_pubkey_b64: String,
     pub x25519_pubkey_b64: Option<String>,
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub blocked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

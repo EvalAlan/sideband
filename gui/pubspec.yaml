@@ -14,6 +14,7 @@ dependencies:
   file_selector: ^1.0.3
   window_manager: ^0.5.1
   tray_manager: ^0.5.2
+  mobile_scanner: ^7.2.0
 
 dev_dependencies:
   flutter_test:
