@@ -186,6 +186,24 @@ enum ContactAction {
         #[arg(long)]
         name: String,
     },
+    Accept {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        name: String,
+    },
+    Block {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        name: String,
+    },
+    Unblock {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        name: String,
+    },
     List {
         #[command(flatten)]
         profile: ProfileArg,
@@ -2278,6 +2296,36 @@ async fn main() -> Result<()> {
                 ensure_profile(&profile)?;
                 if contact_delete(&profile, &name)? {
                     println!("contact '{name}' deleted");
+                } else {
+                    println!("contact '{name}' not found");
+                }
+                Ok(())
+            }
+            ContactAction::Accept { profile, name } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                if contact_accept(&profile, &name)? {
+                    println!("contact '{name}' accepted");
+                } else {
+                    println!("contact '{name}' not found");
+                }
+                Ok(())
+            }
+            ContactAction::Block { profile, name } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                if contact_block(&profile, &name)? {
+                    println!("contact '{name}' blocked");
+                } else {
+                    println!("contact '{name}' not found");
+                }
+                Ok(())
+            }
+            ContactAction::Unblock { profile, name } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                if contact_unblock(&profile, &name)? {
+                    println!("contact '{name}' unblocked");
                 } else {
                     println!("contact '{name}' not found");
                 }

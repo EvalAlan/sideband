@@ -782,6 +782,33 @@ class _Cli {
         name,
       ]);
 
+  Future<String> acceptContact(String name) => _run([
+        'contact',
+        'accept',
+        '--profile',
+        profile,
+        '--name',
+        name,
+      ]);
+
+  Future<String> blockContact(String name) => _run([
+        'contact',
+        'block',
+        '--profile',
+        profile,
+        '--name',
+        name,
+      ]);
+
+  Future<String> unblockContact(String name) => _run([
+        'contact',
+        'unblock',
+        '--profile',
+        profile,
+        '--name',
+        name,
+      ]);
+
   Future<String> deleteGroup(String group) =>
       _run(groupDeleteArgs(profile: profile, group: group));
 
@@ -3358,8 +3385,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       if (_canUseMobileBackend && _mobile != null) {
         await _mobile!.acceptContact(contact.name);
       } else {
-        throw Exception(
-            'accept pending contact is only wired on Android right now');
+        _showInfo('Contact accepted', await _cli.acceptContact(contact.name));
       }
       await _refresh();
     } catch (e) {
@@ -3376,7 +3402,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       if (_canUseMobileBackend && _mobile != null) {
         await _mobile!.blockContact(contact.name);
       } else {
-        throw Exception('blocking is only wired on Android right now');
+        _showInfo('Contact blocked', await _cli.blockContact(contact.name));
       }
       await _refresh();
     } catch (e) {
@@ -3389,7 +3415,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       if (_canUseMobileBackend && _mobile != null) {
         await _mobile!.unblockContact(contact.name);
       } else {
-        throw Exception('unblocking is only wired on Android right now');
+        _showInfo('Contact unblocked', await _cli.unblockContact(contact.name));
       }
       await _refresh();
     } catch (e) {
