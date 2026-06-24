@@ -2925,13 +2925,29 @@ fn save_autodiscovered_contact(profile: &Path, msg: &ChatMessage) -> Result<Opti
 
 pub fn contact_accept(profile: &Path, name: &str) -> Result<bool> {
     let mut contacts = load_contacts(profile)?;
+    let pending_count = contacts.values().filter(|c| c.pending).count();
     let Some(contact) = contacts.get_mut(name) else {
         return Ok(false);
     };
+    let was_pending = contact.pending;
     contact.pending = false;
     contact.blocked = false;
     save_contacts(profile, &contacts)?;
+    if was_pending && pending_count == 1 {
+        migrate_legacy_verified_peer_history(profile, name)?;
+    }
     Ok(true)
+}
+
+fn migrate_legacy_verified_peer_history(profile: &Path, name: &str) -> Result<()> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "UPDATE messages
+         SET contact = ?1, conversation_id = ?1
+         WHERE conversation_kind = 'contact' AND contact = 'verified-peer'",
+        params![name],
+    )?;
+    Ok(())
 }
 
 pub fn contact_block(profile: &Path, name: &str) -> Result<bool> {
@@ -4463,6 +4479,43 @@ mod tests {
             alice.x25519_pubkey_b64.as_deref(),
             Some(msg.sender_x25519_pubkey_b64.as_str())
         );
+    }
+
+    #[test]
+    fn contact_accept_migrates_single_legacy_verified_peer_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk = B64.encode([1u8; 32]);
+        let xpk = B64.encode([2u8; 32]);
+        let mut contacts = ContactsMap::new();
+        contacts.insert(
+            "Alice".to_string(),
+            ContactFile {
+                name: "Alice".to_string(),
+                onion: "stqclefnkl4wfmdsz627hlfwu2xwgrk3sb6sgegfq44auik3pz7jmyqd.onion".to_string(),
+                pubkey_b64: pk,
+                x25519_pubkey_b64: Some(xpk),
+                pending: true,
+                blocked: false,
+            },
+        );
+        save_contacts(dir.path(), &contacts).unwrap();
+        store_message(
+            dir.path(),
+            "in",
+            "verified-peer",
+            "",
+            "hello first-contact",
+            123,
+            DeliveryStatus::Delivered,
+        )
+        .unwrap();
+
+        assert!(contact_accept(dir.path(), "Alice").unwrap());
+        let rows = load_history(dir.path(), Some("Alice"), 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "hello first-contact");
+        assert_eq!(rows[0].contact, "Alice");
+        assert_eq!(rows[0].conversation_id, "Alice");
     }
 
     // -- contacts CRUD --
