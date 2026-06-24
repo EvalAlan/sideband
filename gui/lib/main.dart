@@ -1033,6 +1033,11 @@ class _MobileApi {
                 ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
                 ffi.Pointer<Utf8>)>('sideband_api_send_message'),
+        _sendFile = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>)>('sideband_api_send_file'),
         _addContact = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
                 ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
@@ -1110,6 +1115,8 @@ class _MobileApi {
       _listGroupMessages;
   final ffi.Pointer<Utf8> Function(
       ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _sendMessage;
+  final ffi.Pointer<Utf8> Function(
+      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _sendFile;
   final ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>,
     ffi.Pointer<Utf8>,
@@ -1312,6 +1319,19 @@ class _MobileApi {
     }
   }
 
+  Future<void> sendFile({required String to, required String path}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cto = to.toNativeUtf8();
+    final cpath = path.toNativeUtf8();
+    try {
+      _decode<Object?>(_sendFile(profile, cto, cpath));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cto);
+      calloc.free(cpath);
+    }
+  }
+
   Future<void> addContact({
     required String name,
     required String onion,
@@ -1445,6 +1465,50 @@ class _QrPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _QrPainter oldDelegate) =>
       oldDelegate.rows != rows;
+}
+
+class _DisplayNameDialog extends StatefulWidget {
+  const _DisplayNameDialog({required this.theme});
+
+  final ThemeDef theme;
+
+  @override
+  State<_DisplayNameDialog> createState() => _DisplayNameDialogState();
+}
+
+class _DisplayNameDialogState extends State<_DisplayNameDialog> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    Navigator.pop(context, _controller.text.trim());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.theme;
+    return AlertDialog(
+      backgroundColor: t.surface,
+      title: Text('Set up Sideband', style: TextStyle(color: t.text)),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        decoration: const InputDecoration(labelText: 'Display name'),
+        onSubmitted: (_) => _submit(),
+      ),
+      actions: [
+        FilledButton(
+          onPressed: _submit,
+          child: const Text('Create profile'),
+        ),
+      ],
+    );
+  }
 }
 
 // ── screen ──────────────────────────────────────────────────────────────────
@@ -1678,32 +1742,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<String?> _promptDisplayName() async {
-    final controller = TextEditingController();
-    try {
-      return await showDialog<String>(
-        context: context,
-        barrierDismissible: false,
-        builder: (dialogContext) => AlertDialog(
-          backgroundColor: _t.surface,
-          title: Text('Set up Sideband', style: TextStyle(color: _t.text)),
-          content: TextField(
-            controller: controller,
-            autofocus: true,
-            decoration: const InputDecoration(labelText: 'Display name'),
-            onSubmitted: (v) => Navigator.pop(dialogContext, v.trim()),
-          ),
-          actions: [
-            FilledButton(
-              onPressed: () =>
-                  Navigator.pop(dialogContext, controller.text.trim()),
-              child: const Text('Create profile'),
-            ),
-          ],
-        ),
-      );
-    } finally {
-      controller.dispose();
-    }
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _DisplayNameDialog(theme: _t),
+    );
   }
 
   @override
@@ -2097,8 +2140,15 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   Future<void> _sendFileViaListener(
       {String? to, String? group, required String path}) async {
     if (_canUseMobileBackend && _mobile != null) {
-      throw Exception(
-          'file sends are not wired through the Android backend yet');
+      if (group != null) {
+        throw Exception(
+            'group file sends are not wired through the Android backend yet');
+      }
+      if (to == null || to.isEmpty) {
+        throw Exception('missing contact for Android file send');
+      }
+      await _mobile!.sendFile(to: to, path: path);
+      return;
     }
     final listener = _listener;
     if (listener == null) {
@@ -3002,7 +3052,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       if (status.isPermanentlyDenied) {
         final opened = await openAppSettings();
         if (!opened) {
-          _snack('Camera permission permanently denied — enable it in Settings');
+          _snack(
+              'Camera permission permanently denied — enable it in Settings');
         }
         return;
       }
@@ -4942,15 +4993,23 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       return;
     }
 
-    // File doesn't exist locally or isn't an image — try opening with system
+    // File exists locally but isn't previewed inline — hand it to the platform.
     if (attachment.path.isNotEmpty && File(attachment.path).existsSync()) {
-      unawaited(Process.run('xdg-open', [attachment.path]).then((r) {
-        if (r.exitCode != 0) {
+      if (Platform.isAndroid) {
+        unawaited(_nativeChannel.invokeMethod<void>('openFile', {
+          'path': attachment.path,
+        }).catchError((_) {
           _snack('Could not open: ${attachment.label}');
-        }
-      }).catchError((_) {
-        _snack('Could not open: ${attachment.label}');
-      }));
+        }));
+      } else {
+        unawaited(Process.run('xdg-open', [attachment.path]).then((r) {
+          if (r.exitCode != 0) {
+            _snack('Could not open: ${attachment.label}');
+          }
+        }).catchError((_) {
+          _snack('Could not open: ${attachment.label}');
+        }));
+      }
       return;
     }
 

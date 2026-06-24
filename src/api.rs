@@ -16,8 +16,13 @@ type ListenerStatusCallback = extern "C" fn(status: *const c_char, onion: *const
 
 struct MobileSendCommand {
     to: String,
-    body: String,
+    payload: MobileSendPayload,
     response: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+enum MobileSendPayload {
+    Message(String),
+    File(String),
 }
 
 struct ListenerState {
@@ -158,7 +163,7 @@ pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Resul
         send_tx
             .send(MobileSendCommand {
                 to: to.to_string(),
-                body: body.to_string(),
+                payload: MobileSendPayload::Message(body.to_string()),
                 response: response_tx,
             })
             .await
@@ -176,6 +181,29 @@ pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Resul
 
 pub async fn api_send_file(profile_path: &str, to: &str, file_path: &str) -> Result<()> {
     let profile = expand_profile(profile_path);
+    let listener_send_tx = {
+        let guard = LISTENER_STATE
+            .lock()
+            .map_err(|_| anyhow!("listener mutex poisoned"))?;
+        guard.as_ref().and_then(|state| state.send_tx.clone())
+    };
+
+    if let Some(send_tx) = listener_send_tx {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        send_tx
+            .send(MobileSendCommand {
+                to: to.to_string(),
+                payload: MobileSendPayload::File(file_path.to_string()),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| anyhow!("mobile listener send channel is closed"))?;
+        return response_rx
+            .await
+            .map_err(|_| anyhow!("mobile listener send response was dropped"))?
+            .map_err(|e| anyhow!(e));
+    }
+
     let tor_client = TorTransport::bootstrap(&profile).await?;
     crate::send_file(&profile, to, file_path, None, tor_client).await
 }
@@ -427,6 +455,24 @@ pub extern "C" fn sideband_api_send_message(
 }
 
 #[no_mangle]
+pub extern "C" fn sideband_api_send_file(
+    profile_path: *const c_char,
+    to: *const c_char,
+    file_path: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(api_send_file(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(to, "to")?,
+            cstr_arg(file_path, "file_path")?,
+        ))
+    })())
+}
+
+#[no_mangle]
 pub extern "C" fn sideband_api_add_contact(
     profile_path: *const c_char,
     name: *const c_char,
@@ -603,22 +649,33 @@ pub extern "C" fn sideband_api_listener_start(profile_path: *const c_char) -> *m
                 let send_lock = Arc::new(tokio::sync::Mutex::new(()));
                 let send_task = tokio::spawn(async move {
                     while let Some(cmd) = send_rx.recv().await {
-                        let result = match crate::resolve_to(&send_profile, &cmd.to) {
-                            Ok(onion) => {
-                                let _guard = send_lock.lock().await;
-                                crate::send(
-                                    &send_profile,
-                                    &onion,
-                                    &cmd.body,
-                                    &cmd.to,
-                                    None,
-                                    send_client.clone(),
-                                    false,
-                                )
-                                .await
-                                .map_err(|e| e.to_string())
+                        let _guard = send_lock.lock().await;
+                        let result = match cmd.payload {
+                            MobileSendPayload::Message(body) => {
+                                match crate::resolve_to(&send_profile, &cmd.to) {
+                                    Ok(onion) => crate::send(
+                                        &send_profile,
+                                        &onion,
+                                        &body,
+                                        &cmd.to,
+                                        None,
+                                        send_client.clone(),
+                                        false,
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string()),
+                                    Err(e) => Err(e.to_string()),
+                                }
                             }
-                            Err(e) => Err(e.to_string()),
+                            MobileSendPayload::File(file_path) => crate::send_file(
+                                &send_profile,
+                                &cmd.to,
+                                &file_path,
+                                None,
+                                send_client.clone(),
+                            )
+                            .await
+                            .map_err(|e| e.to_string()),
                         };
                         let _ = cmd.response.send(result);
                     }
