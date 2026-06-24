@@ -198,10 +198,14 @@ pub async fn api_send_file(profile_path: &str, to: &str, file_path: &str) -> Res
             })
             .await
             .map_err(|_| anyhow!("mobile listener send channel is closed"))?;
-        return response_rx
-            .await
-            .map_err(|_| anyhow!("mobile listener send response was dropped"))?
-            .map_err(|e| anyhow!(e));
+        // File transfers can take many seconds because chunked sends wait for
+        // ACKs. The Android FFI call runs on Flutter's UI isolate, so waiting
+        // here freezes the app hard enough for Android to show "not responding".
+        // Queue the work onto the listener-owned runtime and return once it is
+        // accepted; the listener still serializes the actual transfer and logs
+        // any delivery failure.
+        drop(response_rx);
+        return Ok(());
     }
 
     let tor_client = TorTransport::bootstrap(&profile).await?;
@@ -740,4 +744,45 @@ pub extern "C" fn sideband_api_listener_stop() -> *mut c_char {
         drop(state);
         Ok(())
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static API_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn api_send_file_with_listener_enqueues_without_waiting_for_delivery() {
+        let _test_guard = API_TEST_LOCK.lock().unwrap();
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<MobileSendCommand>(1);
+        {
+            let mut guard = LISTENER_STATE.lock().unwrap();
+            *guard = Some(ListenerState {
+                quit_tx: None,
+                send_tx: Some(send_tx),
+                handle: None,
+            });
+        }
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            api_send_file("/tmp/sideband-test-profile", "bob", "/tmp/photo.jpg"),
+        )
+        .await;
+        assert!(result.is_ok(), "api_send_file waited for delivery response");
+        result.unwrap().unwrap();
+
+        let cmd = send_rx
+            .try_recv()
+            .expect("file send command was not queued");
+        assert_eq!(cmd.to, "bob");
+        match cmd.payload {
+            MobileSendPayload::File(path) => assert_eq!(path, "/tmp/photo.jpg"),
+            MobileSendPayload::Message(_) => panic!("queued message payload instead of file"),
+        }
+
+        let mut guard = LISTENER_STATE.lock().unwrap();
+        *guard = None;
+    }
 }
