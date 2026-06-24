@@ -428,8 +428,8 @@ pub struct GroupDeletePayload {
 // File transfer
 // ---------------------------------------------------------------------------
 
-const FILE_CHUNK_SIZE: usize = 8 * 1024; // 8 KB chunks (smaller HS payload for better reliability)
-const FILE_INLINE_MAX_SIZE: usize = 96 * 1024; // auto-inline small/medium files; no mode switching for users
+const FILE_CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks — fewer round-trips over Tor HS circuits
+const FILE_INLINE_MAX_SIZE: usize = 512 * 1024; // inline small/medium files; avoids chunked ACK waits on mobile TF circuits
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileOfferPayload {
@@ -930,7 +930,7 @@ pub async fn send_file(
                 ));
             }
 
-            if wait_for_file_ack(&hash, chunk_index, std::time::Duration::from_secs(20)).await {
+            if wait_for_file_ack(&hash, chunk_index, std::time::Duration::from_secs(60)).await {
                 delivered = true;
                 break;
             }
