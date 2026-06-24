@@ -136,39 +136,26 @@ DESKTOP_ID="com.evalalan.sideband.desktop"
 cp "${SCRIPT_DIR}/linux/sideband_gui.desktop" "${APPDIR}/usr/share/applications/${DESKTOP_ID}"
 
 # Bundled NotoColorEmoji sometimes loses to system emoji fonts on Linux fontconfig.
-# Ship a fontconfig override that prefers the bundled color emoji font so chat emoji
-# render with color instead of falling back to a monochrome system font.
+# Ship a fontconfig override that prefers the bundled color emoji font (registered
+# under a unique family name to avoid ambiguity) so chat emoji render with color
+# instead of falling back to a monochrome system font.
 mkdir -p "${APPDIR}/etc/fonts"
 cat > "${APPDIR}/etc/fonts/local.conf" <<'FONTCONF'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
 <fontconfig>
   <alias>
-    <family>Noto Color Emoji</family>
-    <prefer>
-      <family>NotoColorEmoji</family>
-    </prefer>
-  </alias>
-  <alias>
-    <family>NotoColorEmoji</family>
+    <family>SidebandEmoji</family>
     <default>
       <family>Noto Color Emoji</family>
     </default>
   </alias>
-  <match target="font">
-    <test name="family" compare="not_eq">
-      <string>NotoColorEmoji</string>
-    </test>
-    <test name="family" compare="not_eq">
-      <string>Noto Color Emoji</string>
-    </test>
-    <test name="color" compare="not_eq">
-      <bool>true</bool>
-    </test>
-    <edit name="color" mode="assign">
-      <bool>false</bool>
-    </edit>
-  </match>
+  <alias>
+    <family>Noto Color Emoji</family>
+    <prefer>
+      <family>SidebandEmoji</family>
+    </prefer>
+  </alias>
 </fontconfig>
 FONTCONF
 

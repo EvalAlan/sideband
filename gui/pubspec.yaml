@@ -30,6 +30,6 @@ flutter:
     - assets/icon_256x256.png
 
   fonts:
-    - family: NotoColorEmoji
+    - family: SidebandEmoji
       fonts:
         - asset: assets/fonts/NotoColorEmoji.ttf

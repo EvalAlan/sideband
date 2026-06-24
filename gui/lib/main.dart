@@ -193,10 +193,11 @@ ThemeData _buildTheme(ThemeDef t) => ThemeData(
           fontSize: 15,
           fontWeight: FontWeight.w600,
           letterSpacing: 0.1,
+          fontFamilyFallback: const ['SidebandEmoji'],
         ),
-        bodyLarge: TextStyle(color: t.text, fontSize: 14, height: 1.4),
-        bodyMedium: TextStyle(color: t.text, fontSize: 13, height: 1.4),
-        bodySmall: TextStyle(color: t.textDim, fontSize: 11),
+        bodyLarge: TextStyle(color: t.text, fontSize: 14, height: 1.4, fontFamilyFallback: const ['SidebandEmoji']),
+        bodyMedium: TextStyle(color: t.text, fontSize: 13, height: 1.4, fontFamilyFallback: const ['SidebandEmoji']),
+        bodySmall: TextStyle(color: t.textDim, fontSize: 11, fontFamilyFallback: const ['SidebandEmoji']),
       ),
     );
 
@@ -5216,7 +5217,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                                                 style: const TextStyle(
                                                     fontSize: 20,
                                                     fontFamily:
-                                                        'NotoColorEmoji')),
+                                                        'SidebandEmoji')),
                                           ),
                                         ),
                                       ),
