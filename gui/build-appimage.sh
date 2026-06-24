@@ -127,12 +127,50 @@ HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 ROOT="$(dirname "$(dirname "${HERE}")")"
 export LD_LIBRARY_PATH="${ROOT}/usr/lib:${ROOT}/usr/bin/lib:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${ROOT}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export FONTCONFIG_PATH="${ROOT}/etc/fonts:${FONTCONFIG_PATH:-}"
 exec "${HERE}/sideband_gui.bin" "$@"
 WRAPPER
 chmod +x "${APPDIR}/usr/bin/sideband_gui"
 
 DESKTOP_ID="com.evalalan.sideband.desktop"
 cp "${SCRIPT_DIR}/linux/sideband_gui.desktop" "${APPDIR}/usr/share/applications/${DESKTOP_ID}"
+
+# Bundled NotoColorEmoji sometimes loses to system emoji fonts on Linux fontconfig.
+# Ship a fontconfig override that prefers the bundled color emoji font so chat emoji
+# render with color instead of falling back to a monochrome system font.
+mkdir -p "${APPDIR}/etc/fonts"
+cat > "${APPDIR}/etc/fonts/local.conf" <<'FONTCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <alias>
+    <family>Noto Color Emoji</family>
+    <prefer>
+      <family>NotoColorEmoji</family>
+    </prefer>
+  </alias>
+  <alias>
+    <family>NotoColorEmoji</family>
+    <default>
+      <family>Noto Color Emoji</family>
+    </default>
+  </alias>
+  <match target="font">
+    <test name="family" compare="not_eq">
+      <string>NotoColorEmoji</string>
+    </test>
+    <test name="family" compare="not_eq">
+      <string>Noto Color Emoji</string>
+    </test>
+    <test name="color" compare="not_eq">
+      <bool>true</bool>
+    </test>
+    <edit name="color" mode="assign">
+      <bool>false</bool>
+    </edit>
+  </match>
+</fontconfig>
+FONTCONF
 
 cat > "${APPDIR}/usr/share/metainfo/sideband_gui.metainfo.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -188,6 +226,7 @@ set -euo pipefail
 ROOT="${APPDIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}"
 export LD_LIBRARY_PATH="${ROOT}/usr/lib:${ROOT}/usr/bin/lib:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${ROOT}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export FONTCONFIG_PATH="${ROOT}/etc/fonts:${FONTCONFIG_PATH:-}"
 exec "${ROOT}/usr/bin/sideband_gui.bin" "$@"
 APPRUN
 chmod +x "${APPDIR}/AppRun"
