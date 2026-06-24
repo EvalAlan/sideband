@@ -96,7 +96,7 @@ pub async fn handle_inbound(
 
     let body_for_display = body_for_inbound_display(&plaintext, decrypt_error.as_deref());
 
-    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, verified);
 
     record_inbound_chat_plaintext(
         profile,
@@ -224,7 +224,7 @@ async fn handle_file_offer(
         (String::new(), false)
     });
 
-    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, verified);
 
     let body_for_display = if verified {
         match serde_json::from_str::<FileOfferPayload>(&plaintext) {
@@ -404,7 +404,7 @@ async fn handle_file_chunk(
             h.update(&data);
             let actual_hash = format!("{:x}", h.finalize());
 
-            let contact_name = contact_name_for_pubkey(contacts, &msg.from, true);
+            let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, true);
             let downloads_dir = profile.join("downloads");
             if let Err(e) = std::fs::create_dir_all(&downloads_dir) {
                 tracing::error!(error=%e, "failed to create downloads dir");
@@ -463,7 +463,7 @@ async fn handle_file_inline(
         (String::new(), false)
     });
 
-    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, verified);
     let inline = match serde_json::from_str::<FileInlinePayload>(&plaintext) {
         Ok(inline) => inline,
         Err(e) => {
@@ -579,7 +579,7 @@ async fn handle_file_ack(
             accepted = true;
         }
     }
-    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, verified);
     let body = if accepted {
         format!("[file ack] {plaintext}")
     } else {
@@ -629,18 +629,31 @@ fn write_file_atomically(path: &std::path::Path, data: &[u8]) -> Result<()> {
 }
 
 /// Resolve a human-readable contact name from a publisher's public key.
-fn contact_name_for_pubkey(contacts: &ContactsMap, pubkey: &str, verified: bool) -> String {
-    contacts
-        .values()
-        .find(|c| c.pubkey_b64 == pubkey)
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| {
-            if verified {
-                "verified-peer".into()
-            } else {
-                pubkey.to_string()
+fn contact_name_for_pubkey(
+    profile: &Path,
+    contacts: &ContactsMap,
+    pubkey: &str,
+    verified: bool,
+) -> String {
+    if let Some(contact) = contacts.values().find(|c| c.pubkey_b64 == pubkey) {
+        return contact.name.clone();
+    }
+
+    if verified {
+        // decrypt_and_verify can trust-on-first-contact and persist a pending
+        // contact while this handler still holds the pre-decrypt contacts
+        // snapshot. Reload before choosing the storage/display name; otherwise
+        // the first message lands under "verified-peer" and disappears when the
+        // user accepts the newly created contact.
+        if let Ok(fresh_contacts) = crate::load_contacts(profile) {
+            if let Some(contact) = fresh_contacts.values().find(|c| c.pubkey_b64 == pubkey) {
+                return contact.name.clone();
             }
-        })
+        }
+        return "verified-peer".into();
+    }
+
+    pubkey.to_string()
 }
 
 fn body_for_inbound_display(plaintext: &str, decrypt_error: Option<&str>) -> String {
@@ -656,8 +669,11 @@ fn body_for_inbound_display(plaintext: &str, decrypt_error: Option<&str>) -> Str
 
 #[cfg(test)]
 mod tests {
-    use super::{ack_is_acceptable, body_for_inbound_display, write_file_atomically};
-    use crate::FileAckPayload;
+    use super::{
+        ack_is_acceptable, body_for_inbound_display, contact_name_for_pubkey,
+        write_file_atomically,
+    };
+    use crate::{save_contacts, ContactFile, ContactsMap, FileAckPayload};
 
     #[test]
     fn atomic_write_replaces_file_contents() {
@@ -705,6 +721,31 @@ mod tests {
             "[decryption failed: unknown sender pubkey: abc]"
         );
         assert_eq!(body_for_inbound_display("hello", None), "hello");
+    }
+
+    #[test]
+    fn verified_unknown_contact_name_uses_autodiscovered_pending_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = "sender-pubkey".to_string();
+        let mut persisted = ContactsMap::new();
+        persisted.insert(
+            "alice".to_string(),
+            ContactFile {
+                name: "alice".to_string(),
+                onion: "alice.onion".to_string(),
+                pubkey_b64: pubkey.clone(),
+                x25519_pubkey_b64: Some("x25519".to_string()),
+                pending: true,
+                blocked: false,
+            },
+        );
+        save_contacts(dir.path(), &persisted).unwrap();
+
+        let stale_snapshot = ContactsMap::new();
+        assert_eq!(
+            contact_name_for_pubkey(dir.path(), &stale_snapshot, &pubkey, true),
+            "alice"
+        );
     }
 }
 
@@ -862,7 +903,7 @@ async fn handle_group_leave(
         tracing::error!(error=%e, "decrypt/verify failed");
         (String::new(), false)
     });
-    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, verified);
     if let Ok(payload) = serde_json::from_str::<crate::GroupLeavePayload>(&plaintext) {
         let display = format!("[{} left group]", contact_name);
         let status = if verified {
@@ -905,7 +946,7 @@ async fn handle_group_deleted(
         tracing::error!(error=%e, "decrypt/verify failed");
         (String::new(), false)
     });
-    let contact_name = contact_name_for_pubkey(contacts, &msg.from, verified);
+    let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, verified);
     if let Ok(payload) = serde_json::from_str::<crate::GroupDeletePayload>(&plaintext) {
         let display = format!("[group deleted by {}]", contact_name);
         let status = if verified {
