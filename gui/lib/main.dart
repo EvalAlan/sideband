@@ -1590,10 +1590,77 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   String? _pendingAttachmentName;
   int _pendingAttachmentSize = 0;
 
+  // presence + typing + activity
+  final Map<String, DateTime> _lastSeen = {};
+  final Map<String, bool> _online = {};
+  final Map<String, DateTime> _typing = {};
+  final Map<String, ChatMsg> _lastMsg = {};
+
+  // retry queue
+  int _retryQueued = 0;
+
   String _formatBytes(int bytes) {
     if (bytes < 1024) return '${bytes}B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
+  }
+
+  // ── activity tracking ─────────────────────────────────────────────────────
+
+  void _recordActivity(List<ChatMsg> msgs) {
+    for (final m in msgs) {
+      if (m.direction == 'in' && m.contact.isNotEmpty) {
+        _lastSeen[m.contact] = m.ts;
+        _online[m.contact] = true;
+        _lastMsg[m.contact] = m;
+      } else if (m.direction == 'out' && m.contact.isNotEmpty) {
+        _lastMsg[m.contact] = m;
+      }
+    }
+  }
+
+  String _presenceLabel(String contactName) {
+    final isOnline = _online[contactName] == true;
+    final lastSeen = _lastSeen[contactName];
+    final typing = _typing[contactName];
+    if (typing != null &&
+        DateTime.now().difference(typing) < const Duration(seconds: 10)) {
+      return 'typing…';
+    }
+    if (isOnline) return 'online';
+    if (lastSeen == null) return 'last seen unknown';
+    final diff = DateTime.now().difference(lastSeen);
+    if (diff.inMinutes < 1) return 'last seen just now';
+    if (diff.inHours < 1) return 'last seen ${diff.inMinutes}m ago';
+    if (diff.inDays < 1) return 'last seen ${diff.inHours}h ago';
+    if (diff.inDays < 7) return 'last seen ${diff.inDays}d ago';
+    return 'last seen ${lastSeen.month}/${lastSeen.day}';
+  }
+
+  Widget _presenceDot(String contactName) {
+    final isOnline = _online[contactName] == true;
+    final typing = _typing[contactName];
+    final isTyping = typing != null &&
+        DateTime.now().difference(typing) < const Duration(seconds: 10);
+    final color = isTyping
+        ? const Color(0xFFFFC857)
+        : isOnline
+            ? const Color(0xFF3FB950)
+            : _t.textDim;
+    return Container(
+      width: 8,
+      height: 8,
+      margin: const EdgeInsets.only(right: 4),
+      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+    );
+  }
+
+  String _previewText(ChatMsg m) {
+    if (m.out) {
+      final prefix = m.sending ? '⏳ ' : m.failed ? '⚠ ' : '✓ ';
+      return '$prefix${m.text}';
+    }
+    return m.text;
   }
 
   ThemeDef get _t => _themeDef(_selectedTheme);
@@ -1637,7 +1704,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       }
       await _startListener();
       await _load();
-      _poll ??= Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
+      _poll ??= Timer.periodic(const Duration(seconds: 6), (_) {
+        _refresh();
+        _queryRetryStatus();
+      });
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -1673,7 +1743,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     }
     if (!await _loadMobile()) return;
     await _startMobileListener();
-    _poll ??= Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
+    _poll ??= Timer.periodic(const Duration(seconds: 6), (_) {
+      _refresh();
+      _queryRetryStatus();
+    });
   }
 
   Future<bool> _loadMobile() async {
@@ -1999,6 +2072,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                     case 'ack':
                       _error = null;
                       break;
+                    case 'retry_status':
+                      final newCount = (decoded['queued'] as int?) ?? 0;
+                      if (newCount != _retryQueued) {
+                        setState(() => _retryQueued = newCount);
+                      }
+                      break;
                   }
                 } catch (_) {
                   // Not valid JSON, ignore
@@ -2289,6 +2368,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       // not inside _checkUnread(), or real new messages get swallowed.
       _seedSeenIds(global);
       _seedSeenIds(h);
+      _recordActivity(global.msgs);
+      _recordActivity(h.msgs);
       setState(() {
         _contacts = c;
         _groups = g;
@@ -2354,6 +2435,24 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     return _cli.history();
   }
 
+  void _queryRetryStatus() {
+    final listener = _listener;
+    if (listener == null) return;
+    try {
+      listener.stdin.writeln(jsonEncode({'cmd': 'retry_status'}));
+      listener.stdin.flush();
+    } catch (_) {}
+  }
+
+  Future<void> _retryFailedMessage(ChatMsg m) async {
+    if (!m.failed || m.contact.isEmpty) return;
+    try {
+      await _sendViaListener(to: m.contact, message: m.text);
+    } catch (e) {
+      setState(() => _error = 'Retry failed: $e');
+    }
+  }
+
   Future<void> _refresh() async {
     try {
       final Future<List<Contact>> cFut;
@@ -2397,6 +2496,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           : await _historyVisibleFor(s?.name,
               group: sg?.id, knownContacts: c.map((x) => x.name));
       await _checkUnread();
+      _recordActivity(h.msgs);
       if (_canUseMobileBackend && _mobile != null) {
         await _syncMobileListenerStatus();
       }
@@ -4332,19 +4432,31 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                           }
                           final c = _contacts[i];
                           final on = _sel?.name == c.name;
+                          final lastMsg = _lastMsg[c.name];
+                          final presenceText = _presenceLabel(c.name);
                           return GestureDetector(
                             onSecondaryTapDown: (details) =>
                                 _showContactMenu(c, details.globalPosition),
                             child: ListTile(
                               selected: on,
-                              leading: CircleAvatar(
-                                radius: 17,
-                                backgroundColor: c.avatarColor,
-                                child: Text(c.initial,
-                                    style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w700)),
+                              leading: Stack(
+                                clipBehavior: Clip.none,
+                                children: [
+                                  CircleAvatar(
+                                    radius: 17,
+                                    backgroundColor: c.avatarColor,
+                                    child: Text(c.initial,
+                                        style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w700)),
+                                  ),
+                                  Positioned(
+                                    bottom: -1,
+                                    right: -1,
+                                    child: _presenceDot(c.name),
+                                  ),
+                                ],
                               ),
                               title: Row(
                                 children: [
@@ -4360,6 +4472,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                                           color: on ? _t.primary : _t.text,
                                         )),
                                   ),
+                                  if (lastMsg != null)
+                                    Text(
+                                      _hm(lastMsg.ts),
+                                          style: TextStyle(
+                                              fontSize: 10, color: _t.textDim),
+                                    ),
                                   const SizedBox(width: 6),
                                   Tooltip(
                                     message: c.securityDescription,
@@ -4371,29 +4489,31 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                               subtitle: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  Text(
-                                    c.shortOnion,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                        fontSize: 10.5, color: _t.textDim),
-                                  ),
+                                  if (lastMsg != null)
+                                    Text(
+                                      _previewText(lastMsg),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                          fontSize: 11, color: _t.textDim),
+                                    )
+                                  else
+                                    Text(
+                                      c.shortOnion,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                          fontSize: 10.5, color: _t.textDim),
+                                    ),
                                   const SizedBox(height: 1),
-                                  Row(
-                                    children: [
-                                      Icon(_securityIcon(c),
-                                          size: 9, color: _securityColor(c)),
-                                      const SizedBox(width: 3),
-                                      Expanded(
-                                        child: Text(c.securityLabel,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: TextStyle(
-                                                fontSize: 10,
-                                                color: _securityColor(c))),
-                                      ),
-                                    ],
-                                  ),
+                                  Text(presenceText,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                          fontSize: 10,
+                                          color: _online[c.name] == true
+                                              ? _t.primary
+                                              : _t.textDim)),
                                 ],
                               ),
                               trailing: Row(
@@ -4618,6 +4738,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           if (_error != null) _errorBanner(),
           if (_sel?.pending == true) _pendingContactBanner(_sel!),
           if (_sel?.blocked == true) _blockedContactBanner(_sel!),
+          if (_retryQueued > 0) _retryQueueBanner(),
           Expanded(child: _msgList()),
           Container(height: 1, color: _t.border),
           _inputArea(),
@@ -4674,12 +4795,42 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     );
   }
 
+  Widget _retryQueueBanner() {
+    final n = _retryQueued;
+    return Container(
+      width: double.infinity,
+      color: const Color(0xFF2D2A0F),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      child: Row(
+        children: [
+          const Icon(Icons.schedule_send_outlined, size: 16, color: Color(0xFFFFC857)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              n == 1
+                  ? '1 message queued for retry — recipient may be offline'
+                  : '$n messages queued for retry — recipients may be offline',
+              style: TextStyle(color: _t.text, fontSize: 11.5),
+            ),
+          ),
+          TextButton(
+            onPressed: _queryRetryStatus,
+            child: const Text('Refresh'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _chatHeader() {
     final c = _sel;
     final g = _selGroup;
     final title = c?.name ?? g!.sidebarLabel;
-    final subtitle = c?.securityLabel ?? 'Group fan-out to ${g!.memberSummary}';
     final isNarrow = MediaQuery.of(context).size.width < 720;
+    final presenceText = c != null ? _presenceLabel(c.name) : '';
+    final subtitle = c != null
+        ? (presenceText.isNotEmpty ? presenceText : c.securityLabel)
+        : 'Group fan-out to ${g!.memberSummary}';
     return Container(
       color: _t.surface,
       padding:
@@ -4697,14 +4848,25 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                 });
               },
             ),
-          CircleAvatar(
-            radius: 16,
-            backgroundColor: c?.avatarColor ?? _t.primary.withAlpha(110),
-            child: Text(c?.initial ?? 'G',
-                style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700)),
+          Stack(
+            clipBehavior: Clip.none,
+            children: [
+              CircleAvatar(
+                radius: 16,
+                backgroundColor: c?.avatarColor ?? _t.primary.withAlpha(110),
+                child: Text(c?.initial ?? 'G',
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700)),
+              ),
+              if (c != null)
+                Positioned(
+                  bottom: -1,
+                  right: -1,
+                  child: _presenceDot(c.name),
+                ),
+            ],
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -4729,8 +4891,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       Text(subtitle,
                           style: TextStyle(
                               fontSize: 10.5,
-                              color:
-                                  c == null ? _t.primary : _securityColor(c))),
+                              color: c == null
+                                  ? _t.primary
+                                  : (_online[c.name] == true
+                                      ? _t.primary
+                                      : _securityColor(c)))),
                     ],
                   ),
                 ),
@@ -4808,9 +4973,13 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         final m = _msgs[i];
         final prev = i > 0 ? _msgs[i - 1] : null;
         final showDate = prev == null || !_sameDay(m.ts, prev.ts);
+        final showTimeGap = prev != null &&
+            m.tsMs - prev.tsMs > 15 * 60 * 1000 &&
+            _sameDay(m.ts, prev.ts);
         return Column(
           children: [
             if (showDate) _dateLabel(m.ts),
+            if (showTimeGap) _timeGapLabel(m.ts, prev!.ts),
             _bubble(m),
             const SizedBox(height: 3),
           ],
@@ -4841,6 +5010,31 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     );
   }
 
+  Widget _timeGapLabel(DateTime current, DateTime previous) {
+    final diff = current.difference(previous);
+    String label;
+    if (diff.inHours >= 1) {
+      label = '${diff.inHours} hour${diff.inHours > 1 ? 's' : ''} later';
+    } else {
+      label = '${diff.inMinutes} min later';
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+          decoration: BoxDecoration(
+            color: _t.surface,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(label,
+              style: TextStyle(
+                  fontSize: 10, color: _t.textDim, letterSpacing: 0.2)),
+        ),
+      ),
+    );
+  }
+
   String _displayText(ChatMsg m) {
     final payload = parseGroupPayloadText(m.text);
     if (payload != null) return payload.body;
@@ -4852,7 +5046,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     final showGroupSender = _selGroup != null;
     final displayText = _displayText(m);
     final attachment = parseAttachmentText(displayText);
-    return Align(
+    final bubble = Align(
       alignment: right ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
         constraints:
@@ -4904,6 +5098,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         ),
       ),
     );
+
+    if (m.failed && m.out) {
+      return GestureDetector(
+        onTap: () => _retryFailedMessage(m),
+        child: Tooltip(
+          message: 'Tap to retry',
+          child: bubble,
+        ),
+      );
+    }
+    return bubble;
   }
 
   Widget _attachmentBubble(AttachmentInfo attachment) {
@@ -5056,10 +5261,26 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     if (m.failed) {
       return Icon(Icons.error_outline, size: 12, color: _t.errorFg);
     }
-    if (m.status == 'delivered') {
-      return Icon(Icons.done_all, size: 13, color: _t.primary.withAlpha(180));
+    // Determine if our message was likely read: any later inbound from same contact
+    final wasRead = _wasRead(m);
+    if (m.status == 'delivered' || wasRead) {
+      return Icon(Icons.done_all, size: 13,
+          color: wasRead ? _t.primary : _t.primary.withAlpha(140));
     }
     return Icon(Icons.done, size: 13, color: _t.primary.withAlpha(160));
+  }
+
+  bool _wasRead(ChatMsg sentMsg) {
+    if (!sentMsg.out) return false;
+    final contact = sentMsg.contact;
+    if (contact.isEmpty) return false;
+    // Check if we have any inbound message from this contact after this one
+    for (final m in _msgs) {
+      if (m.direction == 'in' && m.contact == contact && m.tsMs > sentMsg.tsMs) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // ── input ────────────────────────────────────────────────────────────────

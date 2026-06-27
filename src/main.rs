@@ -1269,6 +1269,24 @@ fn init_db(profile: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_inbound_transfers_updated
             ON inbound_transfers(updated_at);",
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS retry_queue (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact     TEXT    NOT NULL,
+            onion       TEXT    NOT NULL,
+            message     TEXT    NOT NULL,
+            attempts    INTEGER NOT NULL DEFAULT 0,
+            next_retry_at TEXT  NOT NULL DEFAULT (datetime('now')),
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            last_error  TEXT
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retry_queue_next_retry
+            ON retry_queue(next_retry_at)",
+        [],
+    )?;
     ensure_message_column(
         &conn,
         "conversation_kind",
@@ -1503,6 +1521,78 @@ pub(crate) fn store_message_for_conversation(
             conversation_kind,
             conversation_id,
         ],
+    )?;
+    Ok(())
+}
+
+/// Enqueue a failed outbound message for retry. Returns the queue ID.
+pub(crate) fn enqueue_retry(
+    profile: &Path,
+    contact: &str,
+    onion: &str,
+    message: &str,
+    error: &str,
+) -> Result<i64> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO retry_queue (contact, onion, message, attempts, next_retry_at, last_error)
+         VALUES (?1, ?2, ?3, 1, datetime('now', '+30 seconds'), ?4)",
+        params![contact, onion, message, error],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// How many messages are currently queued for retry.
+pub(crate) fn retry_queue_len(profile: &Path) -> Result<usize> {
+    let conn = init_db(profile)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM retry_queue",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// Get all due retry items (next_retry_at <= now).
+pub(crate) fn retry_due(profile: &Path) -> Result<Vec<(i64, String, String, String)>> {
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, contact, onion, message FROM retry_queue
+         WHERE next_retry_at <= datetime('now')
+         ORDER BY created_at ASC LIMIT 5",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow!("retry_due query: {e}"))
+}
+
+/// Update a retry item after an attempt: increment attempts, set next backoff, or remove if maxed.
+pub(crate) fn retry_update(profile: &Path, id: i64, success: bool, last_error: Option<&str>) -> Result<()> {
+    let conn = init_db(profile)?;
+    if success {
+        conn.execute("DELETE FROM retry_queue WHERE id = ?1", params![id])?;
+        return Ok(());
+    }
+    // Exponential backoff: 30s, 2min, 10min, 30min, then give up after 5 attempts.
+    let mut stmt = conn.prepare("SELECT attempts FROM retry_queue WHERE id = ?1")?;
+    let attempts: i32 = stmt.query_row(params![id], |row| row.get(0))?;
+    drop(stmt);
+    if attempts >= 5 {
+        warn!(id, attempts, "retry queue: max attempts reached, dropping message");
+        conn.execute("DELETE FROM retry_queue WHERE id = ?1", params![id])?;
+        return Ok(());
+    }
+    let backoff_secs = match attempts {
+        1 => 120,
+        2 => 600,
+        3 => 1800,
+        _ => 3600,
+    };
+    conn.execute(
+        "UPDATE retry_queue SET attempts = attempts + 1, next_retry_at = datetime('now', ?1), last_error = ?2 WHERE id = ?3",
+        params![format!("+{backoff_secs} seconds"), last_error.unwrap_or("unknown"), id],
     )?;
     Ok(())
 }
@@ -2180,6 +2270,8 @@ enum ServeResponse {
     Left { cmd: String, group: String },
     #[serde(rename = "deleted")]
     Deleted { cmd: String, group: String },
+    #[serde(rename = "retry_status")]
+    RetryStatus { queued: u32 },
 }
 
 /// Emit a structured JSON response on stdout for the GUI.
@@ -4067,6 +4159,12 @@ pub(crate) async fn serve(
                         }
                     });
                 }
+                "retry_status" => {
+                    let queued = retry_queue_len(&profile).unwrap_or(0);
+                    emit_response(&ServeResponse::RetryStatus {
+                        queued: queued as u32,
+                    });
+                }
                 other => {
                     emit_response(&ServeResponse::Error {
                         cmd: other.into(),
@@ -4120,6 +4218,49 @@ pub(crate) async fn serve(
             Err(e) => {
                 tracing::error!(error=%e, "try_recv error from transport channel");
                 break;
+            }
+        }
+
+        // Periodic retry queue processing (every ~25s).
+        {
+            use std::sync::Mutex;
+            use std::time::{Duration, Instant};
+            static LAST_RETRY_TICK: Mutex<Option<Instant>> = Mutex::new(None);
+            let should_tick = {
+                let mut last = LAST_RETRY_TICK.lock().unwrap();
+                match *last {
+                    Some(t) if t.elapsed() <= Duration::from_secs(25) => false,
+                    _ => {
+                        *last = Some(Instant::now());
+                        true
+                    }
+                }
+            };
+            if should_tick {
+                let profile = profile.to_path_buf();
+                let tc = tor_client.clone();
+                tokio::spawn(async move {
+                    match retry_due(&profile) {
+                        Ok(items) if items.is_empty() => {}
+                        Ok(items) => {
+                            for (id, contact, onion, message) in items {
+                                info!(id, contact = %contact, "retry: attempting delivery");
+                                match send(&profile, &onion, &message, &contact, None, tc.clone(), false).await {
+                                    Ok(()) => {
+                                        info!(id, contact = %contact, "retry: success");
+                                        let _ = retry_update(&profile, id, true, None);
+                                    }
+                                    Err(e) => {
+                                        warn!(id, contact = %contact, error=%e, "retry: failed again");
+                                        let _ = retry_update(&profile, id, false, Some(&e.to_string()));
+                                    }
+                                }
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
+                        }
+                        Err(e) => warn!(error=%e, "retry_due query failed"),
+                    }
+                });
             }
         }
 
@@ -4324,6 +4465,17 @@ pub(crate) async fn send_in_conversation(
             conversation_id,
         ) {
             error!(error=%e, "failed to store outbound message");
+        }
+    }
+
+    // On final failure, enqueue for background retry (contact-only, not groups).
+    if status == DeliveryStatus::Sent {
+        // success — nothing to enqueue
+    } else if conversation_kind == "contact" {
+        let err_text = last_error.as_deref().unwrap_or("unknown");
+        match enqueue_retry(profile, contact_hint, to, message, err_text) {
+            Ok(qid) => info!(qid, contact = %contact_hint, "enqueued for retry"),
+            Err(e) => warn!(error=%e, "failed to enqueue retry"),
         }
     }
 
