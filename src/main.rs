@@ -111,7 +111,18 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
-    Serve(ProfileArg),
+    Serve {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Bridge incoming messages to a Hermes agent (hermes chat -q).
+        /// Each inbound message is piped to Hermes; the response is sent back via Sideband.
+        #[arg(long)]
+        hermes_bridge: bool,
+        /// Only bridge messages starting with this prefix (e.g. "!").
+        /// Omit to bridge all incoming messages.
+        #[arg(long, default_value = "!")]
+        hermes_prefix: String,
+    },
     Send {
         #[command(flatten)]
         profile: ProfileArg,
@@ -2331,15 +2342,52 @@ async fn main() -> Result<()> {
             ensure_profile(&profile)?;
             print_share(&profile, onion.as_deref(), json)
         }
-        CommandKind::Serve(args) => {
-            let profile = args.path()?;
+        CommandKind::Serve {
+            profile: serve_profile,
+            hermes_bridge,
+            hermes_prefix,
+        } => {
+            let profile = serve_profile.path()?;
             ensure_profile(&profile)?;
+            let bridge = hermes_bridge;
+            let prefix = hermes_prefix;
             let (tx, mut rx) = mpsc::channel::<TuiEvent>(64);
+            let profile_for_bridge = profile.clone();
             tokio::spawn(async move {
                 while let Some(evt) = rx.recv().await {
                     match evt {
                         TuiEvent::StatusUpdate(text) => println!("{text}"),
-                        TuiEvent::InboundMessage { .. } => println!("message received"),
+                        TuiEvent::InboundMessage { ref contact, ref body, .. } => {
+                            if bridge {
+                                let trimmed = body.trim();
+                                let should_respond = if prefix.is_empty() {
+                                    true
+                                } else if trimmed.starts_with(&prefix) {
+                                    true
+                                } else {
+                                    false
+                                };
+                                if should_respond {
+                                    let query = if prefix.is_empty() {
+                                        trimmed.to_string()
+                                    } else {
+                                        trimmed[prefix.len()..].trim().to_string()
+                                    };
+                                    if !query.is_empty() {
+                                        println!("[hermes-bridge] from={contact}: {query}");
+                                        let _ = bridge_query_to_hermes(
+                                            &profile_for_bridge,
+                                            contact,
+                                            &query,
+                                        ).await;
+                                    }
+                                } else {
+                                    println!("message received (ignored, no prefix)");
+                                }
+                            } else {
+                                println!("message received");
+                            }
+                        }
                         TuiEvent::InboundGroupMessage { .. } => println!("group message received"),
                         TuiEvent::OutboundMessage { .. } => {}
                     }
@@ -4272,6 +4320,77 @@ pub(crate) async fn serve(
 
     // Propagate any panic/error from the IO loop.
     io_handle.await??;
+    Ok(())
+}
+
+/// Bridge a single inbound message to Hermes and send the response back.
+async fn bridge_query_to_hermes(profile: &Path, contact: &str, query: &str) -> Result<()> {
+    use std::process::Command;
+    info!(contact=%contact, query=%query, "hermes-bridge: querying Hermes");
+
+    // Spawn hermes chat -q with the user's query
+    let output = tokio::task::spawn_blocking({
+        let query = query.to_string();
+        move || -> Result<String, anyhow::Error> {
+            let out = Command::new("hermes")
+                .args(["chat", "-q", &query])
+                .output()
+                .map_err(|e| anyhow!("failed to spawn hermes: {e}"))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return Err(anyhow!("hermes exited with code {}: {}", out.status, stderr));
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        }
+    })
+    .await
+    .map_err(|e| anyhow!("hermes task join error: {e}"))??;
+
+    // Trim and dedent the response. Hermes may output ANSI codes in TTY mode;
+    // -q should be clean but strip just in case.
+    let response = output.trim().to_string();
+    if response.is_empty() {
+        return Err(anyhow!("hermes returned empty response"));
+    }
+
+    // Sideband messages have a practical limit; truncate if needed.
+    // The ratchet protocol handles chunking but let's keep it reasonable.
+    const MAX_LEN: usize = 4000;
+    let response = if response.len() > MAX_LEN {
+        format!("{}... (truncated)", &response[..MAX_LEN])
+    } else {
+        response
+    };
+
+    info!(contact=%contact, response_len=%response.len(), "hermes-bridge: sending response");
+
+    // Send the response back through the CLI binary (one-shot, own Tor client).
+    // This avoids conflicting with the running listener's Tor client.
+    let profile_str = profile.to_string_lossy().to_string();
+    let response_clone = response.clone();
+    let contact_clone = contact.to_string();
+    let send_output = tokio::task::spawn_blocking(move || {
+        Command::new("sideband")
+            .args([
+                "--profile", &profile_str,
+                "send",
+                "--to", &contact_clone,
+                "--message", &response_clone,
+            ])
+            .output()
+            .map_err(|e| anyhow!("failed to spawn sideband send: {e}"))
+    })
+    .await
+    .map_err(|e| anyhow!("sideband send join error: {e}"))??;
+
+    if !send_output.status.success() {
+        return Err(anyhow!(
+            "sideband send failed: {}",
+            String::from_utf8_lossy(&send_output.stderr)
+        ));
+    }
+
+    info!(contact=%contact, "hermes-bridge: response sent");
     Ok(())
 }
 
