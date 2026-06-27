@@ -1551,7 +1551,8 @@ class _ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   final _cli = _Cli();
-  final _MobileApi? _mobile = Platform.isAndroid ? _MobileApi() : null;
+  _MobileApi? _mobile;
+  bool _mobileApiAvailable = false;
   String? _mobileOnion;
   final _input = TextEditingController();
   final _scroll = ScrollController();
@@ -1750,6 +1751,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   Future<bool> _loadMobile() async {
+    if (_mobile == null && !_mobileApiAvailable) {
+      try {
+        _mobile = _MobileApi();
+        _mobileApiAvailable = true;
+      } catch (e) {
+        _mobileApiAvailable = false;
+        setState(() => _error = 'Android native backend unavailable: libsideband.so not found. Build with ./build-android-rust.sh');
+        return false;
+      }
+    }
     final mobile = _mobile;
     if (mobile == null) throw Exception('Android backend unavailable');
     setState(() {
