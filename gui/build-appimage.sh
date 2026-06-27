@@ -243,9 +243,14 @@ fi
 # Step 7: Package with appimagetool (avoids linuxdeploy's bundled strip)
 log "Packaging AppImage..."
 mkdir -p "${OUTPUT_DIR}"
-APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGETOOL}" "${APPDIR}" "${OUTPUT_DIR}/Sideband-${APPIMAGE_ARCH}.AppImage"
+FINAL_APPIMAGE="${OUTPUT_DIR}/Sideband-${APPIMAGE_ARCH}.AppImage"
+TMP_APPIMAGE="$(mktemp "${OUTPUT_DIR}/Sideband-${APPIMAGE_ARCH}.tmp.XXXXXX.AppImage")"
+trap 'rm -f "${TMP_APPIMAGE}"' EXIT
+APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGETOOL}" "${APPDIR}" "${TMP_APPIMAGE}"
 
-chmod +x "${OUTPUT_DIR}/Sideband-${APPIMAGE_ARCH}.AppImage"
-log "AppImage created: ${OUTPUT_DIR}/Sideband-${APPIMAGE_ARCH}.AppImage"
+chmod +x "${TMP_APPIMAGE}"
+mv -f "${TMP_APPIMAGE}" "${FINAL_APPIMAGE}"
+trap - EXIT
+log "AppImage created: ${FINAL_APPIMAGE}"
 ls -lh "${OUTPUT_DIR}"/*.AppImage
 log "Done!"

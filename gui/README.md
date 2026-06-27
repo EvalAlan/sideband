@@ -27,7 +27,7 @@ export SIDEBAND_PROFILE=~/.sideband
 ## Run (Linux)
 
 ```bash
-cd /home/rocky/repos/sideband/gui
+cd /path/to/sideband/gui
 ../.tools/flutter/bin/flutter pub get
 ../.tools/flutter/bin/flutter run -d linux
 ```
@@ -35,7 +35,7 @@ cd /home/rocky/repos/sideband/gui
 If Flutter is in `PATH`:
 
 ```bash
-cd /home/rocky/repos/sideband/gui
+cd /path/to/sideband/gui
 flutter pub get
 flutter run -d linux
 ```
