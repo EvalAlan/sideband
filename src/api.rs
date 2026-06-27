@@ -706,7 +706,7 @@ pub extern "C" fn sideband_api_listener_start(profile_path: *const c_char) -> *m
                     }
                 });
 
-                match crate::serve(&profile_for_task, tui_tx, quit_rx, tor_client, false).await {
+                match crate::serve(&profile_for_task, tui_tx, quit_rx, tor_client, false, None).await {
                     Ok(()) => set_listener_status("listener stopped", ""),
                     Err(e) => set_listener_status(&format!("listener failed: {e}"), ""),
                 }

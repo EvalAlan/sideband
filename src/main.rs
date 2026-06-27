@@ -122,6 +122,10 @@ enum CommandKind {
         /// Omit to bridge all incoming messages.
         #[arg(long, default_value = "!")]
         hermes_prefix: String,
+        /// Listen on a TCP address for remote GUI clients (e.g. "127.0.0.1:9999").
+        /// Remote clients speak the same JSON-line protocol as the stdin control channel.
+        #[arg(long = "remote-addr")]
+        remote_addr: Option<String>,
     },
     Send {
         #[command(flatten)]
@@ -2285,12 +2289,24 @@ enum ServeResponse {
     RetryStatus { queued: u32 },
 }
 
-/// Emit a structured JSON response on stdout for the GUI.
+/// Broadcast a structured JSON response to all connected GUI clients.
+/// Each response line starts with `__sideband_resp__:` prefix so the GUI
+/// can distinguish structured responses from other stdout output.
+/// Also broadcasts to any connected TCP remote clients.
 fn emit_response(resp: &ServeResponse) {
     if let Ok(json) = serde_json::to_string(resp) {
         println!("__sideband_resp__:{json}");
+        // Also broadcast to TCP remote clients
+        let _ = (*RESP_BROADCAST).send(json);
     }
 }
+
+/// Broadcast channel for sending responses to remote TCP clients.
+static RESP_BROADCAST: std::sync::LazyLock<tokio::sync::broadcast::Sender<String>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(256);
+        tx
+    });
 
 // ---------------------------------------------------------------------------
 // Entrypoint
@@ -2346,6 +2362,7 @@ async fn main() -> Result<()> {
             profile: serve_profile,
             hermes_bridge,
             hermes_prefix,
+            remote_addr,
         } => {
             let profile = serve_profile.path()?;
             ensure_profile(&profile)?;
@@ -2396,7 +2413,7 @@ async fn main() -> Result<()> {
             let (_quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
             let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
             let tor = transport::tor::TorTransport::new(None, tor_client);
-            crate::serve(&profile, tx, quit_rx, tor.client.clone(), true).await
+            crate::serve(&profile, tx, quit_rx, tor.client.clone(), true, remote_addr).await
         }
         CommandKind::Send {
             profile,
@@ -3921,6 +3938,7 @@ pub(crate) async fn serve(
     quit_rx: tokio::sync::oneshot::Receiver<()>,
     tor_client: Arc<TorClient<PreferredRuntime>>,
     read_control_stdin: bool,
+    remote_addr: Option<String>,
 ) -> Result<()> {
     let _key = crate::load_signing_key(profile)?;
     if let Err(e) = crate::load_incoming_states(profile) {
@@ -3934,6 +3952,39 @@ pub(crate) async fn serve(
 
     let (control_tx, mut control_rx) = mpsc::channel::<ServeControlCommand>(64);
     let send_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    // Optional: remote TCP control channel for GUI clients (e.g. Android without libsideband.so).
+    if let Some(addr) = remote_addr {
+        let control_tx_remote = control_tx.clone();
+        let listen_addr = addr.clone();
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(&listen_addr).await {
+                Ok(listener) => {
+                    tracing::info!(addr=%listen_addr, "remote control listener ready");
+                    loop {
+                        match listener.accept().await {
+                            Ok((stream, peer)) => {
+                                let control_tx_clone = control_tx_remote.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_remote_client(stream, control_tx_clone).await {
+                                        tracing::debug!(error=%e, %peer, "remote client error");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!(error=%e, "remote accept failed");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error=%e, addr=%listen_addr, "failed to bind remote control listener");
+                }
+            }
+        });
+    }
+
     if read_control_stdin {
         tokio::spawn(async move {
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -4320,6 +4371,63 @@ pub(crate) async fn serve(
 
     // Propagate any panic/error from the IO loop.
     io_handle.await??;
+    Ok(())
+}
+
+/// Handle a single remote TCP client. Reads JSON-line commands from the client,
+/// forwards them to the serve control channel, and writes broadcast responses back.
+async fn handle_remote_client(
+    mut stream: tokio::net::TcpStream,
+    mut control_tx: mpsc::Sender<ServeControlCommand>,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
+    let mut lines = reader.lines();
+    let mut broadcast_rx = (*RESP_BROADCAST).subscribe();
+
+    loop {
+        tokio::select! {
+            // Read command from TCP client → forward to control channel
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        let line = line.trim();
+                        if line.is_empty() { continue; }
+                        match serde_json::from_str::<ServeControlCommand>(line) {
+                            Ok(cmd) => {
+                                if control_tx.send(cmd).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let err = serde_json::to_string(&ServeResponse::Error {
+                                    cmd: "parse".into(),
+                                    kind: "validation".into(),
+                                    message: e.to_string(),
+                                }).unwrap_or_default();
+                                let _ = writer.write_all(err.as_bytes()).await;
+                                let _ = writer.write_all(b"\n").await;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            // Receive broadcast response → forward to TCP client
+            resp = broadcast_rx.recv() => {
+                match resp {
+                    Ok(json) => {
+                        if writer.write_all(json.as_bytes()).await.is_err() { break; }
+                        if writer.write_all(b"\n").await.is_err() { break; }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
     Ok(())
 }
 
