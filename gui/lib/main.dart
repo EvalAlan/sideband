@@ -6,7 +6,6 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 import 'dart:ffi' as ffi;
@@ -3186,26 +3185,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       _snack('QR scanning is only wired on Android right now');
       return;
     }
-    try {
-      final status = await Permission.camera.request();
-      if (status.isPermanentlyDenied) {
-        final opened = await openAppSettings();
-        if (!opened) {
-          _snack(
-              'Camera permission permanently denied — enable it in Settings');
-        }
-        return;
-      }
-      if (!status.isGranted) {
-        _snack('Camera permission denied');
-        return;
-      }
-    } catch (e) {
-      _snack('camera permission check failed: $e');
-      return;
-    }
-    final controller = MobileScannerController();
+    final controller = MobileScannerController(
+      cameraResolution: const Size(1280, 720),
+    );
     var handled = false;
+    String? scannerError;
     try {
       final raw = await showDialog<String>(
         context: context,
@@ -3219,6 +3203,67 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
               borderRadius: BorderRadius.circular(12),
               child: MobileScanner(
                 controller: controller,
+                onDetectError: (error, stackTrace) {
+                  if (error is MobileScannerException) {
+                    final details = error.errorDetails?.details?.toString();
+                    scannerError = 'MobileScanner ${error.errorCode.name}: '
+                        '${error.errorDetails?.message ?? 'no details'}'
+                        '${details == null || details.isEmpty ? '' : '\n$details'}';
+                  } else {
+                    scannerError = error.toString();
+                  }
+                },
+                errorBuilder: (context, error) {
+                  final details = error.errorDetails?.details?.toString();
+                  scannerError = 'MobileScanner ${error.errorCode.name}: '
+                      '${error.errorDetails?.message ?? 'no details'}'
+                      '${details == null || details.isEmpty ? '' : '\n$details'}';
+                  return Container(
+                    color: Colors.black,
+                    padding: const EdgeInsets.all(16),
+                    alignment: Alignment.center,
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.error_outline,
+                            color: Colors.white, size: 36),
+                        const SizedBox(height: 12),
+                        Text(
+                          'Camera failed to start',
+                          style: TextStyle(
+                              color: _t.text, fontWeight: FontWeight.w600),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          error.errorCode.name,
+                          style: TextStyle(color: _t.text, fontSize: 13),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          error.errorDetails?.message ?? 'no details',
+                          style: TextStyle(color: _t.textDim, fontSize: 12),
+                          textAlign: TextAlign.center,
+                        ),
+                        if (details != null && details.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          Expanded(
+                            child: SingleChildScrollView(
+                              child: SelectableText(
+                                details,
+                                style: TextStyle(
+                                    color: _t.textDim, fontSize: 10),
+                                textAlign: TextAlign.left,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  );
+                },
                 onDetect: (capture) {
                   if (handled) return;
                   for (final barcode in capture.barcodes) {
@@ -3240,7 +3285,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           ],
         ),
       );
-      if (raw == null) return;
+      if (raw == null) {
+        if (scannerError != null && scannerError!.isNotEmpty) {
+          throw Exception(scannerError!);
+        }
+        return;
+      }
       final parsed = parseAddCommandContact(raw);
       if (parsed == null) {
         throw Exception('QR did not contain a Sideband /add contact command');
