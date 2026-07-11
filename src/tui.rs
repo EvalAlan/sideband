@@ -2318,6 +2318,34 @@ mod qr_popup_test {
     }
 
     #[test]
+    fn share_command_sets_qr_popup_when_onion_ready() {
+        let (_tx, rx) = mpsc::channel::<TuiEvent>(1);
+        let (send_tx, _s) = mpsc::channel::<SendCommand>(1);
+        let (file_tx, _f) = mpsc::channel::<FileCommand>(1);
+        let dir = tempfile::tempdir().unwrap();
+        crate::init_profile_with_name(dir.path(), "alan").unwrap();
+        let quit_tx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            rx,
+            send_tx,
+            file_tx,
+            vec![],
+            quit_tx,
+        );
+        app.onion = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead.onion".to_string();
+        app.input = "/share".to_string();
+
+        let quit = app.try_send();
+
+        assert!(!quit);
+        assert!(
+            app.qr_popup.is_some(),
+            "/share with a ready onion should populate the QR overlay"
+        );
+    }
+
+    #[test]
     fn qr_popup_renders_qr_row_intact() {
         // Representative /share payload (name + onion + two base64 keys).
         let payload = "/add alan aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead.onion \
