@@ -1168,6 +1168,12 @@ class _MobileApi {
                     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
                     ffi.Pointer<Utf8>)>('sideband_api_block_contact'),
+        _initRatchet = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>)>('sideband_api_init_ratchet'),
         _unblockContact = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(
@@ -1233,6 +1239,8 @@ class _MobileApi {
       _acceptContact;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
       _blockContact;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _initRatchet;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
       _unblockContact;
   final void Function(ffi.Pointer<Utf8>) _freeString;
@@ -1510,6 +1518,10 @@ class _MobileApi {
 
   Future<void> blockContact(String name) async {
     _withCString2<Object?>(await profilePath(), name, _blockContact);
+  }
+
+  Future<void> ratchet(String contact) async {
+    _withCString2<Object?>(await profilePath(), contact, _initRatchet);
   }
 
   Future<void> unblockContact(String name) async {
@@ -3473,9 +3485,14 @@ class _ChatScreenState extends State<_ChatScreen>
           return;
         case 'ratchet':
           if (parts.length < 2) throw Exception('usage: /ratchet <contact>');
-          final result = await _cli.ratchet(parts[1]);
+          if (_canUseMobileBackend && _mobile != null) {
+            await _mobile!.ratchet(parts[1]);
+          } else {
+            await _cli.ratchet(parts[1]);
+          }
           await _load();
-          _showInfo('Ratchet', result);
+          _showInfo('Ratchet',
+              'Double Ratchet initialized for ${parts[1]}. Send a message to complete the handshake.');
           return;
         case 'status':
           _showInfo('Status',
@@ -4085,6 +4102,30 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  Future<void> _startRatchet(Contact contact) async {
+    if (contact.ratchetActive) {
+      _showInfo('Forward secrecy',
+          'Double Ratchet is already active for ${contact.name}.');
+      return;
+    }
+    if (!await _confirm('Enable forward secrecy',
+        'Start a Double Ratchet session with ${contact.name}? Your next message will upgrade to forward-secret encryption. Both sides must be online for the ratchet to fully establish.')) {
+      return;
+    }
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.ratchet(contact.name);
+      } else {
+        await _cli.ratchet(contact.name);
+      }
+      await _refresh();
+      _showInfo('Forward secrecy',
+          'Double Ratchet initialized for ${contact.name}. Send a message to complete the handshake.');
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
   Future<void> _blockContact(Contact contact) async {
     if (!await _confirm('Block contact',
         'Block ${contact.name}? Future inbound messages from this key/onion will be dropped.')) {
@@ -4358,18 +4399,35 @@ class _ChatScreenState extends State<_ChatScreen>
       position: RelativeRect.fromLTRB(
           position.dx, position.dy, position.dx, position.dy),
       color: _t.surface,
-      items: const [
-        PopupMenuItem(value: 'history', child: Text('Show history')),
-        PopupMenuItem(value: 'clear-history', child: Text('Delete history')),
-        PopupMenuDivider(),
-        PopupMenuItem(value: 'accept', child: Text('Add pending contact')),
-        PopupMenuItem(value: 'block', child: Text('Block contact')),
-        PopupMenuItem(value: 'unblock', child: Text('Unblock contact')),
-        PopupMenuDivider(),
-        PopupMenuItem(value: 'edit', child: Text('Edit contact')),
-        PopupMenuItem(value: 'delete', child: Text('Delete contact')),
-        PopupMenuDivider(),
-        PopupMenuItem(value: 'details', child: Text('Contact details')),
+      items: [
+        const PopupMenuItem(value: 'history', child: Text('Show history')),
+        const PopupMenuItem(
+            value: 'clear-history', child: Text('Delete history')),
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: 'ratchet',
+          enabled: !contact.ratchetActive,
+          child: Row(
+            children: [
+              Icon(Icons.lock_outline,
+                  size: 16,
+                  color: contact.ratchetActive ? _t.primary : _t.textDim),
+              const SizedBox(width: 8),
+              Text(contact.ratchetActive
+                  ? 'Forward secrecy active'
+                  : 'Enable forward secrecy'),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(value: 'accept', child: Text('Add pending contact')),
+        const PopupMenuItem(value: 'block', child: Text('Block contact')),
+        const PopupMenuItem(value: 'unblock', child: Text('Unblock contact')),
+        const PopupMenuDivider(),
+        const PopupMenuItem(value: 'edit', child: Text('Edit contact')),
+        const PopupMenuItem(value: 'delete', child: Text('Delete contact')),
+        const PopupMenuDivider(),
+        const PopupMenuItem(value: 'details', child: Text('Contact details')),
       ],
     );
     if (action == null) return;
@@ -4382,6 +4440,9 @@ class _ChatScreenState extends State<_ChatScreen>
         return;
       case 'accept':
         await _acceptContact(contact);
+        return;
+      case 'ratchet':
+        await _startRatchet(contact);
         return;
       case 'block':
         await _blockContact(contact);
@@ -5154,6 +5215,9 @@ class _ChatScreenState extends State<_ChatScreen>
                                         case 'clear-history':
                                           await _clearHistoryFor(c);
                                           return;
+                                        case 'ratchet':
+                                          await _startRatchet(c);
+                                          return;
                                         case 'accept':
                                           await _acceptContact(c);
                                           return;
@@ -5175,32 +5239,50 @@ class _ChatScreenState extends State<_ChatScreen>
                                           return;
                                       }
                                     },
-                                    itemBuilder: (_) => const [
-                                      PopupMenuItem(
+                                    itemBuilder: (_) => [
+                                      const PopupMenuItem(
                                           value: 'history',
                                           child: Text('Show history')),
-                                      PopupMenuItem(
+                                      const PopupMenuItem(
                                           value: 'clear-history',
                                           child: Text('Delete history')),
-                                      PopupMenuDivider(),
+                                      const PopupMenuDivider(),
                                       PopupMenuItem(
+                                        value: 'ratchet',
+                                        enabled: !c.ratchetActive,
+                                        child: Row(
+                                          children: [
+                                            Icon(Icons.lock_outline,
+                                                size: 16,
+                                                color: c.ratchetActive
+                                                    ? _t.primary
+                                                    : _t.textDim),
+                                            const SizedBox(width: 8),
+                                            Text(c.ratchetActive
+                                                ? 'Forward secrecy active'
+                                                : 'Enable forward secrecy'),
+                                          ],
+                                        ),
+                                      ),
+                                      const PopupMenuDivider(),
+                                      const PopupMenuItem(
                                           value: 'accept',
                                           child: Text('Add pending contact')),
-                                      PopupMenuItem(
+                                      const PopupMenuItem(
                                           value: 'block',
                                           child: Text('Block contact')),
-                                      PopupMenuItem(
+                                      const PopupMenuItem(
                                           value: 'unblock',
                                           child: Text('Unblock contact')),
-                                      PopupMenuDivider(),
-                                      PopupMenuItem(
+                                      const PopupMenuDivider(),
+                                      const PopupMenuItem(
                                           value: 'edit',
                                           child: Text('Edit contact')),
-                                      PopupMenuItem(
+                                      const PopupMenuItem(
                                           value: 'delete',
                                           child: Text('Delete contact')),
-                                      PopupMenuDivider(),
-                                      PopupMenuItem(
+                                      const PopupMenuDivider(),
+                                      const PopupMenuItem(
                                           value: 'details',
                                           child: Text('Contact details')),
                                     ],

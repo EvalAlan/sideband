@@ -155,6 +155,11 @@ pub fn api_delete_contact(profile_path: &str, name: &str) -> Result<bool> {
     crate::contact_delete(&profile, name)
 }
 
+pub fn api_init_ratchet(profile_path: &str, contact: &str) -> Result<()> {
+    let profile = expand_profile(profile_path);
+    crate::init_ratchet_for_contact(&profile, contact)
+}
+
 pub fn api_accept_contact(profile_path: &str, name: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
     crate::contact_accept(&profile, name)
@@ -658,6 +663,19 @@ pub extern "C" fn sideband_api_delete_contact(
         api_delete_contact(
             cstr_arg(profile_path, "profile_path")?,
             cstr_arg(name, "name")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_init_ratchet(
+    profile_path: *const c_char,
+    contact: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_init_ratchet(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(contact, "contact")?,
         )
     })())
 }
