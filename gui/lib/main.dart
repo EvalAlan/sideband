@@ -1974,7 +1974,28 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  bool _ensureMobileApi() {
+    if (_mobile == null && !_mobileApiAvailable) {
+      try {
+        _mobile = _MobileApi();
+        _mobileApiAvailable = true;
+      } catch (e) {
+        _mobileApiAvailable = false;
+        if (mounted) {
+          setState(() {
+            _loading = false;
+            _error =
+                'Android native backend unavailable: libsideband.so not found. Build with ./build-android-rust.sh';
+          });
+        }
+        return false;
+      }
+    }
+    return _mobile != null;
+  }
+
   Future<void> _bootstrapMobile() async {
+    if (!_ensureMobileApi()) return;
     final mobile = _mobile;
     if (mobile == null) throw Exception('Android backend unavailable');
     _mobileProfilePath = await mobile.profilePath();
@@ -2006,16 +2027,7 @@ class _ChatScreenState extends State<_ChatScreen>
   }
 
   Future<bool> _loadMobile() async {
-    if (_mobile == null && !_mobileApiAvailable) {
-      try {
-        _mobile = _MobileApi();
-        _mobileApiAvailable = true;
-      } catch (e) {
-        _mobileApiAvailable = false;
-        setState(() => _error = 'Android native backend unavailable: libsideband.so not found. Build with ./build-android-rust.sh');
-        return false;
-      }
-    }
+    if (!_ensureMobileApi()) return false;
     final mobile = _mobile;
     if (mobile == null) throw Exception('Android backend unavailable');
     setState(() {
