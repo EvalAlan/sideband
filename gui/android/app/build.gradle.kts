@@ -70,6 +70,15 @@ android {
             } else {
                 signingConfigs.getByName("debug")
             }
+            // Flutter runs R8 on release builds. Keep it on (smaller APK) but apply our
+            // keep rules so reflection-based plugins (mobile_scanner -> ML Kit barcode)
+            // survive shrinking; without these the QR scanner fails to start in release.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }
