@@ -5669,56 +5669,73 @@ class _ChatScreenState extends State<_ChatScreen>
     final showGroupSender = _selGroup != null;
     final displayText = _displayText(m);
     final attachment = parseAttachmentText(displayText);
-    final bubble = Align(
-      alignment: right ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        constraints:
-            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.65),
-        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
-        margin: const EdgeInsets.only(bottom: 1),
-        decoration: BoxDecoration(
-          color: right ? _t.bubbleOut : _t.bubbleIn,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(14),
-            topRight: const Radius.circular(14),
-            bottomLeft: Radius.circular(right ? 14 : 3),
-            bottomRight: Radius.circular(right ? 3 : 14),
-          ),
-          border: attachment != null
-              ? Border.all(color: _t.primary.withAlpha(70))
-              : null,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (showGroupSender) ...[
-              Text(right ? 'You' : m.contact,
-                  style: TextStyle(
-                      color: right ? _t.primary : _t.textDim,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w700)),
-              const SizedBox(height: 3),
-            ],
-            if (attachment == null)
-              SelectableText(displayText,
-                  style: TextStyle(color: _t.text, fontSize: 14, height: 1.35))
-            else
-              _attachmentBubble(attachment),
-            const SizedBox(height: 3),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(_hm(m.ts),
-                    style: TextStyle(
-                        fontSize: 10, color: _t.textDim.withAlpha(153))),
-                if (right) ...[
-                  const SizedBox(width: 4),
-                  _statusIcon(m),
-                ],
-              ],
-            ),
+    final timeLabel = Padding(
+      padding: const EdgeInsets.only(bottom: 2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(_hm(m.ts),
+              style: TextStyle(
+                  fontSize: 11,
+                  color: _t.textDim,
+                  fontWeight: FontWeight.w500)),
+          if (right) ...[
+            const SizedBox(width: 4),
+            _statusIcon(m),
           ],
+        ],
+      ),
+    );
+
+    final content = Container(
+      constraints:
+          BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.62),
+      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+      decoration: BoxDecoration(
+        color: right ? _t.bubbleOut : _t.bubbleIn,
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(14),
+          topRight: const Radius.circular(14),
+          bottomLeft: Radius.circular(right ? 14 : 3),
+          bottomRight: Radius.circular(right ? 3 : 14),
         ),
+        border: attachment != null
+            ? Border.all(color: _t.primary.withAlpha(70))
+            : null,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (showGroupSender) ...[
+            Text(right ? 'You' : m.contact,
+                style: TextStyle(
+                    color: right ? _t.primary : _t.textDim,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700)),
+            const SizedBox(height: 3),
+          ],
+          if (attachment == null)
+            SelectableText(displayText,
+                style: TextStyle(color: _t.text, fontSize: 14, height: 1.35))
+          else
+            _attachmentBubble(attachment),
+        ],
+      ),
+    );
+
+    // Timestamp sits to the left of the bubble in both directions, so it stays
+    // out of the way of the message text and is easy to scan down the margin.
+    final bubble = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      child: Row(
+        mainAxisAlignment:
+            right ? MainAxisAlignment.end : MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          timeLabel,
+          const SizedBox(width: 8),
+          Flexible(child: content),
+        ],
       ),
     );
 
