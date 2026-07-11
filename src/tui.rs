@@ -12,12 +12,12 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState,
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState,
     },
     Frame, Terminal,
 };
@@ -73,6 +73,9 @@ struct App {
     error_until: Option<Instant>,
     unread_contacts: HashSet<String>,
     unread_groups: HashSet<String>,
+    /// When set, a full-screen QR overlay is shown: (share command, rendered QR).
+    /// Rendered raw (no message-list prefix/wrapping) so it stays scannable.
+    qr_popup: Option<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -126,6 +129,7 @@ impl App {
             error_until: None,
             unread_contacts: HashSet::new(),
             unread_groups: HashSet::new(),
+            qr_popup: None,
         }
     }
 
@@ -576,12 +580,16 @@ impl App {
                     match crate::share_command(&self.profile, &self.onion)
                         .and_then(|command| Ok((crate::qr_unicode(&command)?, command)))
                     {
-                        Ok((qr, command)) => self.push_sys(
-                            &format!(
-                                "Send this to your contact:\n  {command}\n\nScan to add:\n{qr}"
-                            ),
-                            "info",
-                        ),
+                        Ok((qr, command)) => {
+                            self.push_sys(
+                                &format!("Send this to your contact:\n  {command}"),
+                                "info",
+                            );
+                            // Show the QR in a raw full-screen overlay so it stays
+                            // scannable — the message list prefixes and wraps every
+                            // row, which shreds the QR grid.
+                            self.qr_popup = Some((command, qr));
+                        }
                         Err(e) => self.push_sys(&format!("share failed: {e}"), "error"),
                     }
                     return false;
@@ -1394,6 +1402,11 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
         if crossterm::event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    // Any key dismisses the QR overlay and is otherwise swallowed.
+                    if app.qr_popup.is_some() {
+                        app.qr_popup = None;
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Enter => {
                             if app.try_send() {
@@ -1754,6 +1767,52 @@ fn draw(f: &mut Frame, app: &App) {
     draw_messages(f, main[1], app);
     draw_input(f, root[2], app);
     draw_footer(f, root[3], app);
+
+    if let Some((_command, qr)) = &app.qr_popup {
+        draw_qr_popup(f, area, qr);
+    }
+}
+
+fn draw_qr_popup(f: &mut Frame, area: Rect, qr: &str) {
+    // Size the overlay to the QR itself (plus borders/padding) so nothing wraps.
+    let qr_w = qr.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let qr_h = qr.lines().count() as u16;
+    let inner_w = qr_w.max(40);
+    // qr + blank + two hint lines, capped to the available height.
+    let content_h = qr_h + 3;
+    let popup_w = (inner_w + 4).min(area.width);
+    let popup_h = (content_h + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    let mut lines: Vec<Line> = qr
+        .lines()
+        .map(|l| Line::from(Span::raw(l.to_string())))
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Scan with the Sideband mobile app to add this contact.",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "Press any key to close.",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Share — scan to add ");
+    let para = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Center);
+
+    f.render_widget(Clear, popup);
+    f.render_widget(para, popup);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -2239,5 +2298,63 @@ mod input_clear_on_command_test {
                 msg.body
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod qr_popup_test {
+    use super::*;
+
+    fn buffer_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        let area = buf.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn qr_popup_renders_qr_row_intact() {
+        // Representative /share payload (name + onion + two base64 keys).
+        let payload = "/add alan aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead.onion \
+            AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8= \
+            AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let qr = crate::qr_unicode(payload).unwrap();
+        // Pick a distinctive interior row of the QR (avoids all-quiet-zone edges).
+        let sample = qr
+            .lines()
+            .max_by_key(|l| l.trim().chars().count())
+            .unwrap()
+            .trim_end()
+            .to_string();
+        assert!(
+            !sample.trim().is_empty(),
+            "QR sample row should have content"
+        );
+
+        let backend = ratatui::backend::TestBackend::new(120, 60);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            draw_qr_popup(f, area, &qr);
+        })
+        .unwrap();
+
+        let rows = buffer_rows(&term);
+        // The QR row must appear contiguously on a single buffer line. Under the
+        // old message-list rendering it was prefixed and wrapped, shearing the
+        // grid; this asserts the overlay keeps it intact.
+        assert!(
+            rows.iter().any(|r| r.contains(&sample)),
+            "QR row was not rendered intact (wrapped or prefixed?)"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("Press any key to close")),
+            "dismiss hint should be shown"
+        );
     }
 }

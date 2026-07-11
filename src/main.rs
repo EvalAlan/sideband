@@ -3078,7 +3078,9 @@ pub(crate) fn qr_unicode(payload: &str) -> Result<String> {
     Ok(code
         .render::<unicode::Dense1x2>()
         .quiet_zone(true)
-        .module_dimensions(2, 1)
+        // 1x1 keeps modules square with Dense1x2's vertical half-block packing;
+        // 2x1 doubled the width and skewed the aspect ratio, hurting scanning.
+        .module_dimensions(1, 1)
         .build())
 }
 
@@ -4188,7 +4190,9 @@ pub(crate) async fn serve(
                             Ok((stream, peer)) => {
                                 let control_tx_clone = control_tx_remote.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_remote_client(stream, control_tx_clone).await {
+                                    if let Err(e) =
+                                        handle_remote_client(stream, control_tx_clone).await
+                                    {
                                         tracing::debug!(error=%e, %peer, "remote client error");
                                     }
                                 });
