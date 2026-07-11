@@ -1,48 +1,272 @@
 package com.example.sideband_gui
 
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
+import java.io.IOException
 import java.net.URLConnection
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
+
+    companion object {
+        // Distinct from mobile_scanner's MobileScannerPermissions.REQUEST_CODE (0x0786 / 1926)
+        // so onRequestPermissionsResult dispatch never collides with the camera-permission flow.
+        private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 24680
+
+        const val MESSAGES_CHANNEL_ID = "sideband_messages_channel"
+    }
+
+    private var pendingNotificationPermissionResult: MethodChannel.Result? = null
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "sideband/native")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "profilePath" -> result.success("${filesDir.absolutePath}/.sideband")
+
                     "openFile" -> {
                         val path = call.argument<String>("path") ?: ""
                         try {
                             openFile(path)
                             result.success(null)
+                        } catch (e: SecurityException) {
+                            result.error("open_file_rejected", e.message, null)
                         } catch (e: Exception) {
                             result.error("open_file_failed", e.message, null)
                         }
                     }
+
+                    "startForegroundService" -> {
+                        try {
+                            val intent = Intent(this, ListenerForegroundService::class.java)
+                            ContextCompat.startForegroundService(this, intent)
+                            result.success(null)
+                        } catch (e: Exception) {
+                            result.error("start_foreground_service_failed", e.message, null)
+                        }
+                    }
+
+                    "stopForegroundService" -> {
+                        try {
+                            val intent = Intent(this, ListenerForegroundService::class.java).apply {
+                                action = ListenerForegroundService.ACTION_STOP
+                            }
+                            startService(intent)
+                            result.success(null)
+                        } catch (e: Exception) {
+                            result.error("stop_foreground_service_failed", e.message, null)
+                        }
+                    }
+
+                    "requestNotificationPermission" -> {
+                        requestNotificationPermission(result)
+                    }
+
+                    "showMessageNotification" -> {
+                        val title = call.argument<String>("title") ?: "Sideband"
+                        val body = call.argument<String>("body") ?: ""
+                        val id = call.argument<Int>("id") ?: 0
+                        try {
+                            showMessageNotification(title, body, id)
+                            result.success(null)
+                        } catch (e: Exception) {
+                            result.error("show_notification_failed", e.message, null)
+                        }
+                    }
+
+                    "cancelMessageNotifications" -> {
+                        try {
+                            val manager = getSystemService(NotificationManager::class.java)
+                            manager?.cancelAll()
+                            result.success(null)
+                        } catch (e: Exception) {
+                            result.error("cancel_notifications_failed", e.message, null)
+                        }
+                    }
+
                     else -> result.notImplemented()
                 }
             }
     }
 
+    // ---------------------------------------------------------------------
+    // File opening, scoped to the app's attachment/download directory only.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Paths that inbound message text can steer us toward are never trusted as-is:
+     * `path` here may originate from attacker-controlled message bodies (see
+     * gui/lib/main.dart's parseAttachmentText, which regex-extracts a path out of
+     * "[file received: ...]" text). We canonicalize and require the result to live
+     * inside the one directory Rust (src/handler.rs) actually writes received files to:
+     * "<filesDir>/.sideband/downloads/". Anything else -- including identity.toml,
+     * the ratchet/ directory, messages.db, or a path that escapes via ".." -- is rejected.
+     */
     private fun openFile(path: String) {
-        val file = File(path)
-        require(file.exists()) { "file does not exist: $path" }
+        if (path.isBlank()) {
+            throw SecurityException("empty path")
+        }
+
+        val requested = File(path).canonicalFile
+        val allowedRoot = File(filesDir, ".sideband/downloads").canonicalFile
+
+        if (!isInsideAllowedRoot(requested, allowedRoot)) {
+            throw SecurityException("path is outside the allowed attachment directory: $path")
+        }
+        if (!requested.exists()) {
+            throw IllegalArgumentException("file does not exist: $path")
+        }
+
         val uri: Uri = FileProvider.getUriForFile(
             this,
             "${applicationContext.packageName}.fileprovider",
-            file
+            requested
         )
-        val mime = URLConnection.guessContentTypeFromName(file.name) ?: "application/octet-stream"
+        val mime = URLConnection.guessContentTypeFromName(requested.name) ?: "application/octet-stream"
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        startActivity(Intent.createChooser(intent, file.name))
+        startActivity(Intent.createChooser(intent, requested.name))
+    }
+
+    private fun isInsideAllowedRoot(candidate: File, allowedRoot: File): Boolean {
+        var dir: File? = candidate
+        while (dir != null) {
+            if (dir == allowedRoot) return true
+            dir = dir.parentFile
+        }
+        return false
+    }
+
+    // ---------------------------------------------------------------------
+    // Notifications: "Messages" channel (normal priority) for inbound message
+    // notifications while backgrounded. Distinct from the foreground service's
+    // own low-priority "Tor connection" channel.
+    // ---------------------------------------------------------------------
+
+    private fun ensureMessagesChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        val channel = NotificationChannel(
+            MESSAGES_CHANNEL_ID,
+            "Messages",
+            NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Notifications for new Sideband messages received while backgrounded."
+        }
+        manager.createNotificationChannel(channel)
+    }
+
+    private fun showMessageNotification(title: String, body: String, id: Int) {
+        ensureMessagesChannel()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                // Silently no-op: caller should have requested permission via
+                // requestNotificationPermission() first. We don't want to throw here
+                // since a missed notification is not fatal.
+                return
+            }
+        }
+
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, MESSAGES_CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        val contentIntent = launchIntent?.let {
+            android.app.PendingIntent.getActivity(
+                this,
+                id,
+                it,
+                android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+        }
+
+        val notification = builder
+            .setContentTitle(title)
+            .setContentText(body)
+            .setSmallIcon(applicationInfo.icon)
+            .setAutoCancel(true)
+            .apply { if (contentIntent != null) setContentIntent(contentIntent) }
+            .build()
+
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(id, notification)
+    }
+
+    // ---------------------------------------------------------------------
+    // Runtime POST_NOTIFICATIONS permission (API 33+). No-op / auto-granted on
+    // older API levels.
+    // ---------------------------------------------------------------------
+
+    private fun requestNotificationPermission(result: MethodChannel.Result) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            result.success(true)
+            return
+        }
+
+        val alreadyGranted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (alreadyGranted) {
+            result.success(true)
+            return
+        }
+
+        if (pendingNotificationPermissionResult != null) {
+            result.error("request_in_progress", "a notification permission request is already pending", null)
+            return
+        }
+
+        pendingNotificationPermissionResult = result
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+            NOTIFICATION_PERMISSION_REQUEST_CODE
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        // IMPORTANT: always call super so Flutter plugins (e.g. mobile_scanner's camera
+        // permission flow, registered via the ActivityPluginBinding's own listener) keep
+        // receiving their callbacks. Our own request code (24680) is chosen well clear of
+        // mobile_scanner's MobileScannerPermissions.REQUEST_CODE (0x0786 / 1926) so the two
+        // never collide.
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+
+        if (requestCode == NOTIFICATION_PERMISSION_REQUEST_CODE) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            pendingNotificationPermissionResult?.success(granted)
+            pendingNotificationPermissionResult = null
+        }
     }
 }

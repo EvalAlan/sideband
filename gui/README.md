@@ -28,17 +28,11 @@ export SIDEBAND_PROFILE=~/.sideband
 
 ```bash
 cd /path/to/sideband/gui
-../.tools/flutter/bin/flutter pub get
-../.tools/flutter/bin/flutter run -d linux
-```
-
-If Flutter is in `PATH`:
-
-```bash
-cd /path/to/sideband/gui
 flutter pub get
 flutter run -d linux
 ```
+
+(Flutter in `PATH` is assumed; use `flutter --version` to verify it is installed.)
 
 ## Build prerequisites (Linux)
 
@@ -55,9 +49,15 @@ sudo apt update
 sudo apt install -y build-essential cmake ninja-build clang libgtk-3-dev pkg-config
 ```
 
+## What's implemented
+
+- **Android**: Native Rust bridge (dart:ffi to libsideband.so), file transfers via transfers UI, group messaging/management, foreground service for background operation, message notifications, offline retry-queue banner
+- **TUI**: Full command-line interface with message history, contact management, file transfer management
+- **Desktop (Linux)**: Basic chat UI; transfer management still routed to TUI
+
 ## Still missing
 
-- Native Rust bridge (flutter_rust_bridge) instead of shelling out to CLI
-- File transfer workflow in GUI
+- Desktop file transfer UI (Linux/macOS/Windows)
+- Light theme (dark theme only)
+- Delivery receipts (message read status)
 - Ratchet/session indicators in chat header
-- Contact add/edit flows in GUI

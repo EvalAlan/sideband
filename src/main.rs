@@ -444,6 +444,45 @@ pub struct GroupDeletePayload {
 // ---------------------------------------------------------------------------
 
 const FILE_CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks — fewer round-trips over Tor HS circuits
+
+/// Absolute sanity cap on the number of chunks a single inbound transfer may
+/// claim, independent of the offered size. At `FILE_CHUNK_SIZE` per chunk this
+/// bounds a transfer at ~64 GiB, well beyond any legitimate use, and stops an
+/// attacker from forcing a giant `vec![None; total_chunks]` allocation.
+const MAX_TOTAL_CHUNKS: usize = 1_000_000;
+
+/// Validate an inbound `total_chunks` against the offered `file_size`.
+///
+/// A legitimate transfer has exactly `ceil(file_size / FILE_CHUNK_SIZE)` chunks
+/// (with a minimum of 1 for a non-empty offer). We reject anything that does not
+/// match, and anything above [`MAX_TOTAL_CHUNKS`], before allocating chunk
+/// storage. When `file_size` is unknown (0, e.g. a bare `file_chunk` with no
+/// prior offer) we only enforce the absolute cap.
+pub(crate) fn validate_total_chunks(file_size: usize, total_chunks: usize) -> Result<()> {
+    if total_chunks == 0 || total_chunks > MAX_TOTAL_CHUNKS {
+        return Err(anyhow!(
+            "rejecting transfer: total_chunks={total_chunks} out of range (1..={MAX_TOTAL_CHUNKS})"
+        ));
+    }
+    if file_size > 0 {
+        let expected = file_size.div_ceil(FILE_CHUNK_SIZE);
+        if total_chunks != expected {
+            return Err(anyhow!(
+                "rejecting transfer: total_chunks={total_chunks} does not match \
+                 ceil(size {file_size}/{FILE_CHUNK_SIZE})={expected}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Maximum number of message keys the receive ratchet will fast-forward through
+/// in a single decrypt. The skip count comes from the attacker-controlled header
+/// and is applied *before* signature verification, so an unbounded value forces
+/// billions of HKDF iterations and stalls the single inbound dispatch loop.
+/// Mirrors Signal's MAX_SKIP. We intentionally keep no skipped-message-key cache;
+/// this only bounds in-order fast-forward.
+const MAX_RATCHET_SKIP: usize = 2000;
 const FILE_INLINE_MAX_SIZE: usize = 512 * 1024; // inline small/medium files; avoids chunked ACK waits on mobile TF circuits
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -500,16 +539,10 @@ struct OutboundTransferState {
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-
-// Global file transfer statics — restored after incomplete SharedTransferState refactor.
-static INCOMING_FILES: LazyLock<std::sync::Mutex<HashMap<String, IncomingFileState>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+// Global file-ACK set. Inbound file transfer state now lives in the listener's
+// SharedTransferState (persisted to SQLite), not in a global map.
 static FILE_ACK_SET: LazyLock<std::sync::Mutex<HashSet<String>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
-
-fn incoming_files_map() -> &'static std::sync::Mutex<HashMap<String, IncomingFileState>> {
-    &INCOMING_FILES
-}
 
 fn file_ack_set() -> &'static std::sync::Mutex<HashSet<String>> {
     &FILE_ACK_SET
@@ -519,14 +552,13 @@ pub(crate) fn ack_key(hash: &str, chunk_index: usize) -> String {
     format!("{hash}:{chunk_index}")
 }
 
-pub(crate) fn persist_incoming_states(profile: &Path) -> Result<()> {
-    let snapshot = {
-        let map = incoming_files_map()
-            .lock()
-            .map_err(|_| anyhow!("incoming file map lock poisoned"))?;
-        map.clone()
-    };
-
+/// Persist the given in-progress inbound transfer state to SQLite. The snapshot
+/// must be taken from the *live* [`SharedTransferState`] the handler mutates —
+/// persisting from the disjoint startup-only global would wipe in-flight state.
+pub(crate) fn persist_incoming_states_snapshot(
+    profile: &Path,
+    snapshot: &HashMap<String, IncomingFileState>,
+) -> Result<()> {
     let mut conn = init_db(profile)?;
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM inbound_transfer_chunks", [])?;
@@ -551,7 +583,10 @@ pub(crate) fn persist_incoming_states(profile: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_incoming_states(profile: &Path) -> Result<()> {
+/// Load persisted in-progress inbound transfer state from SQLite. The returned
+/// map is used to seed the live [`SharedTransferState`] on startup so a resumed
+/// transfer continues from the next missing chunk after a restart.
+pub(crate) fn load_incoming_states(profile: &Path) -> Result<HashMap<String, IncomingFileState>> {
     let conn = init_db(profile)?;
     let mut stmt = conn.prepare(
         "SELECT t.transfer_key, t.total_chunks, c.chunk_index, c.chunk_data
@@ -560,8 +595,7 @@ fn load_incoming_states(profile: &Path) -> Result<()> {
          ORDER BY t.transfer_key, c.chunk_index",
     )?;
 
-    let mut map: std::collections::HashMap<String, IncomingFileState> =
-        std::collections::HashMap::new();
+    let mut map: HashMap<String, IncomingFileState> = HashMap::new();
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -587,11 +621,14 @@ fn load_incoming_states(profile: &Path) -> Result<()> {
         }
     }
 
-    let mut lock = incoming_files_map()
-        .lock()
-        .map_err(|_| anyhow!("incoming file map lock poisoned"))?;
-    *lock = map;
-    Ok(())
+    Ok(map)
+}
+
+/// Index of the next missing chunk in a persisted transfer, used to verify
+/// resume continuity (and by callers deciding where a transfer picks up).
+#[allow(dead_code)]
+pub(crate) fn next_missing_chunk(state: &IncomingFileState) -> Option<usize> {
+    state.chunks.iter().position(|c| c.is_none())
 }
 
 pub(crate) fn persist_outbound_state(profile: &Path, state: &OutboundTransferState) -> Result<()> {
@@ -645,10 +682,7 @@ fn load_outbound_state(profile: &Path, hash: &str) -> Result<Option<OutboundTran
     }))
 }
 
-pub fn outbound_transfer_target(
-    profile: &Path,
-    hash: &str,
-) -> Result<Option<(String, String)>> {
+pub fn outbound_transfer_target(profile: &Path, hash: &str) -> Result<Option<(String, String)>> {
     let Some(st) = load_outbound_state(profile, hash)? else {
         return Ok(None);
     };
@@ -689,7 +723,10 @@ pub fn list_transfers(profile: &Path) -> Result<Vec<String>> {
         ));
     }
 
-    if let Ok(map) = incoming_files_map().lock() {
+    // Incoming transfers are persisted to SQLite from the live handler state, so
+    // read them back from there (the runtime map lives inside the listener's
+    // SharedTransferState and is not reachable from this call site).
+    if let Ok(map) = load_incoming_states(profile) {
         for (k, st) in map.iter() {
             let have = st.chunks.iter().filter(|c| c.is_some()).count();
             rows.push(format!(
@@ -785,7 +822,9 @@ pub async fn send_file(
         }
 
         if !sent {
-            return Err(anyhow!("file_inline send failed to {contact_name}: {last_error}"));
+            return Err(anyhow!(
+                "file_inline send failed to {contact_name}: {last_error}"
+            ));
         }
 
         let timestamp_ms = std::time::SystemTime::now()
@@ -1082,9 +1121,9 @@ async fn send_typed_message(
     let use_ratchet = message_type == "msg" && ratchet_path.exists();
 
     let msg = if use_ratchet {
-        let mut state_bytes = fs::read(&ratchet_path)?;
+        let state_bytes = fs::read(&ratchet_path)?;
         let mut state: RatchetState =
-            bincode::deserialize(&mut state_bytes).context("deserialize ratchet state")?;
+            bincode::deserialize(&state_bytes).context("deserialize ratchet state")?;
         let (header_b64, nonce_hex, ct_hex) =
             ratchet_encrypt(&mut state, plaintext.as_bytes(), &our_ed25519_pub)?;
         state.save(profile, contact_name)?;
@@ -1169,8 +1208,12 @@ async fn send_typed_message(
 
     match &result {
         Ok(Ok(())) => tracing::info!(%to_onion, message_type, payload_len, "send_typed_message OK"),
-        Ok(Err(e)) => tracing::warn!(%to_onion, message_type, payload_len, error=%e, "send_typed_message failed"),
-        Err(_) => tracing::warn!(%to_onion, message_type, payload_len, "send_typed_message timed out"),
+        Ok(Err(e)) => {
+            tracing::warn!(%to_onion, message_type, payload_len, error=%e, "send_typed_message failed")
+        }
+        Err(_) => {
+            tracing::warn!(%to_onion, message_type, payload_len, "send_typed_message timed out")
+        }
     }
 
     match result {
@@ -1216,8 +1259,21 @@ fn db_path(profile: &Path) -> PathBuf {
     profile.join("messages.db")
 }
 
-fn init_db(profile: &Path) -> Result<Connection> {
+/// Open the profile's SQLite database with the connection-level settings all
+/// writers rely on. WAL lets the listener handler, send tasks and the retry
+/// loop read/write concurrently, and busy_timeout makes contended writes wait
+/// for the lock instead of failing with SQLITE_BUSY (which many call sites
+/// silently swallow).
+fn open_db(profile: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path(profile))?;
+    // journal_mode returns a row, so use query_row rather than execute.
+    conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    Ok(conn)
+}
+
+fn init_db(profile: &Path) -> Result<Connection> {
+    let conn = open_db(profile)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS messages (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1300,6 +1356,18 @@ fn init_db(profile: &Path) -> Result<Connection> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_retry_queue_next_retry
             ON retry_queue(next_retry_at)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS seen_messages (
+            envelope_hash TEXT PRIMARY KEY,
+            seen_at       TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seen_messages_seen_at
+            ON seen_messages(seen_at)",
         [],
     )?;
     ensure_message_column(
@@ -1511,6 +1579,7 @@ pub(crate) fn store_message(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn store_message_for_conversation(
     profile: &Path,
     direction: &str,
@@ -1560,11 +1629,7 @@ pub(crate) fn enqueue_retry(
 /// How many messages are currently queued for retry.
 pub(crate) fn retry_queue_len(profile: &Path) -> Result<usize> {
     let conn = init_db(profile)?;
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM retry_queue",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM retry_queue", [], |row| row.get(0))?;
     Ok(count as usize)
 }
 
@@ -1584,7 +1649,12 @@ pub(crate) fn retry_due(profile: &Path) -> Result<Vec<(i64, String, String, Stri
 }
 
 /// Update a retry item after an attempt: increment attempts, set next backoff, or remove if maxed.
-pub(crate) fn retry_update(profile: &Path, id: i64, success: bool, last_error: Option<&str>) -> Result<()> {
+pub(crate) fn retry_update(
+    profile: &Path,
+    id: i64,
+    success: bool,
+    last_error: Option<&str>,
+) -> Result<()> {
     let conn = init_db(profile)?;
     if success {
         conn.execute("DELETE FROM retry_queue WHERE id = ?1", params![id])?;
@@ -1595,7 +1665,10 @@ pub(crate) fn retry_update(profile: &Path, id: i64, success: bool, last_error: O
     let attempts: i32 = stmt.query_row(params![id], |row| row.get(0))?;
     drop(stmt);
     if attempts >= 5 {
-        warn!(id, attempts, "retry queue: max attempts reached, dropping message");
+        warn!(
+            id,
+            attempts, "retry queue: max attempts reached, dropping message"
+        );
         conn.execute("DELETE FROM retry_queue WHERE id = ?1", params![id])?;
         return Ok(());
     }
@@ -1610,6 +1683,57 @@ pub(crate) fn retry_update(profile: &Path, id: i64, success: bool, last_error: O
         params![format!("+{backoff_secs} seconds"), last_error.unwrap_or("unknown"), id],
     )?;
     Ok(())
+}
+
+/// Number of days a seen-message fingerprint is retained. Replays older than
+/// this are re-accepted, which is a deliberate trade-off: clocks over Tor are
+/// unreliable so we cannot use a freshness window, and unbounded retention
+/// would grow the DB forever.
+const SEEN_MESSAGE_RETENTION_DAYS: i64 = 14;
+/// Hard cap on retained fingerprints, pruned oldest-first.
+const SEEN_MESSAGE_MAX_ROWS: i64 = 50_000;
+
+/// Compute a stable fingerprint for an inbound message's ciphertext so replays
+/// can be detected. Uses the encrypted payload (v2 enc_body or v3 ratchet
+/// ciphertext) plus the sender pubkey, not the plaintext.
+pub(crate) fn message_replay_fingerprint(msg: &ChatMessage) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(msg.from.as_bytes());
+    h.update(b"|");
+    h.update(msg.enc_body.as_bytes());
+    h.update(b"|");
+    h.update(msg.ratchet_ct_hex.as_bytes());
+    h.update(b"|");
+    h.update(msg.sig_b64.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Record a message fingerprint, returning `true` if it is new (should be
+/// processed) or `false` if it is a replay (already seen). Prunes old rows.
+pub(crate) fn record_seen_message(profile: &Path, fingerprint: &str) -> Result<bool> {
+    let conn = init_db(profile)?;
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO seen_messages (envelope_hash) VALUES (?1)",
+        params![fingerprint],
+    )?;
+    if inserted == 0 {
+        return Ok(false);
+    }
+    // Prune by age, then by absolute count (oldest first).
+    let _ = conn.execute(
+        "DELETE FROM seen_messages WHERE seen_at < datetime('now', ?1)",
+        params![format!("-{SEEN_MESSAGE_RETENTION_DAYS} days")],
+    );
+    let _ = conn.execute(
+        "DELETE FROM seen_messages WHERE envelope_hash IN (
+             SELECT envelope_hash FROM seen_messages
+             ORDER BY seen_at DESC, envelope_hash DESC
+             LIMIT -1 OFFSET ?1
+         )",
+        params![SEEN_MESSAGE_MAX_ROWS],
+    );
+    Ok(true)
 }
 
 #[allow(dead_code)]
@@ -1627,7 +1751,7 @@ pub(crate) struct HistoryRow {
     pub(crate) conversation_id: String,
 }
 
-pub fn load_history(
+pub(crate) fn load_history(
     profile: &Path,
     contact_filter: Option<&str>,
     limit: usize,
@@ -2101,13 +2225,13 @@ pub(crate) fn discover_or_update_group(
     resolve_group(profile, group_id)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct GroupSendFailure {
     pub(crate) contact: String,
     pub(crate) error: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct GroupSendResult {
     pub(crate) group_id: String,
     pub(crate) group_title: String,
@@ -2147,6 +2271,7 @@ pub(crate) async fn send_group(
             force_static,
             "group",
             &group.id,
+            false,
             false,
         )
         .await
@@ -2374,16 +2499,22 @@ async fn main() -> Result<()> {
                 while let Some(evt) = rx.recv().await {
                     match evt {
                         TuiEvent::StatusUpdate(text) => println!("{text}"),
-                        TuiEvent::InboundMessage { ref contact, ref body, .. } => {
-                            if bridge {
+                        TuiEvent::InboundMessage {
+                            ref contact,
+                            ref body,
+                            verified,
+                            ..
+                        } => {
+                            // Only bridge messages whose signature verified from a
+                            // known contact. Acting on unverified senders would let
+                            // anyone drive the Hermes agent by spoofing a pubkey.
+                            let known_contact = crate::load_contacts(&profile_for_bridge)
+                                .map(|c| c.contains_key(contact.as_str()))
+                                .unwrap_or(false);
+                            if bridge && verified && known_contact {
                                 let trimmed = body.trim();
-                                let should_respond = if prefix.is_empty() {
-                                    true
-                                } else if trimmed.starts_with(&prefix) {
-                                    true
-                                } else {
-                                    false
-                                };
+                                let should_respond =
+                                    prefix.is_empty() || trimmed.starts_with(&prefix);
                                 if should_respond {
                                     let query = if prefix.is_empty() {
                                         trimmed.to_string()
@@ -2396,7 +2527,8 @@ async fn main() -> Result<()> {
                                             &profile_for_bridge,
                                             contact,
                                             &query,
-                                        ).await;
+                                        )
+                                        .await;
                                     }
                                 } else {
                                     println!("message received (ignored, no prefix)");
@@ -2726,14 +2858,51 @@ pub fn identity_path(profile: &Path) -> PathBuf {
     profile.join("identity.toml")
 }
 
+/// Write a file containing private key material with owner-only permissions on
+/// unix (0o600). On other platforms this is a plain write.
+fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    fs::write(path, contents.as_ref())?;
+    restrict_file(path);
+    Ok(())
+}
+
+/// chmod a private file to 0o600 on unix (best-effort). No-op elsewhere.
+fn restrict_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(error=%e, path=%path.display(), "failed to restrict file permissions");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Create a profile directory tree with owner-only permissions on unix (0o700).
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(error=%e, path=%path.display(), "failed to restrict dir permissions");
+        }
+    }
+    Ok(())
+}
+
 fn load_identity(profile: &Path) -> Result<IdentityFile> {
     let path = identity_path(profile);
     let text = fs::read_to_string(&path).context("read identity.toml")?;
+    // Correct permissions on existing profiles created before we started
+    // restricting the identity file.
+    restrict_file(&path);
     Ok(toml::from_str(&text)?)
 }
 
 fn save_identity(profile: &Path, id: &IdentityFile) -> Result<()> {
-    fs::write(identity_path(profile), toml::to_string_pretty(id)?).context("write identity")
+    write_private(&identity_path(profile), toml::to_string_pretty(id)?).context("write identity")
 }
 
 pub fn load_display_name(profile: &Path) -> Result<String> {
@@ -2761,7 +2930,7 @@ pub(crate) fn set_display_name(profile: &Path, name: &str) -> Result<String> {
 
 #[allow(dead_code)]
 fn init_profile(profile: &Path) -> Result<()> {
-    fs::create_dir_all(profile).context("create profile dir")?;
+    create_private_dir(profile).context("create profile dir")?;
 
     let identity_path = identity_path(profile);
     if !identity_path.exists() {
@@ -2772,7 +2941,8 @@ fn init_profile(profile: &Path) -> Result<()> {
             display_name: default_display_name(profile),
             x25519_secret_b64: B64.encode(x25519_secret.to_bytes()),
         };
-        fs::write(&identity_path, toml::to_string_pretty(&id_file)?).context("write identity")?;
+        write_private(&identity_path, toml::to_string_pretty(&id_file)?)
+            .context("write identity")?;
     }
 
     fs::create_dir_all(profile.join("tor/state"))?;
@@ -2843,7 +3013,7 @@ fn run_wizard(profile: &Path) -> Result<()> {
 }
 
 pub fn init_profile_with_name(profile: &Path, display_name: &str) -> Result<()> {
-    fs::create_dir_all(profile).context("create profile dir")?;
+    create_private_dir(profile).context("create profile dir")?;
 
     let signing = SigningKey::generate(&mut OsRng);
     let x25519_secret = StaticSecret::random_from_rng(OsRng);
@@ -2853,7 +3023,7 @@ pub fn init_profile_with_name(profile: &Path, display_name: &str) -> Result<()> 
         x25519_secret_b64: B64.encode(x25519_secret.to_bytes()),
     };
     let identity_path = identity_path(profile);
-    fs::write(&identity_path, toml::to_string_pretty(&id_file)?).context("write identity")?;
+    write_private(&identity_path, toml::to_string_pretty(&id_file)?).context("write identity")?;
 
     fs::create_dir_all(profile.join("arti_state"))?;
 
@@ -2978,7 +3148,11 @@ pub fn save_contacts(profile: &Path, contacts: &ContactsMap) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_contact_fields(onion: &str, pubkey_b64: &str, x25519_pubkey_b64: &str) -> Result<()> {
+pub fn validate_contact_fields(
+    onion: &str,
+    pubkey_b64: &str,
+    x25519_pubkey_b64: &str,
+) -> Result<()> {
     onion
         .parse::<tor_hsservice::HsId>()
         .map_err(|e| anyhow!("invalid v3 onion address '{}': {}", onion, e))?;
@@ -3292,6 +3466,13 @@ impl RatchetState {
             .join(format!("{}.bin", contact.display()))
     }
 
+    /// Whether a Double Ratchet session exists for `contact_name` (state file
+    /// present on disk). This is the same truth the desktop GUI reads directly.
+    #[allow(dead_code)]
+    pub(crate) fn is_active(profile: &Path, contact_name: &str) -> bool {
+        Self::path(profile, std::path::Path::new(contact_name)).exists()
+    }
+
     /// Load existing state or create a new one from an X25519 shared secret.
     fn load_or_init_alice(
         profile: &Path,
@@ -3329,7 +3510,7 @@ impl RatchetState {
         Self {
             dh_secret_b64: B64.encode(our_secret.to_bytes()),
             their_dh_pub_b64: None,
-            root_key_b64: B64.encode(shared_secret.to_vec()),
+            root_key_b64: B64.encode(shared_secret),
             send_ck_b64: None,
             recv_ck_b64: None,
             send_n: 0,
@@ -3348,6 +3529,7 @@ impl RatchetState {
         let path = Self::path(profile, std::path::Path::new(contact_name));
         if path.exists() {
             let bytes = fs::read(&path)?;
+            restrict_file(&path);
             return bincode::deserialize(&bytes).context("deserialize ratchet state");
         }
         Ok(Self::new_bob(shared_secret, our_dh_keypair))
@@ -3355,11 +3537,18 @@ impl RatchetState {
 
     fn save(&self, profile: &Path, contact_name: &str) -> Result<()> {
         let path = Self::path(profile, std::path::Path::new(contact_name));
-        fs::create_dir_all(path.parent().unwrap())?;
+        create_private_dir(path.parent().unwrap())?;
         let bytes = bincode::serialize(self)?;
-        fs::write(&path, bytes).context("write ratchet state")?;
+        write_private(&path, bytes).context("write ratchet state")?;
         Ok(())
     }
+}
+
+/// Whether a Double Ratchet session is established with `contact_name`.
+/// Used by the FFI contacts listing so the app can show a true ratchet status.
+#[allow(dead_code)]
+pub(crate) fn ratchet_is_active(profile: &Path, contact_name: &str) -> bool {
+    RatchetState::is_active(profile, contact_name)
 }
 
 /// HKDF-based root key derivation: combines the initial shared secret with DH output.
@@ -3520,10 +3709,22 @@ fn ratchet_decrypt(
 
     let mut ck_cursor = ck_bytes;
     let mut mk = None;
-    let steps = msg_n
+    let skip = msg_n
         .checked_sub(state.recv_n)
-        .ok_or_else(|| anyhow!("invalid ratchet counters"))?
-        + 1;
+        .ok_or_else(|| anyhow!("invalid ratchet counters"))?;
+    // The skip count is derived from the unauthenticated header, so cap the
+    // fast-forward before doing any HKDF work. Beyond the cap we refuse to
+    // decrypt rather than grind through up to ~4B derivations.
+    if skip as usize > MAX_RATCHET_SKIP {
+        return Err(anyhow!(
+            "ratchet skip too large: {} > {} (msg_n={} recv_n={})",
+            skip,
+            MAX_RATCHET_SKIP,
+            msg_n,
+            state.recv_n
+        ));
+    }
+    let steps = skip + 1;
 
     for _ in 0..steps {
         let (next_ck, derived_mk) = hkdf_chain_key(&ck_cursor)?;
@@ -3819,6 +4020,16 @@ pub(crate) fn decrypt_and_verify(
     msg.body = plaintext.clone();
     let verified = verify_message(msg, contacts).unwrap_or(false)
         || verify_message_with_sender_metadata(msg).unwrap_or(false);
+    // Replay protection for v2 static messages: a signed-but-replayed ciphertext
+    // still verifies, so reject envelopes we have already processed. Only gate on
+    // verified messages so unverified junk cannot poison the cache against a
+    // future legitimate delivery.
+    if verified {
+        let fingerprint = message_replay_fingerprint(msg);
+        if !record_seen_message(our_profile, &fingerprint)? {
+            return Err(anyhow!("replayed message rejected (already seen)"));
+        }
+    }
     if verified && known_contact.is_none() {
         let _ = save_autodiscovered_contact(our_profile, msg)?;
     }
@@ -3941,14 +4152,25 @@ pub(crate) async fn serve(
     remote_addr: Option<String>,
 ) -> Result<()> {
     let _key = crate::load_signing_key(profile)?;
-    if let Err(e) = crate::load_incoming_states(profile) {
-        tracing::warn!(error=%e, "failed to load persisted incoming file state");
-    }
+    let persisted_incoming = match crate::load_incoming_states(profile) {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(error=%e, "failed to load persisted incoming file state");
+            std::collections::HashMap::new()
+        }
+    };
     let transport = Arc::new(crate::transport::tor::TorTransport::new_with_status(
         None,
         tor_client.clone(),
         Some(tui_tx.clone()),
     ));
+    // Seed the live transfer state the handler mutates with any partially
+    // received transfers from a previous run, so resume actually continues.
+    {
+        let transfer_state = transport.transfer_state();
+        let mut state = transfer_state.lock().await;
+        state.incoming_files = persisted_incoming;
+    }
 
     let (control_tx, mut control_rx) = mpsc::channel::<ServeControlCommand>(64);
     let send_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -4136,7 +4358,10 @@ pub(crate) async fn serve(
                         });
                         continue;
                     };
-                    println!("DEBUG: file cmd received, path={path}, to={:?}, group={:?}", cmd.to, cmd.group);
+                    println!(
+                        "DEBUG: file cmd received, path={path}, to={:?}, group={:?}",
+                        cmd.to, cmd.group
+                    );
                     emit_response(&ServeResponse::Ack { cmd: "file".into() });
                     tracing::info!(path=%path, group=cmd.group.as_deref(), "file send command received");
                     tokio::spawn(async move {
@@ -4344,14 +4569,17 @@ pub(crate) async fn serve(
                         Ok(items) => {
                             for (id, contact, onion, message) in items {
                                 info!(id, contact = %contact, "retry: attempting delivery");
-                                match send(&profile, &onion, &message, &contact, None, tc.clone(), false).await {
+                                match send_retry(&profile, &onion, &message, &contact, tc.clone())
+                                    .await
+                                {
                                     Ok(()) => {
                                         info!(id, contact = %contact, "retry: success");
                                         let _ = retry_update(&profile, id, true, None);
                                     }
                                     Err(e) => {
                                         warn!(id, contact = %contact, error=%e, "retry: failed again");
-                                        let _ = retry_update(&profile, id, false, Some(&e.to_string()));
+                                        let _ =
+                                            retry_update(&profile, id, false, Some(&e.to_string()));
                                     }
                                 }
                                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -4446,7 +4674,11 @@ async fn bridge_query_to_hermes(profile: &Path, contact: &str, query: &str) -> R
                 .map_err(|e| anyhow!("failed to spawn hermes: {e}"))?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                return Err(anyhow!("hermes exited with code {}: {}", out.status, stderr));
+                return Err(anyhow!(
+                    "hermes exited with code {}: {}",
+                    out.status,
+                    stderr
+                ));
             }
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
         }
@@ -4480,10 +4712,13 @@ async fn bridge_query_to_hermes(profile: &Path, contact: &str, query: &str) -> R
     let send_output = tokio::task::spawn_blocking(move || {
         Command::new("sideband")
             .args([
-                "--profile", &profile_str,
+                "--profile",
+                &profile_str,
                 "send",
-                "--to", &contact_clone,
-                "--message", &response_clone,
+                "--to",
+                &contact_clone,
+                "--message",
+                &response_clone,
             ])
             .output()
             .map_err(|e| anyhow!("failed to spawn sideband send: {e}"))
@@ -4526,10 +4761,39 @@ pub async fn send(
         "contact",
         contact_hint,
         true,
+        false,
     )
     .await
 }
 
+/// Like [`send`], but flagged as a retry attempt so a repeated failure does not
+/// enqueue a *new* retry_queue row (the caller owns the existing row and calls
+/// [`retry_update`] on it). Without this, every failed retry duplicates the
+/// queue entry and all copies deliver once the peer returns.
+pub(crate) async fn send_retry(
+    profile: &Path,
+    to: &str,
+    message: &str,
+    contact_hint: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    send_in_conversation(
+        profile,
+        to,
+        message,
+        contact_hint,
+        None,
+        tor_client,
+        false,
+        "contact",
+        contact_hint,
+        true,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_in_conversation(
     profile: &Path,
     to: &str,
@@ -4541,6 +4805,7 @@ pub(crate) async fn send_in_conversation(
     conversation_kind: &str,
     conversation_id: &str,
     store_outbound_history: bool,
+    is_retry: bool,
 ) -> Result<()> {
     if !to.ends_with(".onion") {
         return Err(anyhow!("resolved --to must be an onion address"));
@@ -4564,9 +4829,9 @@ pub(crate) async fn send_in_conversation(
 
     let msg = if use_ratchet {
         // v3: Double Ratchet encrypt.
-        let mut state_bytes = fs::read(&ratchet_path)?;
+        let state_bytes = fs::read(&ratchet_path)?;
         let mut state: RatchetState =
-            bincode::deserialize(&mut state_bytes).context("deserialize ratchet state")?;
+            bincode::deserialize(&state_bytes).context("deserialize ratchet state")?;
         let (header_b64, nonce_hex, ct_hex) =
             ratchet_encrypt(&mut state, plaintext.as_bytes(), &our_ed25519_pub)?;
         state.save(profile, contact_hint)?;
@@ -4696,9 +4961,12 @@ pub(crate) async fn send_in_conversation(
     }
 
     // On final failure, enqueue for background retry (contact-only, not groups).
+    // A retry attempt never re-enqueues: the retry loop already owns an existing
+    // queue row and calls retry_update on it. Re-enqueuing here would duplicate
+    // the row on every failed retry and deliver every copy once the peer returns.
     if status == DeliveryStatus::Sent {
         // success — nothing to enqueue
-    } else if conversation_kind == "contact" {
+    } else if conversation_kind == "contact" && !is_retry {
         let err_text = last_error.as_deref().unwrap_or("unknown");
         match enqueue_retry(profile, contact_hint, to, message, err_text) {
             Ok(qid) => info!(qid, contact = %contact_hint, "enqueued for retry"),
@@ -5635,7 +5903,7 @@ fn ratchet_encrypt_decrypt_round_trip() {
     let mut bob_state = RatchetState {
         dh_secret_b64: B64.encode(bob_x25519.to_bytes()),
         their_dh_pub_b64: Some(B64.encode(alice_pub.as_bytes())),
-        root_key_b64: B64.encode(shared2.as_bytes().to_vec()),
+        root_key_b64: B64.encode(shared2.as_bytes()),
         send_ck_b64: None,
         recv_ck_b64: None,
         send_n: 0,
@@ -5669,6 +5937,57 @@ fn ratchet_encrypt_decrypt_round_trip() {
     let plaintext =
         ratchet_decrypt(&mut bob_state_for_decrypt, &header_b64, &nonce_hex, &ct_hex).unwrap();
     assert_eq!(plaintext, b"hello from alice");
+}
+
+#[test]
+fn ratchet_decrypt_rejects_oversized_skip() {
+    // A malicious header can announce an enormous msg_n. Without the cap this
+    // forces ~msg_n HKDF iterations before signature verification; the fix must
+    // return an error quickly instead of grinding.
+    let dir = tempfile::tempdir().unwrap();
+    init_profile(dir.path()).unwrap();
+
+    let alice_x25519 = load_x25519_secret(dir.path()).unwrap();
+    let alice_pub = X25519PublicKey::from(&alice_x25519);
+    let bob_x25519 = StaticSecret::random_from_rng(OsRng);
+    let bob_pub = X25519PublicKey::from(&bob_x25519);
+
+    let shared = alice_x25519.diffie_hellman(&bob_pub);
+    let (mut alice_state, _, _) =
+        RatchetState::load_or_init_alice(dir.path(), "bob", shared.as_bytes(), &bob_pub).unwrap();
+    alice_state.save(dir.path(), "bob").unwrap();
+
+    let shared2 = bob_x25519.diffie_hellman(&alice_pub);
+    let mut bob_state = RatchetState {
+        dh_secret_b64: B64.encode(bob_x25519.to_bytes()),
+        their_dh_pub_b64: None,
+        root_key_b64: B64.encode(shared2.as_bytes()),
+        send_ck_b64: None,
+        recv_ck_b64: None,
+        send_n: 0,
+        recv_n: 0,
+        prev_send_n: 0,
+        initialized: false,
+    };
+    let (recv_ck, send_ck) = hkdf_chain_key(shared2.as_bytes()).unwrap();
+    bob_state.recv_ck_b64 = Some(B64.encode(&recv_ck));
+    bob_state.send_ck_b64 = Some(B64.encode(&send_ck));
+
+    let (header_b64, nonce_hex, ct_hex) =
+        ratchet_encrypt(&mut alice_state, b"hi", "alice_pk").unwrap();
+
+    // Patch msg_n (header bytes [32..36]) to a value just past the cap.
+    let mut header_bytes = B64.decode(header_b64.as_bytes()).unwrap();
+    let evil_n = (MAX_RATCHET_SKIP as u32) + 5;
+    header_bytes[32..36].copy_from_slice(&evil_n.to_be_bytes());
+    let evil_header_b64 = B64.encode(&header_bytes);
+
+    let err = ratchet_decrypt(&mut bob_state, &evil_header_b64, &nonce_hex, &ct_hex)
+        .expect_err("oversized skip must be rejected");
+    assert!(
+        err.to_string().contains("skip too large"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -6306,33 +6625,133 @@ fn inbound_transfer_state_survives_restart_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path();
 
-    {
-        let mut map = incoming_files_map().lock().unwrap();
-        map.clear();
-        map.insert(
-            "alicepub:hash123".to_string(),
-            IncomingFileState {
-                total_chunks: 3,
-                chunks: vec![Some(vec![1, 2, 3]), None, Some(vec![9])],
-            },
-        );
-    }
-    persist_incoming_states(profile).unwrap();
+    // Persist a partial transfer (chunk 1 of 3 still missing) directly from a
+    // snapshot, exactly like the handler does from its live SharedTransferState.
+    let mut snapshot: HashMap<String, IncomingFileState> = HashMap::new();
+    snapshot.insert(
+        "alicepub:hash123".to_string(),
+        IncomingFileState {
+            total_chunks: 3,
+            chunks: vec![Some(vec![1, 2, 3]), None, Some(vec![9])],
+        },
+    );
+    persist_incoming_states_snapshot(profile, &snapshot).unwrap();
 
-    // Simulate process restart by dropping in-memory state.
-    {
-        let mut map = incoming_files_map().lock().unwrap();
-        map.clear();
-    }
-
-    load_incoming_states(profile).unwrap();
-
-    let map = incoming_files_map().lock().unwrap();
-    let st = map.get("alicepub:hash123").expect("restored state missing");
+    // Simulate a process restart: reload from SQLite into a fresh map.
+    let reloaded = load_incoming_states(profile).unwrap();
+    let st = reloaded
+        .get("alicepub:hash123")
+        .expect("restored state missing");
     assert_eq!(st.total_chunks, 3);
     assert_eq!(st.chunks[0].as_deref(), Some(&[1, 2, 3][..]));
     assert!(st.chunks[1].is_none());
     assert_eq!(st.chunks[2].as_deref(), Some(&[9][..]));
+
+    // Resume continuity: the next chunk to request after reload is index 1.
+    assert_eq!(next_missing_chunk(st), Some(1));
+}
+
+#[test]
+fn persist_incoming_snapshot_overwrites_previous_partial_state() {
+    // Regression for the broken refactor: persisting must reflect the latest
+    // live snapshot, not wipe in-progress state. A second persist with more
+    // chunks filled in must be what survives a reload.
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+
+    let mut snap1: HashMap<String, IncomingFileState> = HashMap::new();
+    snap1.insert(
+        "peer:h".to_string(),
+        IncomingFileState {
+            total_chunks: 3,
+            chunks: vec![Some(vec![1]), None, None],
+        },
+    );
+    persist_incoming_states_snapshot(profile, &snap1).unwrap();
+
+    let mut snap2: HashMap<String, IncomingFileState> = HashMap::new();
+    snap2.insert(
+        "peer:h".to_string(),
+        IncomingFileState {
+            total_chunks: 3,
+            chunks: vec![Some(vec![1]), Some(vec![2]), None],
+        },
+    );
+    persist_incoming_states_snapshot(profile, &snap2).unwrap();
+
+    let reloaded = load_incoming_states(profile).unwrap();
+    let st = reloaded.get("peer:h").expect("state missing after reload");
+    assert_eq!(next_missing_chunk(st), Some(2));
+    assert_eq!(st.chunks[1].as_deref(), Some(&[2][..]));
+}
+
+#[test]
+fn failed_retries_do_not_duplicate_queue_row() {
+    // Regression for retry-queue amplification: the retry loop owns a single
+    // row and only ever retry_update()s it. A repeated failure must NOT add a
+    // second row (that would deliver duplicate copies once the peer returns).
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+
+    let id = enqueue_retry(profile, "alice", "alice.onion", "hello", "timeout").unwrap();
+    assert_eq!(retry_queue_len(profile).unwrap(), 1);
+
+    // Simulate several failed retry attempts (what the retry loop does).
+    for _ in 0..3 {
+        retry_update(profile, id, false, Some("still failing")).unwrap();
+    }
+    assert_eq!(
+        retry_queue_len(profile).unwrap(),
+        1,
+        "failed retries must not duplicate the queue row"
+    );
+
+    // A success clears the single row.
+    retry_update(profile, id, true, None).unwrap();
+    assert_eq!(retry_queue_len(profile).unwrap(), 0);
+}
+
+#[test]
+fn retry_update_drops_after_max_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    let id = enqueue_retry(profile, "bob", "bob.onion", "hi", "err").unwrap();
+    // attempts starts at 1; each failing update increments until the row is
+    // dropped at the max. Stop once the queue is empty (the retry loop only
+    // updates rows that are still present/due).
+    for _ in 0..5 {
+        if retry_queue_len(profile).unwrap() == 0 {
+            break;
+        }
+        retry_update(profile, id, false, Some("nope")).unwrap();
+    }
+    assert_eq!(retry_queue_len(profile).unwrap(), 0);
+}
+
+#[test]
+fn seen_message_cache_rejects_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    // First time a fingerprint is seen it is accepted (returns true).
+    assert!(record_seen_message(profile, "fp-abc").unwrap());
+    // Replaying the same fingerprint is rejected (returns false).
+    assert!(!record_seen_message(profile, "fp-abc").unwrap());
+    // A different fingerprint is still accepted.
+    assert!(record_seen_message(profile, "fp-xyz").unwrap());
+}
+
+#[test]
+fn validate_total_chunks_rejects_mismatched_and_oversized() {
+    // Exact match for a size that spans 2 chunks.
+    let two_chunks = FILE_CHUNK_SIZE + 1;
+    assert!(validate_total_chunks(two_chunks, 2).is_ok());
+    // Wrong count for the offered size.
+    assert!(validate_total_chunks(two_chunks, 2000).is_err());
+    // Zero is never valid.
+    assert!(validate_total_chunks(10, 0).is_err());
+    // Absolute cap enforced even without a size.
+    assert!(validate_total_chunks(0, MAX_TOTAL_CHUNKS).is_ok());
+    assert!(validate_total_chunks(0, MAX_TOTAL_CHUNKS + 1).is_err());
 }
 
 #[test]
@@ -6450,7 +6869,7 @@ fn tor_transport_try_recv_returns_envelope_from_channel() {
 
         // Step 2: raw_line_to_envelope wraps the raw JSON
         let envelope = crate::transport::tor::TorTransport::raw_line_to_envelope(json);
-        assert_eq!(envelope.msg_id.starts_with("tor-in-"), true);
+        assert!(envelope.msg_id.starts_with("tor-in-"));
         assert_eq!(envelope.seq, 0);
         assert_eq!(envelope.total, 1);
         assert_eq!(envelope.transport_hint.as_deref(), Some("tor"));

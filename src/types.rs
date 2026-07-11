@@ -11,6 +11,10 @@ pub struct ApiContact {
     pub pending: bool,
     #[serde(default)]
     pub blocked: bool,
+    /// True when a Double Ratchet (v3) session has been established with this
+    /// contact (i.e. the ratchet state file exists on disk).
+    #[serde(default)]
+    pub ratchet_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

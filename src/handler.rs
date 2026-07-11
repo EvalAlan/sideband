@@ -11,13 +11,14 @@ use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use tokio::sync::mpsc;
 
-use crate::transport::tor::TorTransport;
 use crate::transport::tor::SharedTransferState;
+use crate::transport::tor::TorTransport;
 use crate::{
-    contact_is_blocked, decrypt_and_verify, discover_or_update_group, resolve_contact_name_by_pubkey,
-    send_typed_message, store_message, store_message_for_conversation, ChatMessage, ContactsMap,
-    DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload, FileOfferPayload,
-    GroupMessagePayload, IncomingFileState, TuiEvent,
+    contact_is_blocked, decrypt_and_verify, discover_or_update_group,
+    resolve_contact_name_by_pubkey, send_typed_message, store_message,
+    store_message_for_conversation, ChatMessage, ContactsMap, DeliveryStatus, FileAckPayload,
+    FileChunkPayload, FileInlinePayload, FileOfferPayload, GroupMessagePayload, IncomingFileState,
+    TuiEvent,
 };
 
 /// Parse a raw inbound line into a [`ChatMessage`].
@@ -229,17 +230,23 @@ async fn handle_file_offer(
     let body_for_display = if verified {
         match serde_json::from_str::<FileOfferPayload>(&plaintext) {
             Ok(offer) => {
+                if let Err(e) = crate::validate_total_chunks(offer.size, offer.total_chunks) {
+                    tracing::warn!(from=%msg.from, error=%e, "rejecting file offer");
+                    return Ok(());
+                }
                 let key = format!("{}:{}", msg.from, offer.hash);
-                let mut state = transfer_state.lock().await;
-                state.incoming_files.insert(
-                    key,
-                    IncomingFileState {
-                        total_chunks: offer.total_chunks,
-                        chunks: vec![None; offer.total_chunks],
-                    },
-                );
-                drop(state);
-                if let Err(e) = crate::persist_incoming_states(profile) {
+                let snapshot = {
+                    let mut state = transfer_state.lock().await;
+                    state.incoming_files.insert(
+                        key,
+                        IncomingFileState {
+                            total_chunks: offer.total_chunks,
+                            chunks: vec![None; offer.total_chunks],
+                        },
+                    );
+                    state.incoming_files.clone()
+                };
+                if let Err(e) = crate::persist_incoming_states_snapshot(profile, &snapshot) {
                     tracing::warn!(error=%e, "failed to persist incoming file offer state");
                 }
                 format!(
@@ -297,18 +304,35 @@ async fn handle_file_chunk(
     // This prevents transfer deadlocks when peers have stale Ed25519 contact keys
     // but still share valid X25519 encryption keys.
     if let Ok(chunk) = serde_json::from_str::<FileChunkPayload>(&plaintext) {
+        // Bound the claimed chunk count before allocating vec![None; total_chunks].
+        // A bare chunk carries no file size, so only the absolute cap applies here;
+        // the file_offer path validated total_chunks against the offered size.
+        if let Err(e) = crate::validate_total_chunks(0, chunk.total_chunks) {
+            tracing::warn!(from=%msg.from, error=%e, "rejecting file chunk");
+            return Ok(());
+        }
+        if chunk.chunk_index >= chunk.total_chunks {
+            tracing::warn!(
+                from=%msg.from,
+                chunk_index = chunk.chunk_index,
+                total_chunks = chunk.total_chunks,
+                "rejecting file chunk: index out of range"
+            );
+            return Ok(());
+        }
         let key = format!("{}:{}", msg.from, chunk.hash);
         let mut completed_data: Option<Vec<u8>> = None;
 
-        {
+        let snapshot = {
             let mut state = transfer_state.lock().await;
-            let file_state = state
-                .incoming_files
-                .entry(key.clone())
-                .or_insert_with(|| IncomingFileState {
-                    total_chunks: chunk.total_chunks,
-                    chunks: vec![None; chunk.total_chunks],
-                });
+            let file_state =
+                state
+                    .incoming_files
+                    .entry(key.clone())
+                    .or_insert_with(|| IncomingFileState {
+                        total_chunks: chunk.total_chunks,
+                        chunks: vec![None; chunk.total_chunks],
+                    });
 
             if chunk.chunk_index < file_state.total_chunks {
                 if let Ok(bytes) = B64.decode(chunk.data_b64.as_bytes()) {
@@ -324,9 +348,12 @@ async fn handle_file_chunk(
                 completed_data = Some(assembled);
                 state.incoming_files.remove(&key);
             }
-        }
+            // Snapshot the live state (the source of truth) so resume after a
+            // restart continues from the next missing chunk.
+            state.incoming_files.clone()
+        };
 
-        if let Err(e) = crate::persist_incoming_states(profile) {
+        if let Err(e) = crate::persist_incoming_states_snapshot(profile, &snapshot) {
             tracing::warn!(error=%e, "failed to persist incoming chunk state");
         }
 
@@ -670,8 +697,7 @@ fn body_for_inbound_display(plaintext: &str, decrypt_error: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ack_is_acceptable, body_for_inbound_display, contact_name_for_pubkey,
-        write_file_atomically,
+        ack_is_acceptable, body_for_inbound_display, contact_name_for_pubkey, write_file_atomically,
     };
     use crate::{save_contacts, ContactFile, ContactsMap, FileAckPayload};
 

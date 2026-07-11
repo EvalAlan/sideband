@@ -201,4 +201,103 @@ void main() {
     final hasMessages = find.text('Messages').evaluate().isNotEmpty;
     expect(hasLoading || hasMessages, isTrue);
   });
+
+  group('transfer string parsing', () {
+    test('parses hash from outbound line', () {
+      expect(
+        parseTransferHash(
+            'outbound abc123 -> bob chunk 3/10 file=photo.jpg'),
+        'abc123',
+      );
+    });
+
+    test('parses key from incoming line', () {
+      expect(parseTransferHash('incoming deadbeef chunks 2/5'), 'deadbeef');
+    });
+
+    test('returns null for unrecognized line', () {
+      expect(parseTransferHash('garbage'), isNull);
+      expect(parseTransferHash(''), isNull);
+    });
+
+    test('classifies outbound vs incoming', () {
+      expect(
+          isOutboundTransfer('outbound abc123 -> bob chunk 1/2 file=x'), isTrue);
+      expect(isOutboundTransfer('incoming deadbeef chunks 1/2'), isFalse);
+    });
+  });
+
+  group('notification helpers', () {
+    test('short body is passed through untouched', () {
+      expect(notificationBody('hello'), 'hello');
+    });
+
+    test('long body is truncated with an ellipsis', () {
+      final long = 'x' * 200;
+      final body = notificationBody(long);
+      expect(body.length, 81); // 80 chars + ellipsis
+      expect(body.endsWith('…'), isTrue);
+    });
+
+    test('respects a custom max length', () {
+      expect(notificationBody('abcdef', maxLen: 3), 'abc…');
+    });
+
+    test('trims whitespace before measuring', () {
+      expect(notificationBody('  hi  '), 'hi');
+    });
+
+    test('per-contact id is stable and non-negative', () {
+      final a = notificationIdForContact('bob');
+      final b = notificationIdForContact('bob');
+      expect(a, b);
+      expect(a, greaterThanOrEqualTo(0));
+      expect(notificationIdForContact('alice'),
+          isNot(notificationIdForContact('bob')));
+    });
+  });
+
+  group('attachment path validation', () {
+    // The MethodChannel profilePath already ends in .sideband, so the
+    // downloads dir is <profile>/downloads.
+    const profile = '/data/user/0/com.example.sideband_gui/files/.sideband';
+
+    test('accepts files directly under downloads', () {
+      expect(
+        isUnderDownloadsDir('$profile/downloads/photo.jpg', profile),
+        isTrue,
+      );
+    });
+
+    test('accepts nested files under downloads', () {
+      expect(
+        isUnderDownloadsDir('$profile/downloads/sub/photo.jpg', profile),
+        isTrue,
+      );
+    });
+
+    test('rejects paths outside downloads', () {
+      expect(
+        isUnderDownloadsDir('$profile/identity.toml', profile),
+        isFalse,
+      );
+      expect(
+        isUnderDownloadsDir('/storage/emulated/0/Pictures/x.jpg', profile),
+        isFalse,
+      );
+    });
+
+    test('rejects traversal escapes', () {
+      expect(
+        isUnderDownloadsDir(
+            '$profile/downloads/../../identity.toml', profile),
+        isFalse,
+      );
+    });
+
+    test('rejects empty inputs', () {
+      expect(isUnderDownloadsDir('', profile), isFalse);
+      expect(isUnderDownloadsDir('$profile/downloads/x', ''), isFalse);
+    });
+  });
 }

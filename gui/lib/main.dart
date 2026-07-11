@@ -231,9 +231,7 @@ class _WindowHandler extends WindowListener {
 
 bool get _isDesktop =>
     Platform.isLinux || Platform.isWindows || Platform.isMacOS;
-bool get _canUseCliBackend => _isDesktop;
 bool get _canUseMobileBackend => Platform.isAndroid;
-bool get _canUseLocalBackend => _canUseCliBackend || _canUseMobileBackend;
 
 const _nativeChannel = MethodChannel('sideband/native');
 // ── app ─────────────────────────────────────────────────────────────────────
@@ -457,6 +455,70 @@ class AttachmentInfo {
   final String label;
   final String path;
   final bool image;
+}
+
+/// Parse the transfer hash/key out of a `sideband_api_list_transfers` line.
+/// Outbound lines look like:
+///   "outbound <hash> -> <contact> chunk <n>/<t> file=<name>"
+/// Incoming lines look like:
+///   "incoming <key> chunks <have>/<total>"
+/// Returns the hash/key token, or null if the line is not recognized.
+String? parseTransferHash(String line) {
+  final trimmed = line.trim();
+  final match =
+      RegExp(r'^(?:outbound|incoming)\s+(\S+)').firstMatch(trimmed);
+  if (match == null) return null;
+  final hash = match.group(1);
+  if (hash == null || hash.isEmpty) return null;
+  return hash;
+}
+
+/// True for outbound transfer lines (resumable/cancelable via the hash).
+bool isOutboundTransfer(String line) => line.trim().startsWith('outbound ');
+
+/// Body text for a local message notification. Truncated to a reasonable
+/// length so the notification stays a preview, not a transcript.
+String notificationBody(String text, {int maxLen = 80}) {
+  final trimmed = text.trim();
+  if (trimmed.length <= maxLen) return trimmed;
+  return '${trimmed.substring(0, maxLen)}…';
+}
+
+/// Stable per-conversation notification id so repeat messages from one sender
+/// coalesce into a single notification. Kept within 31-bit positive range for
+/// the Android notification manager.
+int notificationIdForContact(String key) {
+  return key.hashCode & 0x7fffffff;
+}
+
+/// True if [path] resolves to a file under the profile's `downloads/`
+/// directory. Only received files land there, and the Kotlin `openFile` handler
+/// rejects anything outside it, so we mirror that check Dart-side to avoid a
+/// pointless platform round-trip and error for sent-file rows that point at
+/// arbitrary picker paths.
+///
+/// [profilePath] is the value returned by the `profilePath` MethodChannel call,
+/// which already ends in `.sideband` (`<filesDir>/.sideband`). The downloads
+/// directory is therefore `<profilePath>/downloads`, matching the Kotlin
+/// `<filesDir>/.sideband/downloads/` allow-root.
+bool isUnderDownloadsDir(String path, String profilePath) {
+  if (path.isEmpty || profilePath.isEmpty) return false;
+  final downloads = _normalizeDirPath('$profilePath/downloads');
+  final normalized = _normalizeDirPath(path);
+  return normalized == downloads || normalized.startsWith('$downloads/');
+}
+
+String _normalizeDirPath(String path) {
+  final segments = <String>[];
+  for (final seg in path.split('/')) {
+    if (seg.isEmpty || seg == '.') continue;
+    if (seg == '..') {
+      if (segments.isNotEmpty) segments.removeLast();
+      continue;
+    }
+    segments.add(seg);
+  }
+  return '/${segments.join('/')}';
 }
 
 AttachmentInfo? parseAttachmentText(String text) {
@@ -1024,6 +1086,20 @@ class _Cli {
   }
 }
 
+// Native/Dart signatures for the string-returning FFI entry points. Every
+// argument and the return value is a `char*`, so the native and Dart forms are
+// identical apart from the pointer element type being fixed to `Utf8`.
+typedef _NativePtr1 = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>);
+typedef _Ptr1 = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>);
+typedef _NativePtr2 = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _Ptr2 = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _NativePtr3 = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _Ptr3 = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+
 class _MobileApi {
   _MobileApi()
       : _initProfile = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
@@ -1171,6 +1247,49 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
       _shareCommand;
 
+  // New symbols (group messaging, group management, retry status, transfers)
+  // are resolved lazily so that an older libsideband.so that predates them does
+  // not hard-crash the app at startup. A missing symbol surfaces as a normal
+  // Exception the first time the feature is actually used.
+  static final ffi.DynamicLibrary _lib =
+      ffi.DynamicLibrary.open('libsideband.so');
+
+  final _lazy = <String, Object?>{};
+
+  T _resolve<T extends Function>(String symbol, T Function() lookup) {
+    final cached = _lazy[symbol];
+    if (cached != null) return cached as T;
+    try {
+      final fn = lookup();
+      _lazy[symbol] = fn;
+      return fn;
+    } catch (_) {
+      throw Exception(
+          'native backend is missing $symbol; rebuild libsideband.so '
+          '(./build-android-rust.sh)');
+    }
+  }
+
+  _Ptr3 _lookup3(String symbol) => _resolve<_Ptr3>(
+      symbol, () => _lib.lookupFunction<_NativePtr3, _Ptr3>(symbol));
+
+  _Ptr2 _lookup2(String symbol) => _resolve<_Ptr2>(
+      symbol, () => _lib.lookupFunction<_NativePtr2, _Ptr2>(symbol));
+
+  _Ptr1 _lookup1(String symbol) => _resolve<_Ptr1>(
+      symbol, () => _lib.lookupFunction<_NativePtr1, _Ptr1>(symbol));
+
+  _Ptr3 get _sendGroupMessage => _lookup3('sideband_api_send_group_message');
+  _Ptr3 get _sendGroupFile => _lookup3('sideband_api_send_group_file');
+  _Ptr3 get _renameGroup => _lookup3('sideband_api_rename_group');
+  _Ptr3 get _groupAddMember => _lookup3('sideband_api_group_add_member');
+  _Ptr3 get _groupRemoveMember => _lookup3('sideband_api_group_remove_member');
+  _Ptr2 get _leaveGroup => _lookup2('sideband_api_leave_group');
+  _Ptr1 get _retryStatus => _lookup1('sideband_api_retry_status');
+  _Ptr1 get _listTransfers => _lookup1('sideband_api_list_transfers');
+  _Ptr2 get _resumeTransfer => _lookup2('sideband_api_resume_transfer');
+  _Ptr2 get _cancelTransfer => _lookup2('sideband_api_cancel_transfer');
+
   String? _profilePath;
 
   Future<String> profilePath() async {
@@ -1244,7 +1363,7 @@ class _MobileApi {
         onion: item['onion'] as String? ?? '',
         pubkey: item['ed25519_pubkey_b64'] as String? ?? '',
         x25519Pubkey: item['x25519_pubkey_b64'] as String? ?? '',
-        ratchetActive: false,
+        ratchetActive: item['ratchet_active'] == true,
         pending: item['pending'] == true,
         blocked: item['blocked'] == true,
       ));
@@ -1437,6 +1556,148 @@ class _MobileApi {
     }
   }
 
+  Future<void> sendGroupMessage(
+      {required String groupId, required String message}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cgroup = groupId.toNativeUtf8();
+    final cmessage = message.toNativeUtf8();
+    try {
+      _decode<Object?>(_sendGroupMessage(profile, cgroup, cmessage));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cgroup);
+      calloc.free(cmessage);
+    }
+  }
+
+  Future<void> sendGroupFile(
+      {required String groupId, required String path}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cgroup = groupId.toNativeUtf8();
+    final cpath = path.toNativeUtf8();
+    try {
+      _decode<Object?>(_sendGroupFile(profile, cgroup, cpath));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cgroup);
+      calloc.free(cpath);
+    }
+  }
+
+  GroupInfo _parseGroupInfo(Map<String, dynamic> raw) {
+    final members = <String>[];
+    final rawMembers = raw['members'];
+    if (rawMembers is List) {
+      for (final m in rawMembers) {
+        if (m is String) members.add(m);
+      }
+    }
+    return GroupInfo(
+      id: raw['id'] as String? ?? '',
+      title: raw['title'] as String? ?? '',
+      members: members,
+    );
+  }
+
+  Future<GroupInfo> renameGroup(
+      {required String groupId, required String title}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cgroup = groupId.toNativeUtf8();
+    final ctitle = title.toNativeUtf8();
+    try {
+      return _parseGroupInfo(
+          _decode<Map<String, dynamic>>(_renameGroup(profile, cgroup, ctitle)));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cgroup);
+      calloc.free(ctitle);
+    }
+  }
+
+  Future<GroupInfo> addGroupMember(
+      {required String groupId, required String member}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cgroup = groupId.toNativeUtf8();
+    final cmember = member.toNativeUtf8();
+    try {
+      return _parseGroupInfo(_decode<Map<String, dynamic>>(
+          _groupAddMember(profile, cgroup, cmember)));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cgroup);
+      calloc.free(cmember);
+    }
+  }
+
+  Future<GroupInfo> removeGroupMember(
+      {required String groupId, required String member}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cgroup = groupId.toNativeUtf8();
+    final cmember = member.toNativeUtf8();
+    try {
+      return _parseGroupInfo(_decode<Map<String, dynamic>>(
+          _groupRemoveMember(profile, cgroup, cmember)));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cgroup);
+      calloc.free(cmember);
+    }
+  }
+
+  Future<GroupInfo> leaveGroup(String groupId) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cgroup = groupId.toNativeUtf8();
+    try {
+      return _parseGroupInfo(
+          _decode<Map<String, dynamic>>(_leaveGroup(profile, cgroup)));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cgroup);
+    }
+  }
+
+  Future<int> retryStatus() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      final raw = _decode<Map<dynamic, dynamic>>(_retryStatus(profile));
+      return (raw['queued'] as num?)?.toInt() ?? 0;
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<List<String>> listTransfers() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      final raw = _decode<List<dynamic>>(_listTransfers(profile));
+      return [for (final e in raw) e.toString()];
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<bool> resumeTransfer(String hash) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final chash = hash.toNativeUtf8();
+    try {
+      return _decode<bool>(_resumeTransfer(profile, chash));
+    } finally {
+      calloc.free(profile);
+      calloc.free(chash);
+    }
+  }
+
+  Future<bool> cancelTransfer(String hash) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final chash = hash.toNativeUtf8();
+    try {
+      return _decode<bool>(_cancelTransfer(profile, chash));
+    } finally {
+      calloc.free(profile);
+      calloc.free(chash);
+    }
+  }
+
   Future<void> clearHistory({String? contact}) async {
     final profile = (await profilePath()).toNativeUtf8();
     final ccontact = contact?.toNativeUtf8() ?? ffi.nullptr;
@@ -1548,7 +1809,8 @@ class _ChatScreen extends StatefulWidget {
   State<_ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<_ChatScreen> with TrayListener {
+class _ChatScreenState extends State<_ChatScreen>
+    with TrayListener, WidgetsBindingObserver {
   final _cli = _Cli();
   _MobileApi? _mobile;
   bool _mobileApiAvailable = false;
@@ -1593,11 +1855,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   // presence + typing + activity
   final Map<String, DateTime> _lastSeen = {};
   final Map<String, bool> _online = {};
-  final Map<String, DateTime> _typing = {};
   final Map<String, ChatMsg> _lastMsg = {};
 
   // retry queue
   int _retryQueued = 0;
+
+  // app lifecycle (Android): drives foreground-service + notification behavior
+  AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
+  bool _foregroundServiceRunning = false;
+  bool _notificationPermissionRequested = false;
+  bool get _appResumed => _lifecycleState == AppLifecycleState.resumed;
 
   String _formatBytes(int bytes) {
     if (bytes < 1024) return '${bytes}B';
@@ -1622,11 +1889,6 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   String _presenceLabel(String contactName) {
     final isOnline = _online[contactName] == true;
     final lastSeen = _lastSeen[contactName];
-    final typing = _typing[contactName];
-    if (typing != null &&
-        DateTime.now().difference(typing) < const Duration(seconds: 10)) {
-      return 'typing…';
-    }
     if (isOnline) return 'online';
     if (lastSeen == null) return 'last seen unknown';
     final diff = DateTime.now().difference(lastSeen);
@@ -1639,14 +1901,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
 
   Widget _presenceDot(String contactName) {
     final isOnline = _online[contactName] == true;
-    final typing = _typing[contactName];
-    final isTyping = typing != null &&
-        DateTime.now().difference(typing) < const Duration(seconds: 10);
-    final color = isTyping
-        ? const Color(0xFFFFC857)
-        : isOnline
-            ? const Color(0xFF3FB950)
-            : _t.textDim;
+    final color = isOnline ? const Color(0xFF3FB950) : _t.textDim;
     return Container(
       width: 8,
       height: 8,
@@ -1670,6 +1925,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   void initState() {
     super.initState();
     trayManager.addListener(this);
+    WidgetsBinding.instance.addObserver(this);
     _listenerLogFile = File('${_cli.expandedProfilePath()}/gui-listener.log');
     _initWindowListeners();
     WidgetsBinding.instance
@@ -1820,9 +2076,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     try {
       await mobile.startListener();
       await _syncMobileListenerStatus();
-      setState(() {
-        _listenerRunning = true;
-      });
+      if (mounted) {
+        setState(() {
+          _listenerRunning = true;
+        });
+      }
+      // Keep the Rust listener alive while backgrounded, and ask for the
+      // notification permission the first time (non-blocking — do not gate the
+      // listener on the result).
+      unawaited(_startForegroundService());
+      unawaited(_requestNotificationPermission());
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -1863,13 +2126,79 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   @override
   void dispose() {
     trayManager.removeListener(this);
+    WidgetsBinding.instance.removeObserver(this);
     windowManager.removeListener(_windowHandler);
     _poll?.cancel();
     _notificationTimer?.cancel();
     _listener?.kill(ProcessSignal.sigterm);
+    unawaited(_stopForegroundService());
     _input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    final wasResumed = _appResumed;
+    _lifecycleState = state;
+    if (!Platform.isAndroid) return;
+    if (state == AppLifecycleState.resumed && !wasResumed) {
+      // Coming back to the foreground: clear any message notifications the user
+      // has now seen.
+      unawaited(_cancelMessageNotifications());
+    }
+  }
+
+  // ── Android foreground service + notifications ────────────────────────────
+
+  Future<void> _startForegroundService() async {
+    if (!Platform.isAndroid || _foregroundServiceRunning) return;
+    try {
+      await _nativeChannel.invokeMethod<void>('startForegroundService');
+      _foregroundServiceRunning = true;
+    } catch (_) {
+      // MissingPluginException on desktop, or a platform failure — non-fatal.
+    }
+  }
+
+  Future<void> _stopForegroundService() async {
+    if (!Platform.isAndroid || !_foregroundServiceRunning) return;
+    try {
+      await _nativeChannel.invokeMethod<void>('stopForegroundService');
+    } catch (_) {
+      // best-effort; the OS reclaims the service when the process dies anyway.
+    }
+    _foregroundServiceRunning = false;
+  }
+
+  Future<void> _requestNotificationPermission() async {
+    if (!Platform.isAndroid || _notificationPermissionRequested) return;
+    _notificationPermissionRequested = true;
+    try {
+      await _nativeChannel.invokeMethod<bool>('requestNotificationPermission');
+    } catch (_) {
+      // request_in_progress or desktop MissingPluginException — non-fatal.
+    }
+  }
+
+  Future<void> _cancelMessageNotifications() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _nativeChannel.invokeMethod<void>('cancelMessageNotifications');
+    } catch (_) {}
+  }
+
+  Future<void> _showMessageNotification(
+      {required String title, required String body, required int id}) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _nativeChannel.invokeMethod<void>('showMessageNotification', {
+        'title': title,
+        'body': body,
+        'id': id,
+      });
+    } catch (_) {}
   }
 
   @override
@@ -2194,7 +2523,11 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           pending.text.substring('[file sent: '.length).split(' (').first;
       final storedPath =
           stored.text.substring('[file sent: '.length).split(' (').first;
-      return pendingPath == storedPath;
+      if (pendingPath == storedPath) return true;
+      // The optimistic row carries the full picker path, but the stored row may
+      // only keep the basename (or vice versa). Fall back to a basename match so
+      // the "(sending…)" ghost row still clears.
+      return _basename(pendingPath) == _basename(storedPath);
     }
     return false;
   }
@@ -2231,8 +2564,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       {String? to, String? group, required String message}) async {
     if (_canUseMobileBackend && _mobile != null) {
       if (group != null) {
-        throw Exception(
-            'group sends are not wired through the Android backend yet');
+        await _mobile!.sendGroupMessage(groupId: group, message: message);
+        return;
       }
       if (to == null || to.isEmpty) {
         throw Exception('missing contact for Android send');
@@ -2258,8 +2591,8 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       {String? to, String? group, required String path}) async {
     if (_canUseMobileBackend && _mobile != null) {
       if (group != null) {
-        throw Exception(
-            'group file sends are not wired through the Android backend yet');
+        await _mobile!.sendGroupFile(groupId: group, path: path);
+        return;
       }
       if (to == null || to.isEmpty) {
         throw Exception('missing contact for Android file send');
@@ -2446,6 +2779,21 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   }
 
   void _queryRetryStatus() {
+    if (_canUseMobileBackend && _mobile != null) {
+      // On Android the retry count comes back synchronously from the FFI rather
+      // than via listener status events.
+      unawaited(() async {
+        try {
+          final queued = await _mobile!.retryStatus();
+          if (mounted && queued != _retryQueued) {
+            setState(() => _retryQueued = queued);
+          }
+        } catch (_) {
+          // best-effort; an old .so without the symbol just leaves the banner off
+        }
+      }());
+      return;
+    }
     final listener = _listener;
     if (listener == null) return;
     try {
@@ -2467,9 +2815,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     try {
       final Future<List<Contact>> cFut;
       final Future<List<GroupInfo>> gFut;
-      if (_canUseMobileBackend && _mobile != null) {
-        cFut = _mobile.contacts();
-        gFut = _mobile.groups();
+      final mobile = _mobile;
+      if (_canUseMobileBackend && mobile != null) {
+        cFut = mobile.contacts();
+        gFut = mobile.groups();
       } else {
         cFut = _cli.contacts();
         gFut = _cli.groups();
@@ -2580,6 +2929,22 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
   void _showNotifications(List<ChatMsg> msgs) {
     for (final m in msgs) {
       _notifiedMessageIds.add(m.id);
+    }
+    // Android: post OS notifications for inbound messages that arrive while the
+    // app is not in the foreground. Coalesce per sender via a stable id.
+    if (Platform.isAndroid && !_appResumed) {
+      for (final m in msgs) {
+        if (m.direction != 'in') continue;
+        final sender = m.contact.isNotEmpty ? m.contact : 'Unknown';
+        final groupName = m.group.isNotEmpty ? _groupNameForId(m.group) : '';
+        final title = groupName.isNotEmpty ? '$sender • $groupName' : sender;
+        unawaited(_showMessageNotification(
+          title: title,
+          body: notificationBody(m.text),
+          id: notificationIdForContact(
+              m.group.isNotEmpty ? m.group : m.contact),
+        ));
+      }
     }
     final String text;
     if (msgs.length == 1) {
@@ -2895,7 +3260,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           if (parts.length != 2) {
             throw Exception('usage: /group-leave <id-or-title>');
           }
-          _showInfo('Left group', await _cli.leaveGroup(parts[1]));
+          if (_canUseMobileBackend && _mobile != null) {
+            final left = await _mobile!.leaveGroup(parts[1]);
+            _showInfo('Left group', left.details);
+          } else {
+            _showInfo('Left group', await _cli.leaveGroup(parts[1]));
+          }
           await _load();
           if (_selGroup?.id == parts[1] || _selGroup?.title == parts[1]) {
             setState(() {
@@ -2908,10 +3278,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           if (parts.length < 3) {
             throw Exception('usage: /group-rename <id-or-title> <new-title>');
           }
-          final group = await _cli.renameGroup(
-            group: parts[1],
-            title: raw.split(RegExp(r'\s+')).skip(2).join(' '),
-          );
+          final newGroupTitle = raw.split(RegExp(r'\s+')).skip(2).join(' ');
+          final group = _canUseMobileBackend && _mobile != null
+              ? await _mobile!.renameGroup(groupId: parts[1], title: newGroupTitle)
+              : await _cli.renameGroup(group: parts[1], title: newGroupTitle);
           await _load();
           _showInfo('Group renamed', group.details);
           return;
@@ -2919,8 +3289,9 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           if (parts.length != 3) {
             throw Exception('usage: /group-add <id-or-title> <member>');
           }
-          final added =
-              await _cli.addGroupMember(group: parts[1], member: parts[2]);
+          final added = _canUseMobileBackend && _mobile != null
+              ? await _mobile!.addGroupMember(groupId: parts[1], member: parts[2])
+              : await _cli.addGroupMember(group: parts[1], member: parts[2]);
           await _load();
           _showInfo('Member added', added.details);
           return;
@@ -2928,8 +3299,10 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           if (parts.length != 3) {
             throw Exception('usage: /group-remove <id-or-title> <member>');
           }
-          final removed =
-              await _cli.removeGroupMember(group: parts[1], member: parts[2]);
+          final removed = _canUseMobileBackend && _mobile != null
+              ? await _mobile!
+                  .removeGroupMember(groupId: parts[1], member: parts[2])
+              : await _cli.removeGroupMember(group: parts[1], member: parts[2]);
           await _load();
           _showInfo('Member removed', removed.details);
           return;
@@ -3128,14 +3501,159 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           _scrollToBottom();
           return;
         case 'transfers':
+          if (_canUseMobileBackend && _mobile != null) {
+            await _showTransfersSheet();
+            return;
+          }
           throw Exception(
-              '/$cmd is not wired in the GUI yet. Backend support is TUI-only right now. Annoying, but honest.');
+              'The transfers UI is available on Android and via the TUI. '
+              'On desktop, manage transfers from the TUI for now.');
         default:
           throw Exception('unknown command: /$cmd (try /help)');
       }
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     }
+  }
+
+  Future<void> _showTransfersSheet() async {
+    final mobile = _mobile;
+    if (mobile == null) {
+      _snack('Android backend unavailable');
+      return;
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _t.surface,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (sheetContext, setSheetState) {
+            Future<void> reload() async => setSheetState(() {});
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.swap_vert, color: _t.primary, size: 20),
+                        const SizedBox(width: 8),
+                        Text('File transfers',
+                            style: TextStyle(
+                                color: _t.text,
+                                fontSize: 16,
+                                fontWeight: FontWeight.w700)),
+                        const Spacer(),
+                        IconButton(
+                          icon: Icon(Icons.refresh, color: _t.textDim),
+                          onPressed: reload,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 380),
+                      child: FutureBuilder<List<String>>(
+                        future: mobile.listTransfers(),
+                        builder: (context, snapshot) {
+                          if (snapshot.connectionState !=
+                              ConnectionState.done) {
+                            return const Padding(
+                              padding: EdgeInsets.all(24),
+                              child: Center(child: CircularProgressIndicator()),
+                            );
+                          }
+                          if (snapshot.hasError) {
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 16),
+                              child: Text('${snapshot.error}',
+                                  style: TextStyle(color: _t.errorFg)),
+                            );
+                          }
+                          final transfers = snapshot.data ?? const [];
+                          if (transfers.isEmpty) {
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 24),
+                              child: Text('No active transfers.',
+                                  style: TextStyle(color: _t.textDim)),
+                            );
+                          }
+                          return ListView.separated(
+                            shrinkWrap: true,
+                            itemCount: transfers.length,
+                            separatorBuilder: (_, __) => Divider(
+                                height: 12, color: _t.border),
+                            itemBuilder: (context, i) {
+                              final line = transfers[i];
+                              final hash = parseTransferHash(line);
+                              final outbound = isOutboundTransfer(line);
+                              return Row(
+                                crossAxisAlignment: CrossAxisAlignment.center,
+                                children: [
+                                  Expanded(
+                                    child: Text(line,
+                                        style: TextStyle(
+                                            color: _t.text, fontSize: 12)),
+                                  ),
+                                  if (hash != null && outbound) ...[
+                                    TextButton(
+                                      onPressed: () async {
+                                        try {
+                                          final ok =
+                                              await mobile.resumeTransfer(hash);
+                                          _snack(ok
+                                              ? 'Resuming transfer'
+                                              : 'No persisted transfer to resume');
+                                          await reload();
+                                        } catch (e) {
+                                          _snack('Resume failed: $e');
+                                        }
+                                      },
+                                      child: const Text('Resume'),
+                                    ),
+                                    TextButton(
+                                      onPressed: () async {
+                                        try {
+                                          final ok =
+                                              await mobile.cancelTransfer(hash);
+                                          _snack(ok
+                                              ? 'Transfer cancelled'
+                                              : 'Nothing to cancel');
+                                          await reload();
+                                        } catch (e) {
+                                          _snack('Cancel failed: $e');
+                                        }
+                                      },
+                                      child: Text('Cancel',
+                                          style: TextStyle(color: _t.errorFg)),
+                                    ),
+                                  ],
+                                ],
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: () => Navigator.pop(sheetContext),
+                        child: const Text('Close'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<void> _showAddContactDialog() => _showContactDialog();
@@ -3370,7 +3888,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           pubkey: newPubkey,
           x25519Pubkey: newX25519,
         );
-        if (editing && contact!.name != newName) {
+        if (contact != null && contact.name != newName) {
           await _mobile!.deleteContact(contact.name);
         }
       } else {
@@ -3380,7 +3898,7 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
           pubkey: newPubkey,
           x25519Pubkey: newX25519,
         );
-        if (editing && contact!.name != newName) {
+        if (contact != null && contact.name != newName) {
           await _cli.deleteContact(contact.name);
         }
       }
@@ -3714,16 +4232,29 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       final newTitle = title.text.trim();
       if (newTitle.isEmpty) throw Exception('group title is required');
       if (selected.isEmpty) throw Exception('select at least one group member');
+      final mobile = _canUseMobileBackend ? _mobile : null;
       if (newTitle != group.title) {
-        await _cli.renameGroup(group: group.id, title: newTitle);
+        if (mobile != null) {
+          await mobile.renameGroup(groupId: group.id, title: newTitle);
+        } else {
+          await _cli.renameGroup(group: group.id, title: newTitle);
+        }
       }
       final wanted = selected.toSet();
       final current = group.members.toSet();
       for (final member in wanted.difference(current)) {
-        await _cli.addGroupMember(group: group.id, member: member);
+        if (mobile != null) {
+          await mobile.addGroupMember(groupId: group.id, member: member);
+        } else {
+          await _cli.addGroupMember(group: group.id, member: member);
+        }
       }
       for (final member in current.difference(wanted)) {
-        await _cli.removeGroupMember(group: group.id, member: member);
+        if (mobile != null) {
+          await mobile.removeGroupMember(groupId: group.id, member: member);
+        } else {
+          await _cli.removeGroupMember(group: group.id, member: member);
+        }
       }
       await _load();
       GroupInfo? updated;
@@ -3791,7 +4322,12 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
       return;
     }
     try {
-      _showInfo('Left group', await _cli.leaveGroup(group.id));
+      if (_canUseMobileBackend && _mobile != null) {
+        final left = await _mobile!.leaveGroup(group.id);
+        _showInfo('Left group', left.details);
+      } else {
+        _showInfo('Left group', await _cli.leaveGroup(group.id));
+      }
       await _load();
       if (_selGroup?.id == group.id) {
         setState(() {
@@ -4152,6 +4688,17 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
                       unawaited(_runSlashCommand('/status'));
                     },
                   ),
+                  if (_canUseMobileBackend)
+                    ListTile(
+                      leading: const Icon(Icons.swap_vert),
+                      title: const Text('File transfers'),
+                      subtitle:
+                          const Text('Resume or cancel in-flight file transfers'),
+                      onTap: () {
+                        Navigator.pop(dialogContext);
+                        unawaited(_showTransfersSheet());
+                      },
+                    ),
                   ListTile(
                     leading: const Icon(Icons.delete_sweep_outlined),
                     title: const Text('Delete all history'),
@@ -5034,13 +5581,16 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
         final m = _msgs[i];
         final prev = i > 0 ? _msgs[i - 1] : null;
         final showDate = prev == null || !_sameDay(m.ts, prev.ts);
-        final showTimeGap = prev != null &&
+        Widget? timeGap;
+        if (prev != null &&
             m.tsMs - prev.tsMs > 15 * 60 * 1000 &&
-            _sameDay(m.ts, prev.ts);
+            _sameDay(m.ts, prev.ts)) {
+          timeGap = _timeGapLabel(m.ts, prev.ts);
+        }
         return Column(
           children: [
             if (showDate) _dateLabel(m.ts),
-            if (showTimeGap) _timeGapLabel(m.ts, prev!.ts),
+            if (timeGap != null) timeGap,
             _bubble(m),
             const SizedBox(height: 3),
           ],
@@ -5289,10 +5839,23 @@ class _ChatScreenState extends State<_ChatScreen> with TrayListener {
     // File exists locally but isn't previewed inline — hand it to the platform.
     if (attachment.path.isNotEmpty && File(attachment.path).existsSync()) {
       if (Platform.isAndroid) {
+        // Only received files (which live under .sideband/downloads/) can be
+        // opened; the Kotlin side rejects anything else. Sent-file rows point at
+        // arbitrary picker paths — for those just surface the path instead of a
+        // guaranteed rejection.
+        final profile = _mobileProfilePath ?? '';
+        if (!isUnderDownloadsDir(attachment.path, profile)) {
+          _snack(attachment.path);
+          return;
+        }
         unawaited(_nativeChannel.invokeMethod<void>('openFile', {
           'path': attachment.path,
-        }).catchError((_) {
-          _snack('Could not open: ${attachment.label}');
+        }).catchError((Object e) {
+          if (e is PlatformException && e.code == 'open_file_rejected') {
+            _snack('File is outside the allowed folder');
+          } else {
+            _snack('Could not open: ${attachment.label}');
+          }
         }));
       } else {
         unawaited(Process.run('xdg-open', [attachment.path]).then((r) {

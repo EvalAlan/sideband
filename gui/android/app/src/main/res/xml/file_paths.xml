@@ -1,5 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Scoped deliberately: only the directories that hold received/sent file attachments
+    are exposed via FileProvider. The profile root (`files/.sideband`) is NOT exposed here
+    because it also contains identity.toml (private keys), the ratchet/ state, and
+    messages.db — none of which should ever be shareable via a content:// URI.
+
+    "downloads" matches `<profile>/downloads/` where src/handler.rs
+    (handle_inbound / handle_file_inline) writes verified inbound file attachments,
+    e.g. `~/.sideband/downloads/<name>` -> on Android `filesDir/.sideband/downloads/<name>`.
+-->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <files-path name="files" path="." />
-    <cache-path name="cache" path="." />
+    <files-path name="attachments" path=".sideband/downloads/" />
+    <cache-path name="attachments_cache" path="attachments/" />
 </paths>

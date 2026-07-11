@@ -1,5 +1,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Required for the embedded Tor client (Rust libsideband.so via dart:ffi) to reach
+         the network at all. Without this, release builds cannot connect to Tor. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Keeps the process foreground-privileged while Tor is connected, so Android doesn't
+         kill/suspend the FFI listener thread when the app is backgrounded. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Required on API 33+ to post the persistent "connected to Tor" and message notifications. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:label="Sideband"
         android:name="${applicationName}"
@@ -41,6 +51,12 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+        <!-- Keeps the process foreground-privileged while the Rust/Tor FFI listener runs in
+             the Flutter/Dart process. This service does not itself run any networking code. -->
+        <service
+            android:name=".ListenerForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

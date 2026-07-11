@@ -38,7 +38,7 @@ cargo test
 cargo fmt --check
 ```
 
-All 23 tests should pass. Tor is not required for `cargo test` — tests use temporary profiles without network.
+All 150 tests (across the lib and bin targets) should pass. Tor is not required for `cargo test` — tests use temporary profiles without network.
 
 ## Quick start
 
@@ -162,32 +162,30 @@ Keys:
   arti_state/            # Arti Tor client state
 ```
 
-## Planned transport architecture
+## Transport architecture
 
-Sideband is moving to a **protocol core + transport adapters** model.
+Sideband implements a **protocol core + transport adapters** model:
 
 - Core protocol: identity, signing, encryption, ratchet, storage, framing
-- Transport adapters: Tor, Meshtastic, MeshCore, future backends
+- Transport adapters: Tor (fully implemented), Meshtastic and MeshCore (planned)
 
-Initial transport abstraction has been introduced in `src/transport/`:
+Transport abstraction is wired in `src/transport/`:
 
 - `Transport` trait
 - `Envelope` with `msg_id`, `seq/total`, `ttl`, `hop_count`, `transport_hint`, `ack_for`
 - `TransportCapabilities` and `TransportStatus`
-- `TorTransport` adapter stub
-
-This is scaffolding only; runtime behavior is unchanged until Tor send/recv paths are fully wired through the trait.
+- `TorTransport` adapter (fully integrated with Arti I/O)
 
 Current state:
-- CLI `serve` and `send` now route through `TorTransport`
-- TUI bootstrap/serve/send/file-offer paths route through `TorTransport`
-- Core `Transport` trait exists but generic envelope send/recv is still stubbed for Tor
+- CLI `serve` and `send` route through `TorTransport` (production-ready)
+- TUI bootstrap/serve/send/file-offer paths route through `TorTransport` (production-ready)
+- Android app calls native Rust via `dart:ffi` into libsideband.so (production-ready)
 
 ## Known limitations
 
 - Arti bootstrapping on first run requires network access and may take 30-60s
 - No Bluetooth or Wi-Fi Direct transports
-- No mobile client
-- File transfer supports offer/chunk/ack, restart-safe progress, and TUI transfer management
+- Meshtastic and MeshCore transports are planned but not yet implemented
+- File transfer supports offer/chunk/ack, restart-safe progress, and transfer management in TUI and Android app
 - No delivery receipts beyond sent/failed
 - No out-of-order message handling (no skip buffer in Double Ratchet)

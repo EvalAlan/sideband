@@ -36,6 +36,26 @@ struct ListenerStatus {
     onion: String,
 }
 
+/// Shared multi-thread runtime used to spawn fire-and-forget network work when
+/// no listener is running. This keeps FFI entry points from ever blocking on
+/// Tor I/O on the caller's (Flutter UI isolate) thread.
+static SHARED_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+fn shared_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    if let Some(rt) = SHARED_RUNTIME.get() {
+        return Ok(rt);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow!("failed to build shared runtime: {e}"))?;
+    // If two threads race, keep whichever landed first; both are equivalent.
+    let _ = SHARED_RUNTIME.set(rt);
+    SHARED_RUNTIME
+        .get()
+        .ok_or_else(|| anyhow!("shared runtime unavailable"))
+}
+
 static LISTENER_STATE: Mutex<Option<ListenerState>> = Mutex::new(None);
 static LISTENER_STATUS: Mutex<ListenerStatus> = Mutex::new(ListenerStatus {
     status: String::new(),
@@ -94,6 +114,7 @@ pub fn api_list_contacts(profile_path: &str) -> Result<Vec<ApiContact>> {
             x25519_pubkey_b64: c.x25519_pubkey_b64.clone(),
             pending: c.pending,
             blocked: c.blocked,
+            ratchet_active: crate::ratchet_is_active(&profile, &c.name),
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -168,15 +189,19 @@ pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Resul
             })
             .await
             .map_err(|_| anyhow!("mobile listener send channel is closed"))?;
-        return response_rx
-            .await
-            .map_err(|_| anyhow!("mobile listener send response was dropped"))?
-            .map_err(|e| anyhow!(e));
+        // Enqueue-and-return: waiting for the full Tor round-trip here would
+        // freeze Flutter's UI isolate (ANR). Delivery status flows back to the
+        // app via listener status events, and the listener serializes the send.
+        drop(response_rx);
+        return Ok(());
     }
 
+    // No listener: never bootstrap Tor on the caller's thread. Persist to the
+    // retry queue so the message is delivered when the listener next runs, and
+    // return immediately.
     let onion = crate::resolve_to(&profile, to)?;
-    let tor_client = TorTransport::bootstrap(&profile).await?;
-    crate::send(&profile, &onion, body, to, None, tor_client, false).await
+    crate::enqueue_retry(&profile, to, &onion, body, "queued: no listener running")?;
+    Ok(())
 }
 
 pub async fn api_send_file(profile_path: &str, to: &str, file_path: &str) -> Result<()> {
@@ -208,8 +233,26 @@ pub async fn api_send_file(profile_path: &str, to: &str, file_path: &str) -> Res
         return Ok(());
     }
 
-    let tor_client = TorTransport::bootstrap(&profile).await?;
-    crate::send_file(&profile, to, file_path, None, tor_client).await
+    // No listener: bootstrapping Tor here would run on the caller's UI isolate
+    // and hang the app. Spawn the bootstrap + transfer onto the shared runtime
+    // and return immediately; the transfer persists resumable state as it goes.
+    let rt = shared_runtime()?;
+    let profile_owned = profile.clone();
+    let to_owned = to.to_string();
+    let file_owned = file_path.to_string();
+    rt.spawn(async move {
+        match TorTransport::bootstrap(&profile_owned).await {
+            Ok(tor_client) => {
+                if let Err(e) =
+                    crate::send_file(&profile_owned, &to_owned, &file_owned, None, tor_client).await
+                {
+                    tracing::error!(error=%e, to=%to_owned, "background file send failed");
+                }
+            }
+            Err(e) => tracing::error!(error=%e, "background file send: tor bootstrap failed"),
+        }
+    });
+    Ok(())
 }
 
 pub fn api_list_messages(
@@ -302,26 +345,131 @@ pub fn api_list_transfers(profile_path: &str) -> Result<Vec<String>> {
     crate::list_transfers(&profile)
 }
 
-pub async fn api_resume_transfer(profile_path: &str, hash: &str) -> Result<bool> {
+pub fn api_cancel_transfer(profile_path: &str, hash: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::cancel_outbound_transfer(&profile, hash)
+}
+
+/// Number of messages currently queued for background retry.
+pub fn api_retry_status(profile_path: &str) -> Result<usize> {
+    let profile = expand_profile(profile_path);
+    crate::retry_queue_len(&profile)
+}
+
+/// Enqueue a group message fan-out and return immediately. Never blocks on Tor
+/// I/O on the caller's thread (mirrors the file-send non-blocking pattern).
+pub fn api_send_group_message(profile_path: &str, group_id: &str, message: &str) -> Result<()> {
+    let profile = expand_profile(profile_path);
+    // Validate the group exists before spawning so obvious errors surface synchronously.
+    let _ = crate::resolve_group(&profile, group_id)?;
+    let rt = shared_runtime()?;
+    let group = group_id.to_string();
+    let body = message.to_string();
+    rt.spawn(async move {
+        match TorTransport::bootstrap(&profile).await {
+            Ok(tor_client) => {
+                if let Err(e) = crate::send_group(&profile, &group, &body, tor_client, false).await
+                {
+                    tracing::error!(error=%e, group=%group, "background group send failed");
+                }
+            }
+            Err(e) => tracing::error!(error=%e, "background group send: tor bootstrap failed"),
+        }
+    });
+    Ok(())
+}
+
+/// Enqueue a group file fan-out and return immediately.
+pub fn api_send_group_file(profile_path: &str, group_id: &str, path: &str) -> Result<()> {
+    let profile = expand_profile(profile_path);
+    let _ = crate::resolve_group(&profile, group_id)?;
+    let rt = shared_runtime()?;
+    let group = group_id.to_string();
+    let file = path.to_string();
+    rt.spawn(async move {
+        match TorTransport::bootstrap(&profile).await {
+            Ok(tor_client) => {
+                if let Err(e) = crate::send_file_to_group(&profile, &group, &file, tor_client).await
+                {
+                    tracing::error!(error=%e, group=%group, "background group file send failed");
+                }
+            }
+            Err(e) => tracing::error!(error=%e, "background group file send: tor bootstrap failed"),
+        }
+    });
+    Ok(())
+}
+
+pub fn api_rename_group(
+    profile_path: &str,
+    group_id: &str,
+    title: &str,
+) -> Result<crate::GroupInfo> {
+    let profile = expand_profile(profile_path);
+    crate::rename_group(&profile, group_id, title)
+}
+
+pub fn api_group_add_member(
+    profile_path: &str,
+    group_id: &str,
+    member: &str,
+) -> Result<crate::GroupInfo> {
+    let profile = expand_profile(profile_path);
+    crate::add_group_member(&profile, group_id, member)
+}
+
+pub fn api_group_remove_member(
+    profile_path: &str,
+    group_id: &str,
+    member: &str,
+) -> Result<crate::GroupInfo> {
+    let profile = expand_profile(profile_path);
+    crate::remove_group_member(&profile, group_id, member)
+}
+
+/// Leave a group. The member-notification fan-out (which needs Tor) is spawned
+/// onto the shared runtime so this never blocks the caller; the local group
+/// snapshot is resolved and returned synchronously.
+pub fn api_leave_group(profile_path: &str, group_id: &str) -> Result<crate::GroupInfo> {
+    let profile = expand_profile(profile_path);
+    let group = crate::resolve_group(&profile, group_id)?;
+    let rt = shared_runtime()?;
+    let group_ref = group_id.to_string();
+    let profile_owned = profile.clone();
+    rt.spawn(async move {
+        match TorTransport::bootstrap(&profile_owned).await {
+            Ok(tor_client) => {
+                if let Err(e) = crate::leave_group(&profile_owned, &group_ref, tor_client).await {
+                    tracing::error!(error=%e, "background group leave failed");
+                }
+            }
+            Err(e) => tracing::error!(error=%e, "background group leave: tor bootstrap failed"),
+        }
+    });
+    Ok(group)
+}
+
+/// Resume an outbound transfer in the background and return immediately. Returns
+/// `false` only when there is no persisted transfer for `hash`.
+pub fn api_resume_transfer_bg(profile_path: &str, hash: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
     let Some((contact, file_path)) = crate::outbound_transfer_target(&profile, hash)? else {
         return Ok(false);
     };
-    let tor_client = TorTransport::bootstrap(&profile).await?;
-    crate::send_file(
-        &profile,
-        &contact,
-        &file_path,
-        None,
-        Arc::clone(&tor_client),
-    )
-    .await?;
+    let rt = shared_runtime()?;
+    rt.spawn(async move {
+        match TorTransport::bootstrap(&profile).await {
+            Ok(tor_client) => {
+                if let Err(e) =
+                    crate::send_file(&profile, &contact, &file_path, None, tor_client).await
+                {
+                    tracing::error!(error=%e, "background resume transfer failed");
+                }
+            }
+            Err(e) => tracing::error!(error=%e, "background resume: tor bootstrap failed"),
+        }
+    });
     Ok(true)
-}
-
-pub fn api_cancel_transfer(profile_path: &str, hash: &str) -> Result<bool> {
-    let profile = expand_profile(profile_path);
-    crate::cancel_outbound_transfer(&profile, hash)
 }
 
 pub fn api_status(profile_path: &str) -> Result<ApiStatus> {
@@ -363,14 +511,17 @@ fn json_response<T: serde::Serialize>(result: Result<T>) -> *mut c_char {
         .into_raw()
 }
 
+/// Free a string previously returned by any `sideband_api_*` function.
+///
+/// # Safety
+/// `ptr` must be null or a pointer returned by a `sideband_api_*` call that has
+/// not already been freed. Passing any other pointer is undefined behaviour.
 #[no_mangle]
-pub extern "C" fn sideband_api_free_string(ptr: *mut c_char) {
+pub unsafe extern "C" fn sideband_api_free_string(ptr: *mut c_char) {
     if ptr.is_null() {
         return;
     }
-    unsafe {
-        let _ = CString::from_raw(ptr);
-    }
+    let _ = CString::from_raw(ptr);
 }
 
 #[no_mangle]
@@ -447,10 +598,9 @@ pub extern "C" fn sideband_api_send_message(
     body: *const c_char,
 ) -> *mut c_char {
     json_response((|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(api_send_message(
+        // These async fns enqueue-and-return without awaiting network I/O, so
+        // block_on completes immediately and never freezes the caller.
+        shared_runtime()?.block_on(api_send_message(
             cstr_arg(profile_path, "profile_path")?,
             cstr_arg(to, "to")?,
             cstr_arg(body, "body")?,
@@ -465,10 +615,7 @@ pub extern "C" fn sideband_api_send_file(
     file_path: *const c_char,
 ) -> *mut c_char {
     json_response((|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(api_send_file(
+        shared_runtime()?.block_on(api_send_file(
             cstr_arg(profile_path, "profile_path")?,
             cstr_arg(to, "to")?,
             cstr_arg(file_path, "file_path")?,
@@ -496,6 +643,7 @@ pub extern "C" fn sideband_api_add_contact(
                 ),
                 pending: false,
                 blocked: false,
+                ratchet_active: false,
             },
         )
     })())
@@ -746,15 +894,146 @@ pub extern "C" fn sideband_api_listener_stop() -> *mut c_char {
     })())
 }
 
+#[no_mangle]
+pub extern "C" fn sideband_api_retry_status(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        let queued = api_retry_status(cstr_arg(profile_path, "profile_path")?)?;
+        Ok(serde_json::json!({ "queued": queued }))
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_send_group_message(
+    profile_path: *const c_char,
+    group_id: *const c_char,
+    message: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_send_group_message(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(group_id, "group_id")?,
+            cstr_arg(message, "message")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_send_group_file(
+    profile_path: *const c_char,
+    group_id: *const c_char,
+    path: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_send_group_file(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(group_id, "group_id")?,
+            cstr_arg(path, "path")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_rename_group(
+    profile_path: *const c_char,
+    group_id: *const c_char,
+    title: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_rename_group(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(group_id, "group_id")?,
+            cstr_arg(title, "title")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_group_add_member(
+    profile_path: *const c_char,
+    group_id: *const c_char,
+    member: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_group_add_member(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(group_id, "group_id")?,
+            cstr_arg(member, "member")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_group_remove_member(
+    profile_path: *const c_char,
+    group_id: *const c_char,
+    member: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_group_remove_member(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(group_id, "group_id")?,
+            cstr_arg(member, "member")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_leave_group(
+    profile_path: *const c_char,
+    group_id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_leave_group(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(group_id, "group_id")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_list_transfers(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_list_transfers(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_resume_transfer(
+    profile_path: *const c_char,
+    hash: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_resume_transfer_bg(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(hash, "hash")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_cancel_transfer(
+    profile_path: *const c_char,
+    hash: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_cancel_transfer(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(hash, "hash")?,
+        )
+    })())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    static API_TEST_LOCK: Mutex<()> = Mutex::new(());
+    // Async-aware lock so it can be held across .await without the
+    // clippy::await_holding_lock hazard a std Mutex would introduce.
+    static API_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test(flavor = "current_thread")]
     async fn api_send_file_with_listener_enqueues_without_waiting_for_delivery() {
-        let _test_guard = API_TEST_LOCK.lock().unwrap();
+        let _test_guard = API_TEST_LOCK.lock().await;
         let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<MobileSendCommand>(1);
         {
             let mut guard = LISTENER_STATE.lock().unwrap();
@@ -784,5 +1063,55 @@ mod tests {
 
         let mut guard = LISTENER_STATE.lock().unwrap();
         *guard = None;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn api_send_message_with_listener_enqueues_without_waiting() {
+        let _test_guard = API_TEST_LOCK.lock().await;
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<MobileSendCommand>(1);
+        {
+            let mut guard = LISTENER_STATE.lock().unwrap();
+            *guard = Some(ListenerState {
+                quit_tx: None,
+                send_tx: Some(send_tx),
+                handle: None,
+            });
+        }
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            api_send_message("/tmp/sideband-test-profile", "bob", "hi there"),
+        )
+        .await;
+        assert!(result.is_ok(), "api_send_message waited for delivery");
+        result.unwrap().unwrap();
+
+        let cmd = send_rx.try_recv().expect("message was not queued");
+        assert_eq!(cmd.to, "bob");
+        match cmd.payload {
+            MobileSendPayload::Message(body) => assert_eq!(body, "hi there"),
+            MobileSendPayload::File(_) => panic!("queued file payload instead of message"),
+        }
+
+        let mut guard = LISTENER_STATE.lock().unwrap();
+        *guard = None;
+    }
+
+    #[test]
+    fn api_retry_status_reports_queued_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().to_str().unwrap();
+        assert_eq!(api_retry_status(profile).unwrap(), 0);
+        crate::enqueue_retry(dir.path(), "alice", "alice.onion", "hi", "err").unwrap();
+        assert_eq!(api_retry_status(profile).unwrap(), 1);
+    }
+
+    #[test]
+    fn api_send_group_message_rejects_unknown_group() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::init_profile(dir.path()).unwrap();
+        let profile = dir.path().to_str().unwrap();
+        // Unknown group must fail synchronously (before any network spawn).
+        assert!(api_send_group_message(profile, "no-such-group", "hi").is_err());
     }
 }

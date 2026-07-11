@@ -135,9 +135,9 @@ impl App {
             return false;
         }
 
-        if raw.starts_with('/') {
+        if let Some(command) = raw.strip_prefix('/') {
             self.input.clear();
-            let parts: Vec<&str> = raw[1..].split_whitespace().collect();
+            let parts: Vec<&str> = command.split_whitespace().collect();
             match parts.first().copied() {
                 Some("quit") => {
                     self.send_quit();
@@ -195,14 +195,15 @@ impl App {
                     };
                     match crate::resolve_group(&self.profile, group_ref) {
                         Ok(group) => {
-                            self.push_sys(
-                                &format!("deleting group '{}'...", group.title),
-                                "info",
-                            );
+                            self.push_sys(&format!("deleting group '{}'...", group.title), "info");
                             let profile = self.profile.clone();
                             let group_id = group.id.clone();
                             tokio::spawn(async move {
-                                let tor = match crate::transport::tor::TorTransport::bootstrap(&profile).await {
+                                let tor = match crate::transport::tor::TorTransport::bootstrap(
+                                    &profile,
+                                )
+                                .await
+                                {
                                     Ok(t) => t,
                                     Err(e) => {
                                         tracing::error!(error=%e, "failed to bootstrap tor for group delete");
@@ -285,22 +286,21 @@ impl App {
                     }
                     match crate::resolve_group(&self.profile, parts[1]) {
                         Ok(group) => {
-                            self.push_sys(
-                                &format!("leaving group '{}'...", group.title),
-                                "info",
-                            );
+                            self.push_sys(&format!("leaving group '{}'...", group.title), "info");
                             let profile = self.profile.clone();
                             tokio::spawn(async move {
-                                let tor = match crate::transport::tor::TorTransport::bootstrap(&profile).await {
+                                let tor = match crate::transport::tor::TorTransport::bootstrap(
+                                    &profile,
+                                )
+                                .await
+                                {
                                     Ok(t) => t,
                                     Err(e) => {
                                         tracing::error!(error=%e, "failed to bootstrap tor for group leave");
                                         return;
                                     }
                                 };
-                                if let Err(e) =
-                                    crate::leave_group(&profile, &group.id, tor).await
-                                {
+                                if let Err(e) = crate::leave_group(&profile, &group.id, tor).await {
                                     tracing::error!(error=%e, "group leave failed");
                                 } else {
                                     tracing::info!(group=%group.title, "left group");
@@ -372,7 +372,10 @@ impl App {
                 }
                 Some("who") => {
                     let Some(group_id) = self.selected_group_id() else {
-                        self.push_sys("no group selected — use Tab to select a group first", "error");
+                        self.push_sys(
+                            "no group selected — use Tab to select a group first",
+                            "error",
+                        );
                         return false;
                     };
                     self.groups = crate::load_groups(&self.profile).unwrap_or_default();
@@ -385,25 +388,46 @@ impl App {
                         .members
                         .iter()
                         .map(|m| {
-                            let security = full.get(&m.contact).map(|c| {
-                                let has_ratchet = std::path::Path::new(&self.profile)
-                                    .join("ratchet")
-                                    .join(format!("{}.bin", m.contact))
-                                    .exists();
-                                if has_ratchet {
-                                    "🔒 Double Ratchet"
-                                } else if c.x25519_pubkey_b64.as_ref().is_some_and(|k| !k.is_empty()) {
-                                    "🔑 Static key"
-                                } else {
-                                    "✍️ Signed only"
-                                }
-                            }).unwrap_or("❓ Unknown");
-                            let onion = full.get(&m.contact).map(|c| c.onion.as_str()).unwrap_or("?");
-                            format!("  {}  onion={}  security={}  role={}", m.contact, onion, security, m.role)
+                            let security = full
+                                .get(&m.contact)
+                                .map(|c| {
+                                    let has_ratchet = std::path::Path::new(&self.profile)
+                                        .join("ratchet")
+                                        .join(format!("{}.bin", m.contact))
+                                        .exists();
+                                    if has_ratchet {
+                                        "🔒 Double Ratchet"
+                                    } else if c
+                                        .x25519_pubkey_b64
+                                        .as_ref()
+                                        .is_some_and(|k| !k.is_empty())
+                                    {
+                                        "🔑 Static key"
+                                    } else {
+                                        "✍️ Signed only"
+                                    }
+                                })
+                                .unwrap_or("❓ Unknown");
+                            let onion = full
+                                .get(&m.contact)
+                                .map(|c| c.onion.as_str())
+                                .unwrap_or("?");
+                            format!(
+                                "  {}  onion={}  security={}  role={}",
+                                m.contact, onion, security, m.role
+                            )
                         })
                         .collect();
                     let header = format!("'{}' members ({}):", group.title, lines.len() + 1);
-                    let self_line = format!("  {}  onion={}  (you)", self.profile_name, if self.onion.is_empty() { "(not yet)" } else { &self.onion });
+                    let self_line = format!(
+                        "  {}  onion={}  (you)",
+                        self.profile_name,
+                        if self.onion.is_empty() {
+                            "(not yet)"
+                        } else {
+                            &self.onion
+                        }
+                    );
                     let mut all_lines = vec![header, self_line];
                     all_lines.extend(lines);
                     self.push_sys(&all_lines.join("\n"), "info");
@@ -450,7 +474,7 @@ impl App {
                         self.push_sys("usage: /add <contact> <onion> <pubkey>", "error");
                         return false;
                     }
-                    let add_parts: Vec<&str> = raw[1..].splitn(5, ' ').collect();
+                    let add_parts: Vec<&str> = command.splitn(5, ' ').collect();
                     if add_parts.len() < 5 {
                         self.push_sys(
                             "usage: /add <name> <onion> <ed25519_pubkey_b64> <x25519_pubkey_b64>",
@@ -582,8 +606,8 @@ impl App {
                         return false;
                     }
                     let target = parts[1].trim();
-                    if !self.contacts.contains(&target.to_string())
-                        && !(self.contacts.len() == 1 && self.contacts[0] == "(no contacts)")
+                    if !(self.contacts.contains(&target.to_string())
+                        || (self.contacts.len() == 1 && self.contacts[0] == "(no contacts)"))
                     {
                         self.push_sys(&format!("unknown contact: {}", target), "error");
                         return false;
@@ -1153,7 +1177,6 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
                     .send(TuiEvent::StatusUpdate(format!("Tor bootstrap failed: {e}")))
                     .await;
                 // Drop tor_ready_tx — the .await in main flow will see Err and bail
-                return;
             }
         }
     });

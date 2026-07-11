@@ -15,7 +15,7 @@
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
 
 # 4. Set NDK path (Android Studio default)
-export ANDROID_NDK_HOME=~/Android/Sdk/ndk/27.0.12077973  # adjust version
+export ANDROID_NDK_HOME=~/Android/Sdk/ndk/28.2.13676358  # or any recent NDK version
 # Add to ~/.bashrc or ~/.zshrc
 ```
 
@@ -76,20 +76,24 @@ cd ~/repos/sideband/gui/android
 
 | File | Purpose |
 |------|---------|
-| `Cargo.toml` | Added `[lib]` cdylib + `[[bin]]` for dual binary/lib build |
-| `android/app/build.gradle.kts` | Standard Flutter Android app config; no FRB Gradle plugin/dependency |
+| `Cargo.toml` | `[lib]` cdylib for FFI exports; `[[bin]]` for CLI binary |
+| `src/app_api.rs` | Rust FFI functions (e.g., `sideband_api_*`, `sideband_api_send_group_message`, `sideband_api_list_transfers`) called by Dart |
+| `gui/lib/main.dart` | Dart FFI bindings in `_MobileApi` class; calls `libsideband.so` directly |
+| `gui/android/app/src/main/kotlin/MainActivity.kt` | MethodChannel handler for profilePath, openFile, foreground-service, notifications |
+| `gui/android/app/src/main/kotlin/ListenerForegroundService.kt` | Foreground service to keep Tor listener running in background |
+| `android/app/build.gradle.kts` | Standard Flutter Android app config |
 | `android/settings.gradle.kts` | Standard Flutter Gradle plugin setup |
-| `flutter_rust_bridge.yaml` | Points to `../src/app_api.rs` for future FFI generation |
-| `build-android-rust.sh` | Script to compile Rust `.so` for all Android ABIs once NDK/OpenSSL are configured |
+| `build-android-rust.sh` | Script to compile Rust `.so` for all Android ABIs; auto-detects NDK in standard locations |
 
 ---
 
 ## Architecture Notes
 
-- **Flutter UI** → Dart calls generated Kotlin bridge (`com.example.sideband_gui.bridge`)
-- **Kotlin bridge** → JNI calls `libsideband.so` (Rust `app_api.rs` functions)
+- **Flutter UI** → Dart calls `libsideband.so` directly via `dart:ffi` (see `gui/lib/main.dart` `_MobileApi`)
+- **Kotlin helpers** → MethodChannel ("sideband/native") provides profilePath, openFile, foreground-service, and notification support
 - **Rust** → Runs same `sideband` logic (contacts, messages, Tor via Arti)
 - **Profile dir** → Uses app-specific directory: `/data/user/0/com.example.sideband_gui/files/.sideband`
+- **Foreground Service** → Keeps Tor listener active in background (see `ListenerForegroundService.kt`)
 
 ---
 
@@ -105,10 +109,24 @@ cd ~/repos/sideband/gui/android
 
 ---
 
+## Release Signing
+
+To sign the APK for release, create `gui/android/key.properties` with standard Flutter format:
+
+```properties
+storeFile=../path/to/your/keystore.jks
+storePassword=your_store_password
+keyAlias=your_key_alias
+keyPassword=your_key_password
+```
+
+The build-android-rust.sh and Gradle build will automatically detect this file. If absent, builds default to debug signing.
+
+**Note**: The `applicationId` remains `com.example.sideband_gui` by design; changing it will orphan existing user data on devices that have the app installed. Use Play Store internal testing tracks to validate signed builds without changing the ID.
+
 ## Next Steps for Production
 
-1. **Signing**: Create `key.properties` + configure `signingConfigs.release` in `app/build.gradle.kts`
-2. **App ID**: Change `applicationId` from `com.example.sideband_gui` to `com.evalan.sideband`
-3. **Permissions**: Add `FOREGROUND_SERVICE` for Tor listener background operation
-4. **App Bundle**: `./gradlew bundleRelease` for Play Store
-5. **Icon**: Replace `android/app/src/main/res/mipmap-*/ic_launcher.png` with Sideband icon
+1. **Release Signing**: Set up `gui/android/key.properties` (see above)
+2. **App Bundle**: `cd gui/android && ./gradlew bundleRelease` for Play Store submission
+3. **Icon**: Replace `android/app/src/main/res/mipmap-*/ic_launcher.png` with Sideband icon
+4. **Metadata**: Update Play Store listing description, screenshots, privacy policy link

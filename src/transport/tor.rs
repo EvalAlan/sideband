@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,6 +37,46 @@ impl FileTransferState {
 }
 
 pub(crate) type SharedTransferState = Arc<tokio::sync::Mutex<FileTransferState>>;
+
+/// Upper bound on a single inbound line/frame. A peer that streams bytes with no
+/// newline would otherwise grow the read buffer without limit (OOM / DoS).
+///
+/// The largest legitimate frame is a `file_chunk`: a 64 KiB payload
+/// (`FILE_CHUNK_SIZE`) base64-encoded is ceil(65536/3)*4 = 87_384 bytes. A
+/// `file_inline` can carry up to 512 KiB (`FILE_INLINE_MAX_SIZE`), which
+/// base64-encodes to ceil(524288/3)*4 = 699_052 bytes. Add the surrounding
+/// JSON/ChatMessage envelope (type, from/pubkeys, signature, hex nonce+ct,
+/// name, timestamps) plus generous headroom and round up.
+///
+/// 699_052 (inline b64) + ~64 KiB envelope ≈ 765 KiB; we cap at 4 MiB, which
+/// comfortably covers every legitimate frame while still bounding the read.
+const MAX_INBOUND_LINE: u64 = 4 * 1024 * 1024;
+
+/// Read a single newline-terminated frame from `reader`, but never buffer more
+/// than [`MAX_INBOUND_LINE`] bytes. Returns:
+///  - `Ok(Some(line))` on a complete line (with or without trailing newline at EOF),
+///  - `Ok(None)` on immediate EOF (nothing read),
+///  - `Err(_)` if the line exceeds the cap (caller should drop the connection) or on IO error.
+async fn read_line_bounded<R>(reader: &mut R) -> Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut buf = Vec::new();
+    // .take() bounds the number of bytes we will ever read from the peer.
+    let n = AsyncReadExt::take(reader, MAX_INBOUND_LINE + 1)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() as u64 > MAX_INBOUND_LINE {
+        return Err(anyhow!(
+            "inbound line exceeded {MAX_INBOUND_LINE} bytes; dropping connection"
+        ));
+    }
+    let line = String::from_utf8(buf).map_err(|_| anyhow!("inbound line is not valid utf-8"))?;
+    Ok(Some(line))
+}
 
 pub struct TorTransport {
     local_onion: Arc<Mutex<Option<String>>>,
@@ -186,10 +226,9 @@ impl TorTransport {
                     tracing::info!(%peer, "incoming connection");
                     tokio::spawn(async move {
                         let mut reader = BufReader::new(stream);
-                        let mut line = String::new();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) => {}
-                            Ok(_) => {
+                        match read_line_bounded(&mut reader).await {
+                            Ok(None) => {}
+                            Ok(Some(line)) => {
                                 if let Some(_msg) = parse_inbound_line(&line).unwrap_or(None) {
                                     // Push the raw envelope into the try_recv channel.
                                     let env = Self::raw_line_to_envelope(&line);
@@ -198,7 +237,9 @@ impl TorTransport {
                                     tracing::error!(raw=%line, "invalid inbound payload");
                                 }
                             }
-                            Err(e) => tracing::error!(error=%e, "read error"),
+                            Err(e) => {
+                                tracing::warn!(%peer, error=%e, "dropping inbound connection");
+                            }
                         }
                     });
                 }
