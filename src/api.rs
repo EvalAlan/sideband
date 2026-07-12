@@ -160,6 +160,21 @@ pub fn api_init_ratchet(profile_path: &str, contact: &str) -> Result<()> {
     crate::init_ratchet_for_contact(&profile, contact)
 }
 
+pub fn api_export_profile(profile_path: &str, out_path: &str, passphrase: &str) -> Result<u64> {
+    let profile = expand_profile(profile_path);
+    crate::export_profile_to(&profile, Path::new(out_path), passphrase)
+}
+
+pub fn api_import_profile(
+    profile_path: &str,
+    in_path: &str,
+    passphrase: &str,
+    overwrite: bool,
+) -> Result<()> {
+    let profile = expand_profile(profile_path);
+    crate::import_profile_from(&profile, Path::new(in_path), passphrase, overwrite)
+}
+
 pub fn api_accept_contact(profile_path: &str, name: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
     crate::contact_accept(&profile, name)
@@ -681,6 +696,38 @@ pub extern "C" fn sideband_api_init_ratchet(
 }
 
 #[no_mangle]
+pub extern "C" fn sideband_api_export_profile(
+    profile_path: *const c_char,
+    out_path: *const c_char,
+    passphrase: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_export_profile(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(out_path, "out_path")?,
+            cstr_arg(passphrase, "passphrase")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_import_profile(
+    profile_path: *const c_char,
+    in_path: *const c_char,
+    passphrase: *const c_char,
+    overwrite: bool,
+) -> *mut c_char {
+    json_response((|| {
+        api_import_profile(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(in_path, "in_path")?,
+            cstr_arg(passphrase, "passphrase")?,
+            overwrite,
+        )
+    })())
+}
+
+#[no_mangle]
 pub extern "C" fn sideband_api_accept_contact(
     profile_path: *const c_char,
     name: *const c_char,
@@ -1136,6 +1183,49 @@ mod tests {
             "invalid onion must surface an error envelope"
         );
         assert!(r["error"].is_string());
+    }
+
+    #[test]
+    fn ffi_export_then_import_round_trips() {
+        let src = tempfile::tempdir().unwrap();
+        let src_p = cs(src.path().to_str().unwrap());
+        let name = cs("Mercury");
+        take_json(sideband_api_init_profile(src_p.as_ptr(), name.as_ptr()));
+
+        let out = src.path().join("backup.sbx");
+        let out_c = cs(out.to_str().unwrap());
+        let pass = cs("hunter2");
+        let r = take_json(sideband_api_export_profile(
+            src_p.as_ptr(),
+            out_c.as_ptr(),
+            pass.as_ptr(),
+        ));
+        assert_eq!(r["ok"], true, "export failed: {r}");
+        assert!(out.exists(), "export must write the archive file");
+
+        // Import into a fresh profile.
+        let dst = tempfile::tempdir().unwrap();
+        let dst_p = cs(dst.path().to_str().unwrap());
+        let r = take_json(sideband_api_import_profile(
+            dst_p.as_ptr(),
+            out_c.as_ptr(),
+            pass.as_ptr(),
+            false,
+        ));
+        assert_eq!(r["ok"], true, "import failed: {r}");
+        assert!(dst.path().join("identity.toml").exists());
+
+        // Wrong passphrase surfaces an error envelope.
+        let dst2 = tempfile::tempdir().unwrap();
+        let dst2_p = cs(dst2.path().to_str().unwrap());
+        let wrong = cs("nope");
+        let r = take_json(sideband_api_import_profile(
+            dst2_p.as_ptr(),
+            out_c.as_ptr(),
+            wrong.as_ptr(),
+            false,
+        ));
+        assert_eq!(r["ok"], false, "wrong passphrase must fail");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -957,6 +957,35 @@ class _Cli {
   Future<String> ratchet(String contact) =>
       _run(['ratchet', '--profile', profile, contact]);
 
+  Future<void> exportProfile(
+      {required String outPath, required String passphrase}) async {
+    await _run([
+      'export',
+      '--profile',
+      profile,
+      '--out',
+      outPath,
+      '--passphrase',
+      passphrase,
+    ]);
+  }
+
+  Future<void> importProfile(
+      {required String inPath,
+      required String passphrase,
+      bool overwrite = false}) async {
+    await _run([
+      'import',
+      '--profile',
+      profile,
+      '--in',
+      inPath,
+      '--passphrase',
+      passphrase,
+      if (overwrite) '--overwrite',
+    ]);
+  }
+
   Future<List<Contact>> contacts() async {
     final raw = await _run(['contact', 'list', '--profile', profile, '--json']);
     if (raw.isEmpty) return [];
@@ -1129,6 +1158,11 @@ typedef _NativePtr3 = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
 typedef _Ptr3 = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+// 3 strings + a bool (for import's `overwrite`).
+typedef _NativePtr3Bool = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Bool);
+typedef _Ptr3Bool = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, bool);
 
 class _MobileApi {
   _MobileApi()
@@ -1324,6 +1358,11 @@ class _MobileApi {
   _Ptr3 get _groupRemoveMember => _lookup3('sideband_api_group_remove_member');
   _Ptr2 get _leaveGroup => _lookup2('sideband_api_leave_group');
   _Ptr1 get _retryStatus => _lookup1('sideband_api_retry_status');
+  _Ptr3 get _exportProfile => _lookup3('sideband_api_export_profile');
+  _Ptr3Bool get _importProfile => _resolve<_Ptr3Bool>(
+      'sideband_api_import_profile',
+      () => _lib.lookupFunction<_NativePtr3Bool, _Ptr3Bool>(
+          'sideband_api_import_profile'));
   _Ptr1 get _listTransfers => _lookup1('sideband_api_list_transfers');
   _Ptr2 get _resumeTransfer => _lookup2('sideband_api_resume_transfer');
   _Ptr2 get _cancelTransfer => _lookup2('sideband_api_cancel_transfer');
@@ -1609,6 +1648,36 @@ class _MobileApi {
       calloc.free(profile);
       calloc.free(cgroup);
       calloc.free(cmessage);
+    }
+  }
+
+  Future<void> exportProfile(
+      {required String outPath, required String passphrase}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cout = outPath.toNativeUtf8();
+    final cpass = passphrase.toNativeUtf8();
+    try {
+      _decode<Object?>(_exportProfile(profile, cout, cpass));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cout);
+      calloc.free(cpass);
+    }
+  }
+
+  Future<void> importProfile(
+      {required String inPath,
+      required String passphrase,
+      bool overwrite = false}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cin = inPath.toNativeUtf8();
+    final cpass = passphrase.toNativeUtf8();
+    try {
+      _decode<Object?>(_importProfile(profile, cin, cpass, overwrite));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cin);
+      calloc.free(cpass);
     }
   }
 
@@ -4699,6 +4768,135 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  Future<String?> _promptPassphrase({
+    required String title,
+    String? message,
+    bool confirm = false,
+  }) async {
+    final pass = TextEditingController();
+    final pass2 = TextEditingController();
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: _t.surface,
+          title: Text(title, style: TextStyle(color: _t.text)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (message != null) ...[
+                Text(message,
+                    style: TextStyle(color: _t.textDim, fontSize: 12.5)),
+                const SizedBox(height: 12),
+              ],
+              TextField(
+                controller: pass,
+                obscureText: true,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'Passphrase'),
+              ),
+              if (confirm)
+                TextField(
+                  controller: pass2,
+                  obscureText: true,
+                  decoration:
+                      const InputDecoration(labelText: 'Confirm passphrase'),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel')),
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('OK')),
+          ],
+        ),
+      );
+      if (ok != true) return null;
+      final p = pass.text;
+      if (p.isEmpty) {
+        _snack('Passphrase must not be empty');
+        return null;
+      }
+      if (confirm && p != pass2.text) {
+        _snack('Passphrases do not match');
+        return null;
+      }
+      return p;
+    } finally {
+      pass.dispose();
+      pass2.dispose();
+    }
+  }
+
+  Future<void> _exportProfileFlow() async {
+    final pass = await _promptPassphrase(
+      title: 'Export profile',
+      message:
+          'Encrypts your identity, contacts, and message history into a backup '
+          'file. Keep the passphrase safe — it is required to restore.',
+      confirm: true,
+    );
+    if (pass == null) return;
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        final base = await _mobile!.profilePath();
+        final ts = DateTime.now().millisecondsSinceEpoch;
+        final out = '$base/downloads/sideband-backup-$ts.sbx';
+        await _mobile!.exportProfile(outPath: out, passphrase: pass);
+        try {
+          await _nativeChannel.invokeMethod<void>('shareFile', {'path': out});
+        } catch (_) {
+          _showInfo('Exported', 'Backup saved on device:\n$out');
+        }
+      } else {
+        final loc = await getSaveLocation(suggestedName: 'sideband-backup.sbx');
+        if (loc == null) return;
+        await _cli.exportProfile(outPath: loc.path, passphrase: pass);
+        _showInfo('Exported', 'Backup written to:\n${loc.path}');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Export failed: $e');
+    }
+  }
+
+  Future<void> _importProfileFlow() async {
+    final picked = await openFile(
+      acceptedTypeGroups: const [
+        XTypeGroup(label: 'Sideband backup', extensions: ['sbx']),
+        XTypeGroup(label: 'All files'),
+      ],
+      confirmButtonText: 'Import',
+    );
+    final path = picked?.path.trim() ?? '';
+    if (path.isEmpty) return;
+    final pass = await _promptPassphrase(
+      title: 'Import profile',
+      message: 'Restores from the backup file you picked.',
+    );
+    if (pass == null) return;
+    if (!await _confirm('Replace this device?',
+        'Importing OVERWRITES this device\'s current identity and all messages '
+        'with the backup. This cannot be undone. Continue?')) {
+      return;
+    }
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.importProfile(inPath: path, passphrase: pass, overwrite: true);
+      } else {
+        await _cli.importProfile(inPath: path, passphrase: pass, overwrite: true);
+      }
+      if (mounted) {
+        _showInfo('Imported',
+            'Profile restored. Restart Sideband to load the imported identity.');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Import failed: $e');
+    }
+  }
+
   Future<void> _showSettings() async {
     await showDialog<void>(
       context: context,
@@ -4872,6 +5070,26 @@ class _ChatScreenState extends State<_ChatScreen>
                         unawaited(_showTransfersSheet());
                       },
                     ),
+                  ListTile(
+                    leading: const Icon(Icons.ios_share_outlined),
+                    title: const Text('Export profile'),
+                    subtitle: const Text(
+                        'Encrypted backup of identity, contacts, and history'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_exportProfileFlow());
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.download_outlined),
+                    title: const Text('Import profile'),
+                    subtitle:
+                        const Text('Restore from an encrypted backup file'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_importProfileFlow());
+                    },
+                  ),
                   ListTile(
                     leading: const Icon(Icons.delete_sweep_outlined),
                     title: const Text('Delete all history'),

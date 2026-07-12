@@ -2887,12 +2887,8 @@ async fn main() -> Result<()> {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
             let pass = resolve_export_passphrase(passphrase)?;
-            let bytes = export_profile_bytes(&profile, &pass)?;
-            write_private(Path::new(&out), &bytes)?;
-            println!(
-                "exported profile to {out} ({} bytes, encrypted)",
-                bytes.len()
-            );
+            let n = export_profile_to(&profile, Path::new(&out), &pass)?;
+            println!("exported profile to {out} ({n} bytes, encrypted)");
             Ok(())
         }
         CommandKind::Import {
@@ -2903,8 +2899,7 @@ async fn main() -> Result<()> {
         } => {
             let profile = profile.path()?;
             let pass = resolve_export_passphrase(passphrase)?;
-            let data = fs::read(&input).with_context(|| format!("read {input}"))?;
-            import_profile_bytes(&profile, &data, &pass, overwrite)?;
+            import_profile_from(&profile, Path::new(&input), &pass, overwrite)?;
             println!("imported profile from {input}");
             Ok(())
         }
@@ -3158,6 +3153,29 @@ pub(crate) fn import_profile_bytes(
         }
     }
     Ok(())
+}
+
+/// Export a profile to `out_path` (encrypted, 0o600). Returns the byte count.
+pub(crate) fn export_profile_to(profile: &Path, out_path: &Path, passphrase: &str) -> Result<u64> {
+    let bytes = export_profile_bytes(profile, passphrase)?;
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).context("create export output directory")?;
+        }
+    }
+    write_private(out_path, &bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+/// Import a profile from an archive at `in_path`.
+pub(crate) fn import_profile_from(
+    profile: &Path,
+    in_path: &Path,
+    passphrase: &str,
+    overwrite: bool,
+) -> Result<()> {
+    let data = fs::read(in_path).with_context(|| format!("read {}", in_path.display()))?;
+    import_profile_bytes(profile, &data, passphrase, overwrite)
 }
 
 /// Resolve the export/import passphrase from the flag or `SIDEBAND_EXPORT_PASSPHRASE`.

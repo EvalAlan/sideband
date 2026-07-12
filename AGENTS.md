@@ -155,14 +155,16 @@ loading with debug fallback in `build.gradle.kts`, committed
 `key.properties.example` template, gitignored secrets, and generation +
 verification docs in ANDROID_BUILD.md; signing wiring verified end-to-end with a
 throwaway keystore); **encrypted profile export/import** (`sideband export` /
-`import`, Argon2id + ChaCha20-Poly1305) for backup and migration; **Android
-`applicationId` migrated** `com.example.sideband_gui` → `com.evalalan.sideband`
-(Kotlin package moved too; APK id verified via aapt).
+`import`, Argon2id + ChaCha20-Poly1305) for backup and migration, **wired into
+both GUIs** (Settings → Export/Import profile: `sideband_api_export_profile` /
+`_import_profile` FFI on Android with a `shareFile` intent, CLI on desktop with
+native save/open dialogs, passphrase prompt); **Android `applicationId`
+migrated** `com.example.sideband_gui` → `com.evalalan.sideband` (Kotlin package
+moved too; APK id verified via aapt).
 
 **Open / backlog (roughly prioritized):**
-1. **Wire export/import into the GUIs.** The core + CLI are done; add
-   `sideband_api_export_profile` / `_import_profile` FFI and Settings items
-   ("Export profile" / "Import profile" with a file picker + passphrase) so
-   Android/desktop users can back up and migrate from the app, not just the CLI.
-2. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
-3. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
+1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
+2. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
+3. After an in-app import, the running listener still holds the old identity —
+   the UI just tells the user to restart. A cleaner flow would reload the profile
+   (restart the listener) in place.

@@ -1,4 +1,4 @@
-package com.example.sideband_gui
+package com.evalalan.sideband
 
 import android.Manifest
 import android.app.Notification
@@ -46,6 +46,18 @@ class MainActivity : FlutterActivity() {
                             result.error("open_file_rejected", e.message, null)
                         } catch (e: Exception) {
                             result.error("open_file_failed", e.message, null)
+                        }
+                    }
+
+                    "shareFile" -> {
+                        val path = call.argument<String>("path") ?: ""
+                        try {
+                            shareFile(path)
+                            result.success(null)
+                        } catch (e: SecurityException) {
+                            result.error("share_file_rejected", e.message, null)
+                        } catch (e: Exception) {
+                            result.error("share_file_failed", e.message, null)
                         }
                     }
 
@@ -141,6 +153,33 @@ class MainActivity : FlutterActivity() {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         startActivity(Intent.createChooser(intent, requested.name))
+    }
+
+    // Share a file (e.g. an exported profile backup) via ACTION_SEND so the user
+    // can save it to Drive/Files/etc. Same scoped-path guard as openFile.
+    private fun shareFile(path: String) {
+        if (path.isBlank()) {
+            throw SecurityException("empty path")
+        }
+        val requested = File(path).canonicalFile
+        val allowedRoot = File(filesDir, ".sideband/downloads").canonicalFile
+        if (!isInsideAllowedRoot(requested, allowedRoot)) {
+            throw SecurityException("path is outside the allowed directory: $path")
+        }
+        if (!requested.exists()) {
+            throw IllegalArgumentException("file does not exist: $path")
+        }
+        val uri: Uri = FileProvider.getUriForFile(
+            this,
+            "${applicationContext.packageName}.fileprovider",
+            requested
+        )
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/octet-stream"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(intent, "Export Sideband backup"))
     }
 
     private fun isInsideAllowedRoot(candidate: File, allowedRoot: File): Boolean {
