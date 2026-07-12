@@ -75,7 +75,8 @@ impl Peer {
     /// Build the wire line for a text message from this peer to the contact
     /// named `to_name` (must already be one of this peer's contacts).
     fn make_message(&self, to_name: &str, text: &str) -> String {
-        let msg = build_outbound_message(&self.profile, to_name, "msg", text, &self.onion).unwrap();
+        let msg =
+            build_outbound_message(&self.profile, to_name, "msg", text, &self.onion, None).unwrap();
         serde_json::to_string(&msg).unwrap()
     }
 }
@@ -252,6 +253,64 @@ fn profile_export_import_round_trips() {
     crate::import_profile_bytes(dst.path(), &archive, "hunter2", true).unwrap();
 }
 
+/// A sender-set message expiry must (a) still verify — proving it's inside the
+/// signed payload, not strippable — (b) be honored on the receiving side, and
+/// (c) get swept once past, while a not-yet-expired message survives.
+#[tokio::test]
+async fn expiring_message_is_signed_honored_and_swept() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+
+    // Already-expired (past absolute expiry).
+    let expired = build_outbound_message(
+        alice.profile(),
+        "bob",
+        "msg",
+        "boom",
+        &alice.onion,
+        Some(1_000),
+    )
+    .unwrap();
+    let events = deliver(&bob, &serde_json::to_string(&expired).unwrap()).await;
+    assert!(
+        events[0].2,
+        "an expiring message must still verify (expiry is signed, not strippable)"
+    );
+    assert!(
+        load_history(bob.profile(), Some("alice"), 50)
+            .unwrap()
+            .iter()
+            .all(|r| r.body != "boom"),
+        "an already-expired message must be swept from history"
+    );
+
+    // Future expiry survives.
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 3_600_000;
+    let live = build_outbound_message(
+        alice.profile(),
+        "bob",
+        "msg",
+        "keep me",
+        &alice.onion,
+        Some(future),
+    )
+    .unwrap();
+    deliver(&bob, &serde_json::to_string(&live).unwrap()).await;
+    assert!(
+        load_history(bob.profile(), Some("alice"), 50)
+            .unwrap()
+            .iter()
+            .any(|r| r.body == "keep me"),
+        "a not-yet-expired message must remain"
+    );
+}
+
 /// A file sent to a group must be filed under the group conversation on the
 /// receiving side, not as a 1:1 PM (regression: group files showed up as PMs).
 #[tokio::test]
@@ -279,8 +338,15 @@ async fn group_inline_file_lands_in_group_not_pm() {
         "group_title": "Homies",
     })
     .to_string();
-    let msg =
-        build_outbound_message(alice.profile(), "bob", "file_inline", &inline_json, "").unwrap();
+    let msg = build_outbound_message(
+        alice.profile(),
+        "bob",
+        "file_inline",
+        &inline_json,
+        "",
+        None,
+    )
+    .unwrap();
     let line = serde_json::to_string(&msg).unwrap();
 
     let contacts = load_contacts(bob.profile()).unwrap();

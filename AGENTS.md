@@ -166,12 +166,21 @@ instead of showing up as 1:1 PMs (file offer/chunk/inline payloads carry
 optional group context; `store_file_message` helper routes them).
 
 **Open / backlog (roughly prioritized):**
-1. **Disappearing / expiring messages** (requested). Default OFF; allow adding a
-   TTL to individual messages and to group messages. Sketch: an `expires_at_ms`
-   column on `messages`, carried in the wire payload so the recipient expires it
-   too; a periodic sweep (and on-load filter) that deletes expired rows; UI to
-   set a default/per-message expiry. The `ChatMessage`/group payload and
-   `store_message*` are the seams. Started nothing yet.
+1. **Disappearing / expiring messages** — MECHANISM DONE, send-side UX next.
+   Done: signed `expires_at_ms` on `ChatMessage` (in `payload_to_sign`, so a
+   relay can't strip it; backward-compatible via serde default); `expires_at_ms`
+   column on `messages` + `conversation_expiry(kind,id,ttl_ms)` table;
+   `store_message_for_conversation_expiring` + `purge_expired_messages` (called
+   in `load_history`); inbound honors the sender's expiry. Test:
+   `expiring_message_is_signed_honored_and_swept`.
+   NEXT (send side, per confirmed design — absolute TTL, sender-enforced,
+   per-conversation default + per-message override, default OFF): thread a TTL
+   through `send_in_conversation` (and its callers / the retry queue, which must
+   preserve expiry) and `send_group`; `build_outbound_message` already takes the
+   arg. Add get/set for the `conversation_expiry` default; CLI (`send --expire`,
+   `expiry --set/--off`); GUI (per-conversation default + per-message override).
+   Also add a periodic sweep in `serve` (currently only purged on history load).
+   FUTURE (noted, not started): Android `FLAG_SECURE` to block screenshots.
 2. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
 3. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
 3. After an in-app import, the running listener still holds the old identity —

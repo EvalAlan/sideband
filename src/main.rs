@@ -429,6 +429,11 @@ pub struct ChatMessage {
     /// v3+: Ratchet ciphertext, hex.
     #[serde(default)]
     ratchet_ct_hex: String,
+    /// Optional sender-set absolute expiry (ms since epoch). When present the
+    /// message is deleted on both ends at/after this time. Signed (see
+    /// payload_to_sign) so a relay can't strip it. Absent = never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<u128>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1190,6 +1195,7 @@ pub(crate) fn build_outbound_message(
     message_type: &str,
     plaintext: &str,
     sender_onion: &str,
+    expires_at_ms: Option<u128>,
 ) -> Result<ChatMessage> {
     let key = load_signing_key(profile)?;
     let our_ed25519_pub = B64.encode(key.verifying_key().to_bytes());
@@ -1225,6 +1231,7 @@ pub(crate) fn build_outbound_message(
             ratchet_header_b64: header_b64,
             ratchet_nonce_hex: nonce_hex,
             ratchet_ct_hex: ct_hex,
+            expires_at_ms,
         };
         sign_message(&key, &mut sign_msg)?;
         sign_msg.body.clear();
@@ -1244,6 +1251,7 @@ pub(crate) fn build_outbound_message(
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
+            expires_at_ms,
         };
         sign_message(&key, &mut msg)?;
         let our_x25519 = load_x25519_secret(profile)?;
@@ -1272,6 +1280,7 @@ async fn send_typed_message(
         message_type,
         plaintext,
         &sender_onion,
+        None, // file/ack packets don't expire
     )?;
 
     let payload = format!("{}\n", serde_json::to_string(&msg)?);
@@ -1488,6 +1497,26 @@ fn init_db(profile: &Path) -> Result<Connection> {
         "UPDATE messages SET conversation_id = contact WHERE conversation_id = ''",
         [],
     )?;
+    // Disappearing messages: absolute expiry (0 = never), plus a per-conversation
+    // default TTL. A sender-set expiry is carried in the signed wire message.
+    ensure_message_column(
+        &conn,
+        "expires_at_ms",
+        "ALTER TABLE messages ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at_ms)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS conversation_expiry (
+            conversation_kind TEXT NOT NULL,
+            conversation_id   TEXT NOT NULL,
+            ttl_ms            INTEGER NOT NULL,
+            PRIMARY KEY (conversation_kind, conversation_id)
+        )",
+        [],
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_kind, conversation_id)",
         [],
@@ -1695,10 +1724,40 @@ pub(crate) fn store_message_for_conversation(
     conversation_kind: &str,
     conversation_id: &str,
 ) -> Result<()> {
+    store_message_for_conversation_expiring(
+        profile,
+        direction,
+        contact,
+        onion,
+        body,
+        timestamp_ms,
+        status,
+        conversation_kind,
+        conversation_id,
+        None,
+    )
+}
+
+/// Like [`store_message_for_conversation`] but with an optional absolute expiry
+/// (ms since epoch; `None` = never). Expired rows are pruned by
+/// [`purge_expired_messages`] and hidden by [`load_history`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn store_message_for_conversation_expiring(
+    profile: &Path,
+    direction: &str,
+    contact: &str,
+    onion: &str,
+    body: &str,
+    timestamp_ms: u128,
+    status: DeliveryStatus,
+    conversation_kind: &str,
+    conversation_id: &str,
+    expires_at_ms: Option<u128>,
+) -> Result<()> {
     let conn = init_db(profile)?;
     conn.execute(
-        "INSERT INTO messages (direction, contact, onion, body, timestamp_ms, status, conversation_kind, conversation_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO messages (direction, contact, onion, body, timestamp_ms, status, conversation_kind, conversation_id, expires_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             direction,
             contact,
@@ -1708,9 +1767,21 @@ pub(crate) fn store_message_for_conversation(
             status.as_i64(),
             conversation_kind,
             conversation_id,
+            expires_at_ms.map(|v| v as i64).unwrap_or(0),
         ],
     )?;
     Ok(())
+}
+
+/// Delete messages whose absolute expiry has passed. Returns the count removed.
+pub(crate) fn purge_expired_messages(profile: &Path) -> Result<usize> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    let conn = init_db(profile)?;
+    let n = conn.execute(
+        "DELETE FROM messages WHERE expires_at_ms > 0 AND expires_at_ms <= ?1",
+        params![now],
+    )?;
+    Ok(n)
 }
 
 /// Enqueue a failed outbound message for retry. Returns the queue ID.
@@ -1860,6 +1931,8 @@ pub(crate) fn load_history(
     contact_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<HistoryRow>> {
+    // Never surface expired messages, and prune them while we're here.
+    let _ = purge_expired_messages(profile);
     let conn = init_db(profile)?;
 
     if let Some(c) = contact_filter {
@@ -3739,6 +3812,11 @@ fn payload_to_sign(msg: &ChatMessage) -> Result<String> {
         body: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         ratchet_header_b64: String,
+        // Signed so a sender-set expiry can't be stripped in transit. Skipped
+        // when absent, keeping the signed bytes byte-identical to pre-expiry
+        // messages (old peers and stored messages still verify).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u128>,
     }
     let p = Payload {
         v: msg.v,
@@ -3750,6 +3828,7 @@ fn payload_to_sign(msg: &ChatMessage) -> Result<String> {
         timestamp_ms: msg.timestamp_ms,
         body: msg.body.clone(),
         ratchet_header_b64: msg.ratchet_header_b64.clone(),
+        expires_at_ms: msg.expires_at_ms,
     };
     Ok(serde_json::to_string(&p)?)
 }
@@ -5210,6 +5289,9 @@ pub(crate) async fn send_in_conversation(
             ratchet_header_b64: header_b64,
             ratchet_nonce_hex: nonce_hex,
             ratchet_ct_hex: ct_hex,
+            // TODO(expiry): thread a per-message/conversation TTL through this
+            // send path; the wire + storage already honor expires_at_ms.
+            expires_at_ms: None,
         };
         sign_message(&key, &mut sign_msg)?;
         sign_msg.body.clear(); // Don't send plaintext on wire.
@@ -5230,6 +5312,7 @@ pub(crate) async fn send_in_conversation(
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
+            expires_at_ms: None, // TODO(expiry): thread TTL through this send path.
         };
         sign_message(&key, &mut msg)?;
         let our_x25519 = load_x25519_secret(profile)?;
@@ -5465,6 +5548,7 @@ mod tests {
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
+            expires_at_ms: None,
         };
         sign_message(&alice_key, &mut msg).unwrap();
         msg.enc_body = encrypt_body(&shared, "hello first-contact").unwrap();
@@ -5981,6 +6065,7 @@ mod tests {
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
+            expires_at_ms: None,
         };
 
         sign_message(&signing, &mut msg).unwrap();
@@ -6021,6 +6106,7 @@ mod tests {
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
+            expires_at_ms: None,
         };
 
         sign_message(&signing, &mut msg).unwrap();
@@ -6061,6 +6147,7 @@ mod tests {
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
+            expires_at_ms: None,
         };
         sign_message(&signing, &mut msg).unwrap();
 
@@ -6086,6 +6173,7 @@ mod tests {
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
+            expires_at_ms: None,
         };
         let payload = payload_to_sign(&msg).unwrap();
         let val: serde_json::Value = serde_json::from_str(&payload).unwrap();
@@ -6409,6 +6497,7 @@ fn first_v3_message_auto_initializes_receiver_ratchet() {
         ratchet_header_b64: header_b64,
         ratchet_nonce_hex: nonce_hex,
         ratchet_ct_hex: ct_hex,
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut msg).unwrap();
     msg.body.clear();
@@ -6482,6 +6571,7 @@ fn receiver_can_send_first_reply_after_ratchet_restart() {
         ratchet_header_b64: header_b64,
         ratchet_nonce_hex: nonce_hex,
         ratchet_ct_hex: ct_hex,
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut first_msg).unwrap();
     first_msg.body.clear();
@@ -6524,6 +6614,7 @@ fn receiver_can_send_first_reply_after_ratchet_restart() {
         ratchet_header_b64: reply_header,
         ratchet_nonce_hex: reply_nonce,
         ratchet_ct_hex: reply_ct,
+        expires_at_ms: None,
     };
     sign_message(&bob_key, &mut reply_msg).unwrap();
     reply_msg.body.clear();
@@ -6567,6 +6658,7 @@ fn receiver_can_send_first_reply_after_ratchet_restart() {
         ratchet_header_b64: followup_header,
         ratchet_nonce_hex: followup_nonce,
         ratchet_ct_hex: followup_ct,
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut followup_msg).unwrap();
     followup_msg.body.clear();
@@ -6637,6 +6729,7 @@ fn both_sides_can_send_after_restart_before_receiving_peer_message() {
         ratchet_header_b64: h,
         ratchet_nonce_hex: n,
         ratchet_ct_hex: c,
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut initial).unwrap();
     initial.body.clear();
@@ -6685,6 +6778,7 @@ fn both_sides_can_send_after_restart_before_receiving_peer_message() {
         ratchet_header_b64: ah,
         ratchet_nonce_hex: an,
         ratchet_ct_hex: ac,
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut alice_msg).unwrap();
     alice_msg.body.clear();
@@ -6702,6 +6796,7 @@ fn both_sides_can_send_after_restart_before_receiving_peer_message() {
         ratchet_header_b64: bh,
         ratchet_nonce_hex: bn,
         ratchet_ct_hex: bc,
+        expires_at_ms: None,
     };
     sign_message(&bob_key, &mut bob_msg).unwrap();
     bob_msg.body.clear();
@@ -6782,6 +6877,7 @@ fn duplicate_old_ratchet_message_does_not_poison_state() {
         ratchet_header_b64: h1,
         ratchet_nonce_hex: n1,
         ratchet_ct_hex: c1,
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut first_msg).unwrap();
     first_msg.body.clear();
@@ -6816,6 +6912,7 @@ fn duplicate_old_ratchet_message_does_not_poison_state() {
         ratchet_header_b64: bh,
         ratchet_nonce_hex: bn,
         ratchet_ct_hex: bc,
+        expires_at_ms: None,
     };
     sign_message(&bob_key, &mut reply_msg).unwrap();
     reply_msg.body.clear();
@@ -6859,6 +6956,7 @@ fn duplicate_old_ratchet_message_does_not_poison_state() {
         ratchet_header_b64: h2,
         ratchet_nonce_hex: n2,
         ratchet_ct_hex: c2,
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut after_dup).unwrap();
     after_dup.body.clear();
@@ -6935,6 +7033,7 @@ fn inbound_v3_recovers_from_simultaneous_manual_ratchet_init() {
         ratchet_header_b64: header_b64,
         ratchet_nonce_hex: nonce_hex,
         ratchet_ct_hex: ct_hex,
+        expires_at_ms: None,
     };
     sign_message(&bob_key, &mut msg).unwrap();
     msg.body.clear();
@@ -7318,6 +7417,7 @@ fn build_v2_wire(alice_dir: &std::path::Path, bob_dir: &std::path::Path, message
         ratchet_header_b64: String::new(),
         ratchet_nonce_hex: String::new(),
         ratchet_ct_hex: String::new(),
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut msg).unwrap();
     msg.body.clear();
@@ -7392,6 +7492,7 @@ fn int_v3_ratchet_message_e2e_stores_in_sqlite() {
         ratchet_header_b64: header_b64,
         ratchet_nonce_hex: nonce_hex,
         ratchet_ct_hex: ct_hex,
+        expires_at_ms: None,
     };
     sign_message(&alice_key, &mut msg).unwrap();
     msg.body.clear();
@@ -7454,6 +7555,7 @@ fn int_v2_unknown_sender_fails_decrypt() {
         ratchet_header_b64: String::new(),
         ratchet_nonce_hex: String::new(),
         ratchet_ct_hex: String::new(),
+        expires_at_ms: None,
     };
     sign_message(&eve_key, &mut msg).unwrap();
     msg.body.clear();

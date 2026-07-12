@@ -16,9 +16,9 @@ use crate::transport::tor::TorTransport;
 use crate::{
     contact_is_blocked, decrypt_and_verify, discover_or_update_group,
     resolve_contact_name_by_pubkey, send_typed_message, store_message,
-    store_message_for_conversation, ChatMessage, ContactsMap, DeliveryStatus, FileAckPayload,
-    FileChunkPayload, FileInlinePayload, FileOfferPayload, GroupMessagePayload, IncomingFileState,
-    TuiEvent,
+    store_message_for_conversation, store_message_for_conversation_expiring, ChatMessage,
+    ContactsMap, DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload,
+    FileOfferPayload, GroupMessagePayload, IncomingFileState, TuiEvent,
 };
 
 /// Parse a raw inbound line into a [`ChatMessage`].
@@ -118,6 +118,7 @@ pub(crate) async fn handle_text_message(
         &body_for_display,
         msg.timestamp_ms,
         verified,
+        msg.expires_at_ms,
     )
     .await?;
 
@@ -130,6 +131,7 @@ pub(crate) async fn handle_text_message(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_inbound_chat_plaintext(
     profile: &Path,
     tui_tx: &mpsc::Sender<TuiEvent>,
@@ -137,6 +139,7 @@ pub(crate) async fn record_inbound_chat_plaintext(
     plaintext: &str,
     timestamp_ms: u128,
     verified: bool,
+    expires_at_ms: Option<u128>,
 ) -> Result<()> {
     let status = if verified {
         DeliveryStatus::Delivered
@@ -156,7 +159,7 @@ pub(crate) async fn record_inbound_chat_plaintext(
             contact_name,
             &payload.members,
         )?;
-        store_message_for_conversation(
+        store_message_for_conversation_expiring(
             profile,
             "in",
             contact_name,
@@ -166,6 +169,7 @@ pub(crate) async fn record_inbound_chat_plaintext(
             status,
             "group",
             &group.id,
+            expires_at_ms,
         )?;
         let _ = tui_tx
             .send(TuiEvent::InboundGroupMessage {
@@ -180,7 +184,7 @@ pub(crate) async fn record_inbound_chat_plaintext(
         return Ok(());
     }
 
-    store_message(
+    store_message_for_conversation_expiring(
         profile,
         "in",
         contact_name,
@@ -188,6 +192,9 @@ pub(crate) async fn record_inbound_chat_plaintext(
         plaintext,
         timestamp_ms,
         status,
+        "contact",
+        contact_name,
+        expires_at_ms,
     )?;
 
     let _ = tui_tx
@@ -883,7 +890,7 @@ mod group_chat_tests {
         })
         .to_string();
 
-        record_inbound_chat_plaintext(dir.path(), &tx, "alice", &payload, 123, true)
+        record_inbound_chat_plaintext(dir.path(), &tx, "alice", &payload, 123, true, None)
             .await
             .unwrap();
 
@@ -953,7 +960,7 @@ mod group_chat_tests {
         })
         .to_string();
 
-        record_inbound_chat_plaintext(dir.path(), &tx, "stranger", &payload, 456, false)
+        record_inbound_chat_plaintext(dir.path(), &tx, "stranger", &payload, 456, false, None)
             .await
             .unwrap();
 
