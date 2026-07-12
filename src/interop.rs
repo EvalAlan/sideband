@@ -178,6 +178,38 @@ fn contact_add_accepts_standard_base64_keys() {
     assert_eq!(contacts.get("Rocky").unwrap().pubkey_b64, ED);
 }
 
+/// Issue 2 (real cause): a `/add` line whose two 44-char base64 keys got
+/// concatenated (space lost copying wrapped terminal output) must be recovered
+/// into two separate keys so the contact still adds.
+#[test]
+fn recover_add_key_fields_splits_concatenated_keys() {
+    let ed = "fLo7TRtqCxE2wtjTvNvUJjRDBewhYV7bkW3P/F/451w=";
+    let x = "K4+eWfSYw8TtmsViirLxsNs7zAWzKQ/YtJtQFVcncUk=";
+    let concatenated = format!("{ed}{x}"); // 88 chars, no space
+    let fields = crate::recover_add_key_fields(vec![
+        "Rocky".to_string(),
+        "example.onion".to_string(),
+        concatenated,
+    ]);
+    assert_eq!(
+        fields.len(),
+        4,
+        "concatenated keys must be split back into two"
+    );
+    assert_eq!(fields[2], ed);
+    assert_eq!(fields[3], x);
+
+    // A well-formed 4-field line is left untouched.
+    let ok = crate::recover_add_key_fields(vec![
+        "Rocky".to_string(),
+        "example.onion".to_string(),
+        ed.to_string(),
+        x.to_string(),
+    ]);
+    assert_eq!(ok.len(), 4);
+    assert_eq!(ok[2], ed);
+}
+
 /// A v3 double-ratchet message (after /ratchet) must decrypt and verify on the
 /// receiving side.
 #[tokio::test]

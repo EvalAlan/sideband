@@ -16,6 +16,17 @@ void main() {
     expect(c.x25519Pubkey, 'K4+eWfSYw8TtmsViirLxsNs7zAWzKQ/YtJtQFVcncUk=');
   });
 
+  test('parseAddCommandContact recovers keys concatenated by a lost space', () {
+    // The space between the two 44-char keys is gone (wrapped-copy artifact).
+    const line =
+        '/add Rocky qdnx34k2b3fzp3umv7ryvzxtbzjluzkvuvqixvuooy43b5n6lddaspid.onion '
+        'UyLPBmDO9XHwOrbYei96QQjIozjEhxa42OuCPxmS+m0=djg7VKfYC9n8onjPu4b7opLPRDjKA4URhyTf7Xd3hCw=';
+    final c = parseAddCommandContact(line);
+    expect(c, isNotNull);
+    expect(c!.pubkey, 'UyLPBmDO9XHwOrbYei96QQjIozjEhxa42OuCPxmS+m0=');
+    expect(c.x25519Pubkey, 'djg7VKfYC9n8onjPu4b7opLPRDjKA4URhyTf7Xd3hCw=');
+  });
+
   test('contact security label shows ratchet as strongest state', () {
     const contact = Contact(
       name: 'bob',

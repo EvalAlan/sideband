@@ -3177,6 +3177,21 @@ pub fn save_contacts(profile: &Path, contacts: &ContactsMap) -> Result<()> {
     Ok(())
 }
 
+/// Recover the trailing fields of a `/add` line, tolerating a lost space between
+/// the two 44-char base64 keys — which happens when a user copies a `/add` line
+/// out of wrapped terminal output and the space at the wrap point is dropped,
+/// concatenating the ed25519 and x25519 keys into one 88-char token.
+///
+/// `fields` is the tokens after the `add` keyword: `[name, onion, key, key?]`.
+pub(crate) fn recover_add_key_fields(mut fields: Vec<String>) -> Vec<String> {
+    if fields.len() == 3 && fields[2].len() == 88 && fields[2].is_ascii() {
+        let blob = fields.pop().unwrap();
+        fields.push(blob[..44].to_string());
+        fields.push(blob[44..].to_string());
+    }
+    fields
+}
+
 pub fn validate_contact_fields(
     onion: &str,
     pubkey_b64: &str,

@@ -360,7 +360,18 @@ class Contact {
 Contact? parseAddCommandContact(String raw) {
   final trimmed = raw.trim();
   if (!trimmed.startsWith('/add ')) return null;
-  final parts = trimmed.split(RegExp(r'\s+'));
+  var parts = trimmed.split(RegExp(r'\s+'));
+  // Recover a line whose two 44-char base64 keys got concatenated into one
+  // 88-char token because a space was lost copying wrapped terminal output.
+  if (parts.length == 4 && parts[3].length == 88) {
+    parts = [
+      parts[0],
+      parts[1],
+      parts[2],
+      parts[3].substring(0, 44),
+      parts[3].substring(44),
+    ];
+  }
   if (parts.length < 5) return null;
   return Contact(
     name: parts[1],
@@ -3399,30 +3410,33 @@ class _ChatScreenState extends State<_ChatScreen>
               'You (self)\n\n$lines');
           return;
         case 'add':
-          if (parts.length < 5) {
+          // Route through the shared parser so it recovers keys concatenated by
+          // a lost space when pasting a wrapped /add line.
+          final add = parseAddCommandContact(raw);
+          if (add == null) {
             throw Exception(
                 'usage: /add <name> <onion> <ed25519_pubkey_b64> <x25519_pubkey_b64>');
           }
           if (_canUseMobileBackend && _mobile != null) {
             await _mobile!.addContact(
-              name: parts[1],
-              onion: parts[2],
-              pubkey: parts[3],
-              x25519Pubkey: parts[4],
+              name: add.name,
+              onion: add.onion,
+              pubkey: add.pubkey,
+              x25519Pubkey: add.x25519Pubkey,
             );
           } else {
             await _cli.addContact(
-              name: parts[1],
-              onion: parts[2],
-              pubkey: parts[3],
-              x25519Pubkey: parts[4],
+              name: add.name,
+              onion: add.onion,
+              pubkey: add.pubkey,
+              x25519Pubkey: add.x25519Pubkey,
             );
           }
           final updatedContact = Contact(
-            name: parts[1],
-            onion: parts[2],
-            pubkey: parts[3],
-            x25519Pubkey: parts[4],
+            name: add.name,
+            onion: add.onion,
+            pubkey: add.pubkey,
+            x25519Pubkey: add.x25519Pubkey,
             ratchetActive: false,
           );
           if (mounted) {

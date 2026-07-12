@@ -439,7 +439,7 @@ impl App {
                 }
                 Some("help") => {
                     self.push_sys(
-                        "/send <contact> <msg>  — send direct message\\n/group <id-or-title> <msg> — send group message\\n/group-create <title> <member> [member...] — create group\\n/group-delete <id-or-title> — delete group\\n/group-leave <id-or-title> — leave group\\n/group-rename <id-or-title> <new-title> — rename group\\n/group-add <id-or-title> <member> — add group member\\n/group-remove <id-or-title> <member> — remove group member\\n/file <contact> <path> — send file\\n/file <contact|group> <path> — send file to contact or group\\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\\n/history [contact] — show log\\n/history-group <id-or-title> — show group log\\n/contacts — list contacts with keys\\n/groups — list groups\\n/who — show members of selected group\\n/add <name> <onion> <ed25519_pk> <x25519_pk>\\n/delete <contact> — remove contact\\n/name [display-name] — show or set your name\\n/whoami — show identity keys\\n/share  — one-liner for sharing\\n/onion  — show onion address\\n/emoji  — show common emoji shortcuts\\n/ratchet <contact> — init double ratchet\\n/status  — full status\\n/clear  — clear messages\\n/quit   — exit",
+                        "/send <contact> <msg>  — send direct message\\n/group <id-or-title> <msg> — send group message\\n/group-create <title> <member> [member...] — create group\\n/group-delete <id-or-title> — delete group\\n/group-leave <id-or-title> — leave group\\n/group-rename <id-or-title> <new-title> — rename group\\n/group-add <id-or-title> <member> — add group member\\n/group-remove <id-or-title> <member> — remove group member\\n/file <contact> <path> — send file\\n/file <contact|group> <path> — send file to contact or group\\n/transfers [cancel <hash>|resume <hash>] — list/manage transfers\\n/history [contact] — show log\\n/history-group <id-or-title> — show group log\\n/contacts — list contacts with keys\\n/groups — list groups\\n/who — show members of selected group\\n/add <name> <onion> <ed25519_pk> <x25519_pk>\\n/accept <contact> — accept a pending contact so you can reply\\n/delete <contact> — remove contact\\n/name [display-name] — show or set your name\\n/whoami — show identity keys\\n/share  — one-liner for sharing\\n/onion  — show onion address\\n/emoji  — show common emoji shortcuts\\n/ratchet <contact> — init double ratchet\\n/status  — full status\\n/clear  — clear messages\\n/quit   — exit",
                         "help",
                     );
                     return false;
@@ -478,18 +478,23 @@ impl App {
                         self.push_sys("usage: /add <contact> <onion> <pubkey>", "error");
                         return false;
                     }
-                    let add_parts: Vec<&str> = command.splitn(5, ' ').collect();
-                    if add_parts.len() < 5 {
+                    // Split on any whitespace and recover keys that got
+                    // concatenated by a lost space when pasting a wrapped line.
+                    let toks: Vec<&str> = command.split_whitespace().collect();
+                    let fields = crate::recover_add_key_fields(
+                        toks[1..].iter().map(|s| s.to_string()).collect(),
+                    );
+                    if fields.len() < 4 {
                         self.push_sys(
                             "usage: /add <name> <onion> <ed25519_pubkey_b64> <x25519_pubkey_b64>",
                             "error",
                         );
                         return false;
                     }
-                    let name = add_parts[1].to_string();
-                    let onion = add_parts[2].to_string();
-                    let pubkey = add_parts[3].to_string();
-                    let x25519_pubkey = add_parts[4].to_string();
+                    let name = fields[0].clone();
+                    let onion = fields[1].clone();
+                    let pubkey = fields[2].clone();
+                    let x25519_pubkey = fields[3].clone();
                     match crate::contact_add(&self.profile, &name, &onion, &pubkey, &x25519_pubkey)
                     {
                         Ok(()) => {
@@ -498,6 +503,29 @@ impl App {
                         }
                         Err(e) => {
                             self.push_sys(&format!("add failed: {}", e), "error");
+                        }
+                    }
+                    return false;
+                }
+                Some("accept") => {
+                    if parts.len() < 2 {
+                        self.push_sys("usage: /accept <contact>", "error");
+                        return false;
+                    }
+                    let name = parts[1].trim().to_string();
+                    match crate::contact_accept(&self.profile, &name) {
+                        Ok(true) => {
+                            self.reload_contacts();
+                            self.push_sys(
+                                &format!("contact '{}' accepted — you can now reply", name),
+                                "info",
+                            );
+                        }
+                        Ok(false) => {
+                            self.push_sys(&format!("contact '{}' not found", name), "error");
+                        }
+                        Err(e) => {
+                            self.push_sys(&format!("accept failed: {}", e), "error");
                         }
                     }
                     return false;
