@@ -97,7 +97,7 @@ run_ui() {
   fi
   if [ -n "$android_device" ]; then
     hr "flutter integration_test on attached Android device/emulator"
-    "$ADB" -s "$android_device" shell pm clear com.example.sideband_gui \
+    "$ADB" -s "$android_device" shell pm clear com.evalalan.sideband \
       >/dev/null 2>&1 || true
     (cd gui && "$FLUTTER" test integration_test -d "$android_device")
   else

@@ -314,7 +314,7 @@ void main() {
   group('attachment path validation', () {
     // The MethodChannel profilePath already ends in .sideband, so the
     // downloads dir is <profile>/downloads.
-    const profile = '/data/user/0/com.example.sideband_gui/files/.sideband';
+    const profile = '/data/user/0/com.evalalan.sideband/files/.sideband';
 
     test('accepts files directly under downloads', () {
       expect(

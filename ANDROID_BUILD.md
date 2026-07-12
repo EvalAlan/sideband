@@ -94,7 +94,7 @@ cd ~/repos/sideband/gui/android
 - **Flutter UI** → Dart calls `libsideband.so` directly via `dart:ffi` (see `gui/lib/main.dart` `_MobileApi`)
 - **Kotlin helpers** → MethodChannel ("sideband/native") provides profilePath, openFile, foreground-service, and notification support
 - **Rust** → Runs same `sideband` logic (contacts, messages, Tor via Arti)
-- **Profile dir** → Uses app-specific directory: `/data/user/0/com.example.sideband_gui/files/.sideband`
+- **Profile dir** → Uses app-specific directory: `/data/user/0/com.evalalan.sideband/files/.sideband`
 - **Foreground Service** → Keeps Tor listener active in background (see `ListenerForegroundService.kt`)
 
 ---
@@ -146,16 +146,16 @@ debug key. Debug builds always use the debug key.
 - `CN=Android Debug` → still the debug fallback (no `key.properties`, or it was ignored).
 - Your own DN → signed with your release key.
 
-### ⚠️ applicationId — do not change without a migration plan
+### applicationId — migrated to `com.evalalan.sideband`
 
-The `applicationId` is deliberately still `com.example.sideband_gui`. It is part
-of Android's per-app storage path (`filesDir`), where the Tor identity
-(`identity.toml`), ratchet state, and message history live. Changing it makes
-Android treat the app as brand new: **existing installs lose access to their Tor
-identity and conversation history** rather than being migrated. Decide this
-deliberately, paired with a data export/migration story, before first public
-release. Use Play Store internal-testing tracks to validate signed builds
-without changing the ID.
+The `applicationId` was migrated from the Flutter-template default
+`com.example.sideband_gui` to `com.evalalan.sideband` (matching the desktop app)
+before public release. The id is part of Android's per-app storage path
+(`filesDir`), where the Tor identity (`identity.toml`), ratchet state, and
+message history live, so **any pre-migration install keeps its own separate data
+under the old id** — it appears as a different app. Move that data over with
+`sideband export` / `sideband import` (encrypted profile archive). Do not change
+the id again without another export/import migration for existing users.
 
 ## Next Steps for Production
 

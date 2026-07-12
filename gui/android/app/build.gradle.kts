@@ -19,7 +19,7 @@ if (hasReleaseSigningConfig) {
 }
 
 android {
-    namespace = "com.example.sideband_gui"
+    namespace = "com.evalalan.sideband"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -29,19 +29,13 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID
-        // (https://developer.android.com/studio/build/application-id.html).
-        //
-        // Left as com.example.sideband_gui deliberately for now -- do NOT change this without
-        // a deliberate migration plan. The applicationId is part of Android's per-app storage
-        // path (filesDir), which is where the Tor identity (identity.toml), ratchet state, and
-        // message history live (see MainActivity.profilePath / src/main.rs). Changing it is
-        // effectively creating a new, empty app from Android's point of view: existing installs
-        // would lose access to their existing Tor identity and conversation history rather than
-        // being migrated. That's an intentional decision for the app owner to make (and pair
-        // with an explicit data-migration/export story), not something to change incidentally
-        // here.
-        applicationId = "com.example.sideband_gui"
+        // The applicationId is part of Android's per-app storage path (filesDir),
+        // where the Tor identity, ratchet state, and message history live. It was
+        // migrated from the com.example.* Flutter-template default to this real id
+        // before public release; existing pre-migration installs keep their own
+        // (old) data and can move over with `sideband export` / `import`. Do not
+        // change it again without another export/import migration story.
+        applicationId = "com.evalalan.sideband"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

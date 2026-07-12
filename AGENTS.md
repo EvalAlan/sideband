@@ -154,15 +154,15 @@ unified `build.sh`; **Android release-signing scaffolding** (`key.properties`
 loading with debug fallback in `build.gradle.kts`, committed
 `key.properties.example` template, gitignored secrets, and generation +
 verification docs in ANDROID_BUILD.md; signing wiring verified end-to-end with a
-throwaway keystore).
+throwaway keystore); **encrypted profile export/import** (`sideband export` /
+`import`, Argon2id + ChaCha20-Poly1305) for backup and migration; **Android
+`applicationId` migrated** `com.example.sideband_gui` → `com.evalalan.sideband`
+(Kotlin package moved too; APK id verified via aapt).
 
 **Open / backlog (roughly prioritized):**
-1. **`applicationId` decision — needs the owner (Alan).** Signing is scaffolded
-   and works; the remaining, deliberately-unmade decision is whether to keep
-   `com.example.sideband_gui` or migrate to a real id (e.g. `com.evalalan.sideband`,
-   which the desktop already uses). Changing it orphans existing Android installs'
-   Tor identity + history (it's part of `filesDir`), so it must be paired with a
-   data export/migration story and made before first public release — do not
-   change it silently. See ANDROID_BUILD.md → "applicationId".
+1. **Wire export/import into the GUIs.** The core + CLI are done; add
+   `sideband_api_export_profile` / `_import_profile` FFI and Settings items
+   ("Export profile" / "Import profile" with a file picker + passphrase) so
+   Android/desktop users can back up and migrate from the app, not just the CLI.
 2. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
 3. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.

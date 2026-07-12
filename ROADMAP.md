@@ -70,7 +70,7 @@ If Bluetooth/Wi-Fi parity with Briar is a hard definition of 1.0, move the optio
 10. Storage has ad hoc migrations but no explicit profile/schema version, migration transaction, backup, or newer-version rejection.
 11. `test_e2e.sh` targets the old system-Tor/profile layout and does not assert a real current Arti exchange.
 12. CI builds AppImages but does not run the complete fast gate, and there is no PR workflow or signed release workflow.
-13. Android still uses `com.example.sideband_gui`; release builds can fall back to debug signing.
+13. Android still uses `com.evalalan.sideband`; release builds can fall back to debug signing.
 14. Product onboarding, safety-number verification, key-change handling, backup/restore, notification privacy, and lifecycle tests are incomplete.
 
 ## Architecture direction
@@ -385,8 +385,8 @@ Acceptance tests:
 Likely files:
 
 - `gui/lib/main.dart`
-- `gui/android/app/src/main/kotlin/com/example/sideband_gui/ListenerForegroundService.kt`
-- `gui/android/app/src/main/kotlin/com/example/sideband_gui/MainActivity.kt`
+- `gui/android/app/src/main/kotlin/com/evalalan/sideband/ListenerForegroundService.kt`
+- `gui/android/app/src/main/kotlin/com/evalalan/sideband/MainActivity.kt`
 - `gui/android/app/src/main/AndroidManifest.xml`
 - `src/api.rs`
 - `src/app_api.rs`
