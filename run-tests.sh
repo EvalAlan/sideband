@@ -70,7 +70,15 @@ run_fast() {
 run_ui() {
   hr "flutter integration_test on Linux desktop"
   if [ -d gui/integration_test ]; then
-    (cd gui && "$FLUTTER" test integration_test -d linux)
+    (
+      prof="$(mktemp -d)"
+      trap 'rm -rf "$prof"' EXIT
+      ./target/debug/sideband init --profile "$prof" --name UiTest >/dev/null
+      cd gui
+      SIDEBAND_BIN="$SCRIPT_DIR/target/debug/sideband" \
+        SIDEBAND_PROFILE="$prof" \
+        "$FLUTTER" test integration_test -d linux
+    )
   else
     red "gui/integration_test not present yet — skipping UI tier"
   fi

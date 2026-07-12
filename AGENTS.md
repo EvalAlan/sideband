@@ -153,9 +153,10 @@ queue; the `src/interop.rs` test harness + FFI/CLI contract tests + tiered
 **Open / backlog (roughly prioritized):**
 1. **UI-driving test tier** — `gui/integration_test/` driven by Flutter's
    `integration_test` (widget finders, not pixels), on Linux and the emulator.
-   Needs a "skip the Tor listener on launch" test hook so add-contact and
-   message-routing flows run without a 60s bootstrap. This is the gap that let
-   the recent Android-only GUI-glue bugs (group tap, `/add`) slip through.
+   Linux add-contact now runs against an isolated real CLI profile with Tor
+   listener startup disabled. Still needs isolated Android execution plus
+   message-routing/sidebar flows. This is the gap that let the recent
+   Android-only GUI-glue bugs (group tap, `/add`) slip through.
 2. Release hygiene for Android: generate a signing keystore
    (`gui/android/key.properties`) and decide on the `applicationId` (changing it
    from `com.example.sideband_gui` orphans existing installs' identities).

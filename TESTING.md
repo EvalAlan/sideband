@@ -58,7 +58,8 @@ Uses Flutter's `integration_test` (widget-key/text finders, **not** pixel
 coordinates — reliable where `xdotool` is not). The same test runs on
 `-d linux` and, if a device/emulator is attached, `-d android`. This is where
 client-specific glue (message-box routing, sidebar refresh, the add-contact
-dialog) is exercised. *Scaffold pending — see below.*
+dialog) is exercised. The Linux tier currently drives add-contact through the
+real CLI backend with an isolated profile and listener startup disabled.
 
 ### E2E tier (`run-tests.sh e2e`)
 
@@ -75,7 +76,6 @@ never touch `~/.sideband` or each other.
 
 ## Still to add
 
-- `gui/integration_test/` for the UI tier (needs a "skip the Tor listener on
-  launch" test hook so the add-contact / message-routing flows can be driven
-  without bootstrapping Tor).
+- Android UI-driving coverage using an isolated app profile.
+- Message-box routing and sidebar refresh flows in `gui/integration_test/`.
 - A PTY-driven TUI test to complement the ratatui `TestBackend` render tests.

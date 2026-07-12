@@ -286,7 +286,9 @@ Future<void> _initTray() async {
 }
 
 class SidebandApp extends StatefulWidget {
-  const SidebandApp({super.key});
+  const SidebandApp({super.key, this.skipListener = false});
+
+  final bool skipListener;
 
   @override
   State<SidebandApp> createState() => _SidebandAppState();
@@ -304,7 +306,10 @@ class _SidebandAppState extends State<SidebandApp> {
     return MaterialApp(
       title: 'Sideband',
       theme: _buildTheme(_themeDef(_themeName)),
-      home: _ChatScreen(onThemeChanged: _setTheme),
+      home: _ChatScreen(
+        onThemeChanged: _setTheme,
+        skipListener: widget.skipListener,
+      ),
       debugShowCheckedModeBanner: false,
     );
   }
@@ -1839,8 +1844,12 @@ class _DisplayNameDialogState extends State<_DisplayNameDialog> {
 // ── screen ──────────────────────────────────────────────────────────────────
 
 class _ChatScreen extends StatefulWidget {
-  const _ChatScreen({required this.onThemeChanged});
+  const _ChatScreen({
+    required this.onThemeChanged,
+    required this.skipListener,
+  });
   final void Function(String) onThemeChanged;
+  final bool skipListener;
 
   @override
   State<_ChatScreen> createState() => _ChatScreenState();
@@ -1995,7 +2004,7 @@ class _ChatScreenState extends State<_ChatScreen>
         }
         await _cli.initProfile(name.trim());
       }
-      await _startListener();
+      if (!widget.skipListener) await _startListener();
       await _load();
       _poll ??= Timer.periodic(const Duration(seconds: 6), (_) {
         _refresh();
@@ -2056,7 +2065,7 @@ class _ChatScreenState extends State<_ChatScreen>
       }
     }
     if (!await _loadMobile()) return;
-    await _startMobileListener();
+    if (!widget.skipListener) await _startMobileListener();
     _poll ??= Timer.periodic(const Duration(seconds: 6), (_) {
       _refresh();
       _queryRetryStatus();
@@ -5002,7 +5011,7 @@ class _ChatScreenState extends State<_ChatScreen>
   // ── sidebar ──────────────────────────────────────────────────────────────
 
   Widget _sidebar() {
-    return Container(
+    return Material(
       color: _t.surface,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
