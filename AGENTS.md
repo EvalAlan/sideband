@@ -73,6 +73,29 @@ contact/group/message-attribution regressions get caught. See `TESTING.md`.
 
 ---
 
+## Working economically (model & subagent economy)
+
+Whoever is driving — Claude, Codex, or Hermes — should match the tool to the job.
+This is a real cost lever; think about it before defaulting to "top model,
+everything inline" or "spawn a subagent for each thing."
+
+- **Tier the model to task difficulty.** Use a cheap/fast model (or fast mode)
+  for mechanical work — builds, formatting, running tests, doc edits, routine
+  wiring. Reserve the strongest model for hard reasoning — crypto/security
+  review, architecture, subtle bugs. Don't run grind on the top model, and don't
+  reason about the ratchet on the cheap one.
+- **Prefer inline; fan out only when it's genuinely parallel.** Spawning a
+  subagent starts it *cold* — it re-derives context the driver already holds — so
+  it costs **more** for a single linear task. Reach for subagents only for
+  independent, parallel work (e.g. several unrelated reviews or searches at
+  once), and give each one a model matched to its slice.
+- Mechanisms differ, principle doesn't: Claude Code spawns Task subagents with a
+  per-subagent model; Hermes has the subagent-driven-development skill; Codex
+  picks one model per session (pick a strong model for reasoning-heavy backlog
+  items, a cheaper one for grind).
+
+---
+
 ## Handoff protocol (read this before you stop OR start)
 
 **Before you stop** (especially when about to hit a rate limit):
