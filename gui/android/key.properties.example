@@ -1,0 +1,24 @@
+# Template for release signing. Copy this file to `key.properties` in this same
+# directory (gui/android/) and fill in real values.
+#
+#   cp key.properties.example key.properties
+#
+# `key.properties` is gitignored and must NEVER be committed. Keep the keystore
+# itself OUTSIDE the repository (e.g. under ~/keys/) so it can't be accidentally
+# staged; *.jks / *.keystore are gitignored too, but out-of-tree is safest.
+#
+# Generate a keystore once:
+#   keytool -genkeypair -v \
+#     -keystore ~/keys/sideband-release.jks \
+#     -alias sideband -keyalg RSA -keysize 4096 -validity 10000
+#
+# When key.properties is present, `./build.sh android` / Gradle sign the release
+# build with it. When absent, release builds fall back to the debug key (fine for
+# local sideloading, not for distribution). See ANDROID_BUILD.md → Release Signing.
+
+# Absolute path to the keystore (recommended; relative paths resolve against
+# gui/android/app). Keep this outside the repo.
+storeFile=/absolute/path/to/sideband-release.jks
+storePassword=CHANGE_ME
+keyAlias=sideband
+keyPassword=CHANGE_ME

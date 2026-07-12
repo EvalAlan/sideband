@@ -113,18 +113,49 @@ cd ~/repos/sideband/gui/android
 
 ## Release Signing
 
-To sign the APK for release, create `gui/android/key.properties` with standard Flutter format:
+By default release builds fall back to the **debug** key (fine for sideloading
+to your own devices, not for distribution). To sign with your own key:
 
-```properties
-storeFile=../path/to/your/keystore.jks
-storePassword=your_store_password
-keyAlias=your_key_alias
-keyPassword=your_key_password
+**1. Generate a keystore once** (keep it OUTSIDE the repo):
+
+```bash
+keytool -genkeypair -v \
+  -keystore ~/keys/sideband-release.jks \
+  -alias sideband -keyalg RSA -keysize 4096 -validity 10000
 ```
 
-`./build.sh android` and the Gradle build will automatically detect this file. If absent, builds default to debug signing.
+**2. Point the build at it.** Copy the template and fill in real values:
 
-**Note**: The `applicationId` remains `com.example.sideband_gui` by design; changing it will orphan existing user data on devices that have the app installed. Use Play Store internal testing tracks to validate signed builds without changing the ID.
+```bash
+cp gui/android/key.properties.example gui/android/key.properties
+$EDITOR gui/android/key.properties
+```
+
+`key.properties` (and `*.jks` / `*.keystore` / `*.p12`) are gitignored and must
+never be committed. `./build.sh android` / Gradle auto-detect the file; when it
+is present the release build is signed with your key, when absent it uses the
+debug key. Debug builds always use the debug key.
+
+**3. Verify which key actually signed an APK:**
+
+```bash
+"$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs \
+  gui/build/app/outputs/flutter-apk/app-release.apk | grep 'certificate DN'
+```
+
+- `CN=Android Debug` → still the debug fallback (no `key.properties`, or it was ignored).
+- Your own DN → signed with your release key.
+
+### ⚠️ applicationId — do not change without a migration plan
+
+The `applicationId` is deliberately still `com.example.sideband_gui`. It is part
+of Android's per-app storage path (`filesDir`), where the Tor identity
+(`identity.toml`), ratchet state, and message history live. Changing it makes
+Android treat the app as brand new: **existing installs lose access to their Tor
+identity and conversation history** rather than being migrated. Decide this
+deliberately, paired with a data export/migration story, before first public
+release. Use Play Store internal-testing tracks to validate signed builds
+without changing the ID.
 
 ## Next Steps for Production
 

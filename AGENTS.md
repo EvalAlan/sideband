@@ -150,11 +150,19 @@ service, message notifications, and mobile-appropriate settings; offline retry
 queue; the `src/interop.rs` test harness + FFI/CLI contract tests + tiered
 `run-tests.sh`; Linux + Android widget-driven integration tests for first-run,
 contact add, `/add`, group creation/sidebar refresh, and group selection;
-unified `build.sh`.
+unified `build.sh`; **Android release-signing scaffolding** (`key.properties`
+loading with debug fallback in `build.gradle.kts`, committed
+`key.properties.example` template, gitignored secrets, and generation +
+verification docs in ANDROID_BUILD.md; signing wiring verified end-to-end with a
+throwaway keystore).
 
 **Open / backlog (roughly prioritized):**
-1. Release hygiene for Android: generate a signing keystore
-   (`gui/android/key.properties`) and decide on the `applicationId` (changing it
-   from `com.example.sideband_gui` orphans existing installs' identities).
+1. **`applicationId` decision — needs the owner (Alan).** Signing is scaffolded
+   and works; the remaining, deliberately-unmade decision is whether to keep
+   `com.example.sideband_gui` or migrate to a real id (e.g. `com.evalalan.sideband`,
+   which the desktop already uses). Changing it orphans existing Android installs'
+   Tor identity + history (it's part of `filesDir`), so it must be paired with a
+   data export/migration story and made before first public release — do not
+   change it silently. See ANDROID_BUILD.md → "applicationId".
 2. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
 3. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
