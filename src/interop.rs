@@ -210,6 +210,39 @@ fn recover_add_key_fields_splits_concatenated_keys() {
     assert_eq!(ok[2], ed);
 }
 
+/// Discovering a group from a peer must never add our own identity as a contact
+/// or a group member — the UI represents self implicitly as "You".
+#[test]
+fn discover_group_excludes_self() {
+    let dir = tempfile::tempdir().unwrap();
+    init_profile_with_name(dir.path(), "Mercury").unwrap();
+
+    // "Rocky" sends a group whose advertised members include us (Mercury).
+    let group = crate::discover_or_update_group(
+        dir.path(),
+        "grp1",
+        "Homies",
+        "Rocky",
+        &["Alan".to_string(), "Mercury".to_string()],
+    )
+    .unwrap();
+
+    assert!(
+        group.members.iter().all(|m| m.contact != "Mercury"),
+        "self must not be listed as a group member"
+    );
+    let contacts = load_contacts(dir.path()).unwrap();
+    assert!(
+        !contacts.contains_key("Mercury"),
+        "self must not be added to contacts"
+    );
+    assert!(
+        contacts.contains_key("Rocky"),
+        "the sender is a real member"
+    );
+    assert!(contacts.contains_key("Alan"), "other members are added");
+}
+
 /// A v3 double-ratchet message (after /ratchet) must decrypt and verify on the
 /// receiving side.
 #[tokio::test]

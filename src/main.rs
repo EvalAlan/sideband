@@ -2207,14 +2207,32 @@ pub(crate) fn discover_or_update_group(
          ON CONFLICT(id) DO UPDATE SET title=excluded.title, updated_at_ms=excluded.updated_at_ms",
         params![group_id, title, now],
     )?;
+    // The advertised member list a peer sends includes *us*. Never add our own
+    // identity as a group member or as a stub contact — the UI represents self
+    // implicitly ("You"), so a self contact is always wrong.
+    let self_name = load_display_name(profile).unwrap_or_default();
+    let is_self = |name: &str| !self_name.is_empty() && name == self_name;
+
     let mut contacts = load_contacts(profile)?;
+    let mut contacts_changed = false;
+
+    // Heal state written by an older build that added our own identity as a
+    // stub contact (empty keys) — remove it so self stops appearing in the
+    // contacts list.
+    if let Some(c) = contacts.get(&self_name) {
+        if !self_name.is_empty() && c.pubkey_b64.is_empty() && c.onion.is_empty() {
+            contacts.remove(&self_name);
+            contacts_changed = true;
+        }
+    }
+
     let mut members_to_add = Vec::new();
-    if !sender_contact.is_empty() {
+    if !sender_contact.is_empty() && !is_self(sender_contact) {
         members_to_add.push(sender_contact.to_string());
     }
     for member in advertised_members {
         let member = member.trim();
-        if member.is_empty() {
+        if member.is_empty() || is_self(member) {
             continue;
         }
         if !members_to_add.iter().any(|m| m == member) {
@@ -2237,15 +2255,24 @@ pub(crate) fn discover_or_update_group(
                     blocked: false,
                 },
             );
+            contacts_changed = true;
         }
     }
-    if !members_to_add.is_empty() {
+    if contacts_changed {
         save_contacts(profile, &contacts)?;
     }
     for member in members_to_add {
         conn.execute(
             "INSERT OR IGNORE INTO group_members (group_id, contact, role, added_at_ms) VALUES (?1, ?2, 'member', ?3)",
             params![group_id, member, now],
+        )?;
+    }
+    // Heal group_members that an older build populated with our own identity so
+    // the participant count and group fan-out no longer include self.
+    if !self_name.is_empty() {
+        conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1 AND contact = ?2",
+            params![group_id, self_name],
         )?;
     }
     drop(conn);
