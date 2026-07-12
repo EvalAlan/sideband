@@ -4,6 +4,9 @@ Experimental privacy-first, serverless chat over Tor onion services.
 
 **Not production secure. Not peer-reviewed. Prototype status.**
 
+See [ROADMAP.md](ROADMAP.md) for the path to 1.0, release gates, and the
+post-1.0 transport and provider architecture.
+
 ## Features
 
 - Tor onion-service transport via **Arti** (embedded Rust Tor, `arti-client`)
