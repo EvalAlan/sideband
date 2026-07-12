@@ -2904,6 +2904,20 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  /// Load visible history via the correct backend: FFI on Android, CLI on
+  /// desktop. Callers must use this rather than `_historyVisibleFor` directly,
+  /// which is desktop-only and throws on Android.
+  Future<_History> _historyDispatch(
+    String? contact, {
+    String? group,
+    Iterable<String>? knownContacts,
+  }) {
+    return _canUseMobileBackend && _mobile != null
+        ? _historyVisibleForMobile(contact,
+            group: group, knownContacts: knownContacts)
+        : _historyVisibleFor(contact, group: group, knownContacts: knownContacts);
+  }
+
   Future<_History> _historyVisibleForMobile(
     String? contact, {
     String? group,
@@ -5112,15 +5126,20 @@ class _ChatScreenState extends State<_ChatScreen>
                                 ),
                                 selected: _selGroup?.id == g.id,
                                 onTap: () async {
-                                  final h = await _historyVisibleFor(null,
-                                      group: g.id);
-                                  setState(() {
-                                    _sel = null;
-                                    _selGroup = g;
-                                    _msgs = _mergePending(h.msgs);
-                                    _unreadGroups.remove(g.id);
-                                  });
-                                  _scrollToBottom();
+                                  try {
+                                    final h =
+                                        await _historyDispatch(null, group: g.id);
+                                    if (!mounted) return;
+                                    setState(() {
+                                      _sel = null;
+                                      _selGroup = g;
+                                      _msgs = _mergePending(h.msgs);
+                                      _unreadGroups.remove(g.id);
+                                    });
+                                    _scrollToBottom();
+                                  } catch (e) {
+                                    if (mounted) setState(() => _error = '$e');
+                                  }
                                 },
                               ),
                             );
