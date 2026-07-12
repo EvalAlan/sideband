@@ -1,8 +1,38 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:image/image.dart' as img;
 import 'package:sideband_gui/main.dart';
+import 'package:zxing2/qrcode.dart';
 
 void main() {
+  test('decodeQrImage reads a Sideband contact QR image', () {
+    const command =
+        '/add Rocky example.onion ed25519-public-key x25519-public-key';
+    final matrix = Encoder.encode(command, ErrorCorrectionLevel.m).matrix!;
+    const scale = 4;
+    const quietZone = 4;
+    final image = img.Image(
+      width: (matrix.width + quietZone * 2) * scale,
+      height: (matrix.height + quietZone * 2) * scale,
+    );
+    img.fill(image, color: img.ColorRgb8(255, 255, 255));
+    for (var y = 0; y < matrix.height; y++) {
+      for (var x = 0; x < matrix.width; x++) {
+        if (matrix.get(x, y) != 1) continue;
+        img.fillRect(
+          image,
+          x1: (x + quietZone) * scale,
+          y1: (y + quietZone) * scale,
+          x2: (x + quietZone + 1) * scale - 1,
+          y2: (y + quietZone + 1) * scale - 1,
+          color: img.ColorRgb8(0, 0, 0),
+        );
+      }
+    }
+
+    expect(decodeQrImage(img.encodePng(image)), command);
+  });
+
   test('parseAddCommandContact preserves base64 +/= characters', () {
     // A real /share line whose keys contain '+', '/', and trailing '='.
     const line =

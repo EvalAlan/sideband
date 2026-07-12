@@ -5,9 +5,11 @@ import 'dart:io';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
+import 'package:zxing2/qrcode.dart';
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
 
@@ -232,6 +234,18 @@ class _WindowHandler extends WindowListener {
 bool get _isDesktop =>
     Platform.isLinux || Platform.isWindows || Platform.isMacOS;
 bool get _canUseMobileBackend => Platform.isAndroid;
+
+String decodeQrImage(Uint8List bytes) {
+  final image = img.decodeImage(bytes);
+  if (image == null) throw const FormatException('Unsupported image format');
+  final pixels = image
+      .convert(numChannels: 4)
+      .getBytes(order: img.ChannelOrder.rgba)
+      .buffer
+      .asInt32List();
+  final source = RGBLuminanceSource(image.width, image.height, pixels);
+  return QRCodeReader().decode(BinaryBitmap(HybridBinarizer(source))).text;
+}
 
 const _nativeChannel = MethodChannel('sideband/native');
 // ── app ─────────────────────────────────────────────────────────────────────
@@ -3878,6 +3892,30 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  Future<void> _uploadContactQr() async {
+    try {
+      final file = await openFile(
+        acceptedTypeGroups: const [
+          XTypeGroup(
+            label: 'QR code images',
+            extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'],
+          ),
+        ],
+        confirmButtonText: 'Open QR code',
+      );
+      if (file == null) return;
+
+      final raw = decodeQrImage(await file.readAsBytes());
+      final parsed = parseAddCommandContact(raw);
+      if (parsed == null) {
+        throw Exception('QR did not contain a Sideband /add contact command');
+      }
+      await _addParsedContact(parsed);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Could not read QR image: $e');
+    }
+  }
+
   Future<void> _showEditContactDialog(Contact contact) =>
       _showContactDialog(contact: contact);
 
@@ -4757,13 +4795,20 @@ class _ChatScreenState extends State<_ChatScreen>
                     },
                   ),
                   ListTile(
-                    leading: const Icon(Icons.qr_code_scanner),
-                    title: const Text('Scan contact QR'),
-                    subtitle: const Text(
-                        'Use the camera to scan a shared Sideband QR'),
+                    leading: Icon(_canUseMobileBackend
+                        ? Icons.qr_code_scanner
+                        : Icons.upload_file),
+                    title: Text(_canUseMobileBackend
+                        ? 'Scan contact QR'
+                        : 'Upload QR code image'),
+                    subtitle: Text(_canUseMobileBackend
+                        ? 'Use the camera to scan a shared Sideband QR'
+                        : 'Choose a shared Sideband QR image from disk'),
                     onTap: () {
                       Navigator.pop(dialogContext);
-                      unawaited(_scanContactQr());
+                      unawaited(_canUseMobileBackend
+                          ? _scanContactQr()
+                          : _uploadContactQr());
                     },
                   ),
                   ListTile(
@@ -5008,9 +5053,18 @@ class _ChatScreenState extends State<_ChatScreen>
                     padding: EdgeInsets.zero,
                     constraints:
                         const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.qr_code_scanner, size: 20),
-                    onPressed: _scanContactQr,
-                    tooltip: 'Scan contact QR',
+                    icon: Icon(
+                      _canUseMobileBackend
+                          ? Icons.qr_code_scanner
+                          : Icons.upload_file,
+                      size: 20,
+                    ),
+                    onPressed: _canUseMobileBackend
+                        ? _scanContactQr
+                        : _uploadContactQr,
+                    tooltip: _canUseMobileBackend
+                        ? 'Scan contact QR'
+                        : 'Upload QR code image',
                   ),
                 ),
                 SizedBox(
