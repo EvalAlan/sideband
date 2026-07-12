@@ -1,4 +1,4 @@
-package com.example.sideband_gui
+package com.evalalan.sideband
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -29,7 +29,7 @@ class ListenerForegroundService : Service() {
         const val CHANNEL_ID = "sideband_listener_channel"
         const val NOTIFICATION_ID = 1001
 
-        const val ACTION_STOP = "com.example.sideband_gui.action.STOP_LISTENER"
+        const val ACTION_STOP = "com.evalalan.sideband.action.STOP_LISTENER"
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
