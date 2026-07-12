@@ -14,6 +14,10 @@ cd "$SCRIPT_DIR"
 
 TIER="${1:-fast}"
 FLUTTER="$(command -v flutter 2>/dev/null || echo "$HOME/flutter/bin/flutter")"
+ADB="$(command -v adb 2>/dev/null || true)"
+if [ -z "$ADB" ] && [ -x "$HOME/Android/Sdk/platform-tools/adb" ]; then
+  ADB="$HOME/Android/Sdk/platform-tools/adb"
+fi
 
 green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
@@ -82,11 +86,22 @@ run_ui() {
   else
     red "gui/integration_test not present yet — skipping UI tier"
   fi
-  if command -v adb >/dev/null && [ -n "$(adb devices | grep -w device || true)" ]; then
+  local android_device=""
+  if [ -n "$ADB" ]; then
+    while read -r serial state; do
+      if [[ "$serial" == emulator-* && "$state" = "device" ]]; then
+        android_device="$serial"
+        break
+      fi
+    done < <("$ADB" devices)
+  fi
+  if [ -n "$android_device" ]; then
     hr "flutter integration_test on attached Android device/emulator"
-    (cd gui && "$FLUTTER" test integration_test -d android || red "android UI tier failed")
+    "$ADB" -s "$android_device" shell pm clear com.example.sideband_gui \
+      >/dev/null 2>&1 || true
+    (cd gui && "$FLUTTER" test integration_test -d "$android_device")
   else
-    red "no Android device attached — skipping Android UI tier"
+    red "no Android emulator attached — skipping Android UI tier"
   fi
 }
 

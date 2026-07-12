@@ -4034,6 +4034,9 @@ class _ChatScreenState extends State<_ChatScreen>
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     } finally {
+      // showDialog completes before the route's reverse animation has fully
+      // detached its TextFields. Android may rebuild them during teardown.
+      await Future<void>.delayed(const Duration(milliseconds: 300));
       name.dispose();
       onion.dispose();
       pubkey.dispose();

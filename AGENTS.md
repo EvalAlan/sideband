@@ -148,17 +148,13 @@ _Update this section as part of the handoff protocol._
 (Android); Double-Ratchet "Enable forward secrecy" button; Android foreground
 service, message notifications, and mobile-appropriate settings; offline retry
 queue; the `src/interop.rs` test harness + FFI/CLI contract tests + tiered
-`run-tests.sh`; unified `build.sh`.
+`run-tests.sh`; Linux + Android widget-driven integration tests for first-run,
+contact add, `/add`, group creation/sidebar refresh, and group selection;
+unified `build.sh`.
 
 **Open / backlog (roughly prioritized):**
-1. **UI-driving test tier** — `gui/integration_test/` driven by Flutter's
-   `integration_test` (widget finders, not pixels), on Linux and the emulator.
-   Linux add-contact now runs against an isolated real CLI profile with Tor
-   listener startup disabled. Still needs isolated Android execution plus
-   message-routing/sidebar flows. This is the gap that let the recent
-   Android-only GUI-glue bugs (group tap, `/add`) slip through.
-2. Release hygiene for Android: generate a signing keystore
+1. Release hygiene for Android: generate a signing keystore
    (`gui/android/key.properties`) and decide on the `applicationId` (changing it
    from `com.example.sideband_gui` orphans existing installs' identities).
-3. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
-4. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
+2. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
+3. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.

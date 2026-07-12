@@ -8,13 +8,26 @@ import 'package:sideband_gui/main.dart';
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
-  testWidgets('desktop add-contact flow persists through the real CLI backend',
+  testWidgets('add-contact, group command, and group selection work end to end',
       (tester) async {
-    if (!Platform.isLinux) return;
-    expect(Platform.environment['SIDEBAND_PROFILE'], isNotEmpty);
+    if (Platform.isLinux) {
+      expect(Platform.environment['SIDEBAND_PROFILE'], isNotEmpty);
+    }
 
     await tester.pumpWidget(const SidebandApp(skipListener: true));
-    await tester.pumpAndSettle();
+    await tester.pump(const Duration(seconds: 2));
+
+    if (Platform.isAndroid) {
+      expect(find.text('Set up Sideband'), findsOneWidget);
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Display name'),
+        'UiTest',
+      );
+      await tester.tap(find.widgetWithText(FilledButton, 'Create profile'));
+      await tester.pump(const Duration(seconds: 3));
+    } else {
+      await tester.pumpAndSettle();
+    }
 
     await tester.tap(find.byTooltip('Add contact'));
     await tester.pumpAndSettle();
@@ -36,5 +49,61 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Rocky'), findsWidgets);
+
+    final composer = find.byWidgetPredicate(
+      (widget) => widget is TextField &&
+          widget.decoration?.hintText == 'Message or /help for commands…',
+      description: 'message composer',
+    );
+    expect(composer, findsOneWidget);
+
+    await tester.enterText(composer, '/group-create TestGroup Rocky');
+    await tester.tap(find.byIcon(Icons.send_rounded));
+    await tester.pumpAndSettle();
+
+    if (Platform.isAndroid) {
+      await tester.tap(find.byIcon(Icons.arrow_back));
+      await tester.pumpAndSettle();
+    }
+
+    expect(find.text('Groups'), findsOneWidget);
+    expect(find.text('TestGroup'), findsWidgets);
+
+    if (find.text('Group created').evaluate().isNotEmpty) {
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
+    }
+    final groupTile = find.ancestor(
+      of: find.text('TestGroup').first,
+      matching: find.byType(ListTile),
+    );
+    expect(groupTile, findsOneWidget);
+    await tester.tap(groupTile);
+    await tester.pumpAndSettle();
+    expect(find.text('Group fan-out to 2 members'), findsOneWidget);
+  });
+
+  testWidgets('/add command routes through the active platform backend',
+      (tester) async {
+    await tester.pumpWidget(const SidebandApp(skipListener: true));
+    await tester.pump(const Duration(seconds: 2));
+
+    final composer = find.byWidgetPredicate(
+      (widget) => widget is TextField &&
+          widget.decoration?.hintText == 'Message or /help for commands…',
+      description: 'message composer',
+    );
+    expect(composer, findsOneWidget);
+
+    await tester.enterText(
+      composer,
+      '/add Adrian '
+      'qdnx34k2b3fzp3umv7ryvzxtbzjluzkvuvqixvuooy43b5n6lddaspid.onion '
+      'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA= '
+      'ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A=',
+    );
+    await tester.tap(find.byIcon(Icons.send_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('Adrian'), findsWidgets);
   });
 }

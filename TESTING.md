@@ -56,10 +56,12 @@ all coverage lives in the fast tier, which never touches Tor.
 
 Uses Flutter's `integration_test` (widget-key/text finders, **not** pixel
 coordinates — reliable where `xdotool` is not). The same test runs on
-`-d linux` and, if a device/emulator is attached, `-d android`. This is where
+`-d linux` and, if an emulator is attached, on that emulator. This is where
 client-specific glue (message-box routing, sidebar refresh, the add-contact
-dialog) is exercised. The Linux tier currently drives add-contact through the
-real CLI backend with an isolated profile and listener startup disabled.
+dialog) is exercised. Linux uses an isolated real CLI profile. Android clears
+the emulator app profile first and drives first-run setup. Both disable listener
+startup, then cover contact add, `/add`, group creation, sidebar refresh, and
+group selection without waiting for Tor.
 
 ### E2E tier (`run-tests.sh e2e`)
 
@@ -76,6 +78,4 @@ never touch `~/.sideband` or each other.
 
 ## Still to add
 
-- Android UI-driving coverage using an isolated app profile.
-- Message-box routing and sidebar refresh flows in `gui/integration_test/`.
 - A PTY-driven TUI test to complement the ratatui `TestBackend` render tests.
