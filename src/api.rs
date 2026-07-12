@@ -1051,6 +1051,93 @@ mod tests {
     // clippy::await_holding_lock hazard a std Mutex would introduce.
     static API_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    // ---- FFI contract tests (the Android client's boundary) ----------------
+    // These exercise the exact `sideband_api_*` exports the Flutter app calls
+    // over dart:ffi, with no Tor and no emulator.
+
+    fn cs(s: &str) -> std::ffi::CString {
+        std::ffi::CString::new(s).unwrap()
+    }
+
+    /// Consume a `*mut c_char` returned by an FFI export: parse the JSON
+    /// envelope, free the string, return the parsed value.
+    fn take_json(ptr: *mut c_char) -> serde_json::Value {
+        assert!(!ptr.is_null(), "FFI returned null");
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { sideband_api_free_string(ptr) };
+        serde_json::from_str(&s).unwrap()
+    }
+
+    // Rocky's real /share keys: base64 with '+', '/', and trailing '='.
+    const ROCKY_ONION: &str = "qdnx34k2b3fzp3umv7ryvzxtbzjluzkvuvqixvuooy43b5n6lddaspid.onion";
+    const ROCKY_ED25519: &str = "fLo7TRtqCxE2wtjTvNvUJjRDBewhYV7bkW3P/F/451w=";
+    const ROCKY_X25519: &str = "K4+eWfSYw8TtmsViirLxsNs7zAWzKQ/YtJtQFVcncUk=";
+
+    #[test]
+    fn ffi_add_contact_accepts_standard_base64_keys_and_lists_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = cs(dir.path().to_str().unwrap());
+        let name = cs("me");
+        let r = take_json(sideband_api_init_profile(profile.as_ptr(), name.as_ptr()));
+        assert_eq!(r["ok"], true, "init_profile failed: {r}");
+
+        let cname = cs("Rocky");
+        let onion = cs(ROCKY_ONION);
+        let ed = cs(ROCKY_ED25519);
+        let x = cs(ROCKY_X25519);
+        let r = take_json(sideband_api_add_contact(
+            profile.as_ptr(),
+            cname.as_ptr(),
+            onion.as_ptr(),
+            ed.as_ptr(),
+            x.as_ptr(),
+        ));
+        assert_eq!(r["ok"], true, "FFI add_contact rejected + / = keys: {r}");
+
+        let r = take_json(sideband_api_list_contacts(profile.as_ptr()));
+        assert_eq!(r["ok"], true);
+        let rocky = r["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Rocky")
+            .expect("Rocky should be listed");
+        assert_eq!(rocky["ed25519_pubkey_b64"], ROCKY_ED25519);
+        assert_eq!(rocky["x25519_pubkey_b64"], ROCKY_X25519);
+        assert_eq!(
+            rocky["ratchet_active"], false,
+            "a freshly added contact has no ratchet yet"
+        );
+    }
+
+    #[test]
+    fn ffi_add_contact_rejects_bad_onion_with_error_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = cs(dir.path().to_str().unwrap());
+        let name = cs("me");
+        take_json(sideband_api_init_profile(profile.as_ptr(), name.as_ptr()));
+
+        let cname = cs("Bad");
+        let onion = cs("not-a-real-onion.onion");
+        let ed = cs(ROCKY_ED25519);
+        let x = cs(ROCKY_X25519);
+        let r = take_json(sideband_api_add_contact(
+            profile.as_ptr(),
+            cname.as_ptr(),
+            onion.as_ptr(),
+            ed.as_ptr(),
+            x.as_ptr(),
+        ));
+        assert_eq!(
+            r["ok"], false,
+            "invalid onion must surface an error envelope"
+        );
+        assert!(r["error"].is_string());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn api_send_file_with_listener_enqueues_without_waiting_for_delivery() {
         let _test_guard = API_TEST_LOCK.lock().await;
