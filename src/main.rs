@@ -519,6 +519,12 @@ pub struct FileOfferPayload {
     size: usize,
     hash: String,
     total_chunks: usize,
+    // Present when the file was sent to a group, so the recipient files it under
+    // the group conversation instead of a 1:1 PM. Absent for direct sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_title: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -544,12 +550,22 @@ pub(crate) struct FileInlinePayload {
     size: usize,
     hash: String,
     data_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IncomingFileState {
     total_chunks: usize,
     chunks: Vec<Option<Vec<u8>>>,
+    // Carried from the file offer so a completed chunked transfer is filed under
+    // the same group conversation the offer named.
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    group_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,6 +656,10 @@ pub(crate) fn load_incoming_states(profile: &Path) -> Result<HashMap<String, Inc
             .or_insert_with(|| IncomingFileState {
                 total_chunks,
                 chunks: vec![None; total_chunks],
+                // Group context isn't persisted across restarts; a chunked group
+                // transfer resumed after a restart falls back to a PM record.
+                group_id: None,
+                group_title: None,
             });
         if let Some(idx_i64) = idx_opt {
             let idx = idx_i64 as usize;
@@ -782,7 +802,11 @@ pub async fn send_file(
     profile: &Path,
     contact_name: &str,
     file_path: &str,
-    _reuse_socks_port: Option<u16>,
+    // When Some((group_id, group_title)) the file is part of a group send: the
+    // wire payload is tagged so the recipient files it under the group, and the
+    // local "file sent" record is left to `send_file_to_group` (stored once for
+    // the group, not once per member).
+    group: Option<(&str, &str)>,
     tor_client: Arc<TorClient<PreferredRuntime>>,
 ) -> Result<()> {
     use sha2::Digest;
@@ -818,6 +842,8 @@ pub async fn send_file(
             size: total_size,
             hash: hash.clone(),
             data_b64: B64.encode(&content),
+            group_id: group.map(|(id, _)| id.to_string()),
+            group_title: group.map(|(_, t)| t.to_string()),
         };
         let inline_json = serde_json::to_string(&inline)?;
 
@@ -859,15 +885,18 @@ pub async fn send_file(
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis();
         tracing::info!(contact=%contact_name, name=%file_name, size=total_size, "file_inline sent OK");
-        crate::store_message(
-            profile,
-            "out",
-            contact_name,
-            &onion,
-            &format!("[file sent: {} ({} bytes, inline)]", file_path, total_size),
-            timestamp_ms,
-            crate::DeliveryStatus::Sent,
-        )?;
+        // For group sends the caller stores one local record for the whole group.
+        if group.is_none() {
+            crate::store_message(
+                profile,
+                "out",
+                contact_name,
+                &onion,
+                &format!("[file sent: {} ({} bytes, inline)]", file_path, total_size),
+                timestamp_ms,
+                crate::DeliveryStatus::Sent,
+            )?;
+        }
 
         drop(tor_client);
         return Ok(());
@@ -900,6 +929,8 @@ pub async fn send_file(
             size: total_size,
             hash: hash.clone(),
             total_chunks,
+            group_id: group.map(|(id, _)| id.to_string()),
+            group_title: group.map(|(_, t)| t.to_string()),
         };
         let offer_json = serde_json::to_string(&offer)?;
 
@@ -1043,18 +1074,20 @@ pub async fn send_file(
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
-    crate::store_message(
-        profile,
-        "out",
-        contact_name,
-        &onion,
-        &format!(
-            "[file sent: {} ({} bytes, {} chunks)]",
-            file_path, total_size, total_chunks
-        ),
-        timestamp_ms,
-        crate::DeliveryStatus::Sent,
-    )?;
+    if group.is_none() {
+        crate::store_message(
+            profile,
+            "out",
+            contact_name,
+            &onion,
+            &format!(
+                "[file sent: {} ({} bytes, {} chunks)]",
+                file_path, total_size, total_chunks
+            ),
+            timestamp_ms,
+            crate::DeliveryStatus::Sent,
+        )?;
+    }
 
     clear_outbound_state(profile, &hash);
     drop(tor_client);
@@ -1079,7 +1112,7 @@ pub(crate) async fn send_file_to_group(
             profile,
             &member.contact,
             file_path,
-            None,
+            Some((&group.id, &group.title)),
             Arc::clone(&tor_client),
         )
         .await
@@ -1104,6 +1137,24 @@ pub(crate) async fn send_file_to_group(
             group.title
         ));
     }
+
+    // One local record for the whole group (send_file skips its per-member store
+    // for group sends), so the sent file shows in the group thread, not as PMs.
+    let size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    store_message_for_conversation(
+        profile,
+        "out",
+        &load_display_name(profile).unwrap_or_default(),
+        "",
+        &format!("[file sent: {file_path} ({size} bytes)]"),
+        timestamp_ms,
+        DeliveryStatus::Sent,
+        "group",
+        &group.id,
+    )?;
 
     Ok(sent)
 }
@@ -6942,6 +6993,8 @@ fn inbound_transfer_state_survives_restart_roundtrip() {
         IncomingFileState {
             total_chunks: 3,
             chunks: vec![Some(vec![1, 2, 3]), None, Some(vec![9])],
+            group_id: None,
+            group_title: None,
         },
     );
     persist_incoming_states_snapshot(profile, &snapshot).unwrap();
@@ -6974,6 +7027,8 @@ fn persist_incoming_snapshot_overwrites_previous_partial_state() {
         IncomingFileState {
             total_chunks: 3,
             chunks: vec![Some(vec![1]), None, None],
+            group_id: None,
+            group_title: None,
         },
     );
     persist_incoming_states_snapshot(profile, &snap1).unwrap();
@@ -6984,6 +7039,8 @@ fn persist_incoming_snapshot_overwrites_previous_partial_state() {
         IncomingFileState {
             total_chunks: 3,
             chunks: vec![Some(vec![1]), Some(vec![2]), None],
+            group_id: None,
+            group_title: None,
         },
     );
     persist_incoming_states_snapshot(profile, &snap2).unwrap();

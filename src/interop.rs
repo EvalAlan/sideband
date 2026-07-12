@@ -252,6 +252,72 @@ fn profile_export_import_round_trips() {
     crate::import_profile_bytes(dst.path(), &archive, "hunter2", true).unwrap();
 }
 
+/// A file sent to a group must be filed under the group conversation on the
+/// receiving side, not as a 1:1 PM (regression: group files showed up as PMs).
+#[tokio::test]
+async fn group_inline_file_lands_in_group_not_pm() {
+    use sha2::Digest;
+
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+
+    // A file_inline payload tagged with a group (what send_file_to_group emits).
+    let data = b"hello group file";
+    let hash = {
+        let mut h = sha2::Sha256::new();
+        h.update(data);
+        format!("{:x}", h.finalize())
+    };
+    let inline_json = serde_json::json!({
+        "name": "note.txt",
+        "size": data.len(),
+        "hash": hash,
+        "data_b64": B64.encode(data),
+        "group_id": "grp1",
+        "group_title": "Homies",
+    })
+    .to_string();
+    let msg =
+        build_outbound_message(alice.profile(), "bob", "file_inline", &inline_json, "").unwrap();
+    let line = serde_json::to_string(&msg).unwrap();
+
+    let contacts = load_contacts(bob.profile()).unwrap();
+    let mut parsed = parse_inbound_line(&line).unwrap().unwrap();
+    let (tx, mut rx) = mpsc::channel::<TuiEvent>(16);
+    crate::handler::handle_file_inline(bob.profile(), &tx, &contacts, &mut parsed)
+        .await
+        .unwrap();
+    drop(tx);
+
+    // Stored under the group conversation, not a contact PM.
+    let all = load_history(bob.profile(), None, 50).unwrap();
+    let row = all
+        .iter()
+        .find(|r| r.body.contains("[file received:"))
+        .expect("received file must be stored");
+    assert_eq!(row.conversation_kind, "group");
+    assert_eq!(row.conversation_id, "grp1");
+    assert!(
+        load_history(bob.profile(), Some("alice"), 50)
+            .unwrap()
+            .iter()
+            .all(|r| !r.body.contains("[file received:")),
+        "the file must NOT appear as a PM under 'alice'"
+    );
+
+    // And a group event (not a plain InboundMessage) was emitted.
+    let mut got_group_event = false;
+    while let Ok(ev) = rx.try_recv() {
+        if let TuiEvent::InboundGroupMessage { group_id, .. } = ev {
+            assert_eq!(group_id, "grp1");
+            got_group_event = true;
+        }
+    }
+    assert!(got_group_event, "expected an InboundGroupMessage event");
+}
+
 /// Discovering a group from a peer must never add our own identity as a contact
 /// or a group member — the UI represents self implicitly as "You".
 #[test]

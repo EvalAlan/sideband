@@ -160,11 +160,20 @@ both GUIs** (Settings → Export/Import profile: `sideband_api_export_profile` /
 `_import_profile` FFI on Android with a `shareFile` intent, CLI on desktop with
 native save/open dialogs, passphrase prompt); **Android `applicationId`
 migrated** `com.example.sideband_gui` → `com.evalalan.sideband` (Kotlin package
-moved too; APK id verified via aapt).
+moved too; APK id verified via aapt); **group file sends now file under the
+group conversation** on the receiving side and as a single local group record,
+instead of showing up as 1:1 PMs (file offer/chunk/inline payloads carry
+optional group context; `store_file_message` helper routes them).
 
 **Open / backlog (roughly prioritized):**
-1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
-2. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
+1. **Disappearing / expiring messages** (requested). Default OFF; allow adding a
+   TTL to individual messages and to group messages. Sketch: an `expires_at_ms`
+   column on `messages`, carried in the wire payload so the recipient expires it
+   too; a periodic sweep (and on-load filter) that deletes expired rows; UI to
+   set a default/per-message expiry. The `ChatMessage`/group payload and
+   `store_message*` are the seams. Started nothing yet.
+2. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
+3. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
 3. After an in-app import, the running listener still holds the old identity —
    the UI just tells the user to restart. A cleaner flow would reload the profile
    (restart the listener) in place.

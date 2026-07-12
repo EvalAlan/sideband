@@ -225,6 +225,60 @@ fn parse_group_message_payload(plaintext: &str) -> Option<GroupMessagePayload> {
     None
 }
 
+/// Store an inbound file-related message under the correct conversation and emit
+/// the matching UI event: the group (when the file was sent to a group) or the
+/// sender's 1:1 PM otherwise.
+#[allow(clippy::too_many_arguments)]
+async fn store_file_message(
+    profile: &Path,
+    tui_tx: &mpsc::Sender<TuiEvent>,
+    contact_name: &str,
+    group: Option<(&str, &str)>,
+    body: &str,
+    timestamp_ms: u128,
+    status: DeliveryStatus,
+    verified: bool,
+) -> Result<()> {
+    match group {
+        Some((group_id, group_title)) if !group_id.is_empty() => {
+            let g = discover_or_update_group(profile, group_id, group_title, contact_name, &[])?;
+            store_message_for_conversation(
+                profile,
+                "in",
+                contact_name,
+                "",
+                body,
+                timestamp_ms,
+                status,
+                "group",
+                &g.id,
+            )?;
+            let _ = tui_tx
+                .send(TuiEvent::InboundGroupMessage {
+                    group_id: g.id,
+                    group_title: g.title,
+                    contact: contact_name.to_string(),
+                    body: body.to_string(),
+                    timestamp_ms,
+                    verified,
+                })
+                .await;
+        }
+        _ => {
+            store_message(profile, "in", contact_name, "", body, timestamp_ms, status)?;
+            let _ = tui_tx
+                .send(TuiEvent::InboundMessage {
+                    contact: contact_name.to_string(),
+                    body: body.to_string(),
+                    timestamp_ms,
+                    verified,
+                })
+                .await;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_file_offer(
     profile: &Path,
     tui_tx: &mpsc::Sender<TuiEvent>,
@@ -239,12 +293,17 @@ async fn handle_file_offer(
 
     let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, verified);
 
+    let mut offer_group: Option<(String, String)> = None;
     let body_for_display = if verified {
         match serde_json::from_str::<FileOfferPayload>(&plaintext) {
             Ok(offer) => {
                 if let Err(e) = crate::validate_total_chunks(offer.size, offer.total_chunks) {
                     tracing::warn!(from=%msg.from, error=%e, "rejecting file offer");
                     return Ok(());
+                }
+                if let Some(id) = offer.group_id.clone() {
+                    let title = offer.group_title.clone().unwrap_or_else(|| id.clone());
+                    offer_group = Some((id, title));
                 }
                 let key = format!("{}:{}", msg.from, offer.hash);
                 let snapshot = {
@@ -254,6 +313,8 @@ async fn handle_file_offer(
                         IncomingFileState {
                             total_chunks: offer.total_chunks,
                             chunks: vec![None; offer.total_chunks],
+                            group_id: offer.group_id.clone(),
+                            group_title: offer.group_title.clone(),
                         },
                     );
                     state.incoming_files.clone()
@@ -272,11 +333,12 @@ async fn handle_file_offer(
         "[file offer — UNVERIFIED]".to_string()
     };
 
-    store_message(
+    let group_ref = offer_group.as_ref().map(|(i, t)| (i.as_str(), t.as_str()));
+    store_file_message(
         profile,
-        "in",
+        tui_tx,
         &contact_name,
-        "",
+        group_ref,
         &body_for_display,
         msg.timestamp_ms,
         if verified {
@@ -284,16 +346,9 @@ async fn handle_file_offer(
         } else {
             DeliveryStatus::Failed
         },
-    )?;
-
-    let _ = tui_tx
-        .send(TuiEvent::InboundMessage {
-            contact: contact_name,
-            body: body_for_display,
-            timestamp_ms: msg.timestamp_ms,
-            verified,
-        })
-        .await;
+        verified,
+    )
+    .await?;
 
     tracing::info!(recv=true, %msg.r#type, "file offer received");
     Ok(())
@@ -334,6 +389,8 @@ async fn handle_file_chunk(
         }
         let key = format!("{}:{}", msg.from, chunk.hash);
         let mut completed_data: Option<Vec<u8>> = None;
+        // Group context (from the offer) for a transfer that completes on this chunk.
+        let mut completed_group: Option<(String, String)> = None;
 
         let snapshot = {
             let mut state = transfer_state.lock().await;
@@ -344,6 +401,8 @@ async fn handle_file_chunk(
                     .or_insert_with(|| IncomingFileState {
                         total_chunks: chunk.total_chunks,
                         chunks: vec![None; chunk.total_chunks],
+                        group_id: None,
+                        group_title: None,
                     });
 
             if chunk.chunk_index < file_state.total_chunks {
@@ -358,6 +417,10 @@ async fn handle_file_chunk(
                     assembled.extend_from_slice(c.as_ref().unwrap());
                 }
                 completed_data = Some(assembled);
+                if let Some(id) = file_state.group_id.clone() {
+                    let title = file_state.group_title.clone().unwrap_or_else(|| id.clone());
+                    completed_group = Some((id, title));
+                }
                 state.incoming_files.remove(&key);
             }
             // Snapshot the live state (the source of truth) so resume after a
@@ -468,30 +531,27 @@ async fn handle_file_chunk(
                 }
             }
 
-            store_message(
+            let group_ref = completed_group
+                .as_ref()
+                .map(|(i, t)| (i.as_str(), t.as_str()));
+            store_file_message(
                 profile,
-                "in",
+                tui_tx,
                 &contact_name,
-                "",
+                group_ref,
                 &body,
                 msg.timestamp_ms,
                 DeliveryStatus::Delivered,
-            )?;
-            let _ = tui_tx
-                .send(TuiEvent::InboundMessage {
-                    contact: contact_name,
-                    body,
-                    timestamp_ms: msg.timestamp_ms,
-                    verified: true,
-                })
-                .await;
+                true,
+            )
+            .await?;
         }
     }
 
     Ok(())
 }
 
-async fn handle_file_inline(
+pub(crate) async fn handle_file_inline(
     profile: &Path,
     tui_tx: &mpsc::Sender<TuiEvent>,
     contacts: &ContactsMap,
@@ -569,23 +629,22 @@ async fn handle_file_inline(
             tracing::error!("base64 decode failed for file_inline");
         }
 
-        store_message(
+        let group = inline
+            .group_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(|id| (id, inline.group_title.as_deref().unwrap_or(id)));
+        store_file_message(
             profile,
-            "in",
+            tui_tx,
             &contact_name,
-            "",
+            group,
             &body,
             msg.timestamp_ms,
             DeliveryStatus::Delivered,
-        )?;
-        let _ = tui_tx
-            .send(TuiEvent::InboundMessage {
-                contact: contact_name,
-                body,
-                timestamp_ms: msg.timestamp_ms,
-                verified,
-            })
-            .await;
+            verified,
+        )
+        .await?;
     }
 
     Ok(())
