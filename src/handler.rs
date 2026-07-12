@@ -88,6 +88,18 @@ pub async fn handle_inbound(
     }
 
     // Normal message.
+    handle_text_message(profile, tui_tx, contacts, msg).await
+}
+
+/// Decrypt/verify a normal text message, resolve the sender's contact name, and
+/// persist + notify. Split out of [`handle_inbound`] so the text path is testable
+/// without a `TorClient` (only file chunks need one, for ACKs).
+pub(crate) async fn handle_text_message(
+    profile: &Path,
+    tui_tx: &mpsc::Sender<TuiEvent>,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
     let decrypt_result = decrypt_and_verify(msg, profile, contacts);
     let decrypt_error = decrypt_result.as_ref().err().map(|e| e.to_string());
     let (plaintext, verified) = decrypt_result.unwrap_or_else(|e| {

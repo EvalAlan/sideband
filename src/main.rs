@@ -32,6 +32,8 @@ use tor_rtcompat::PreferredRuntime;
 
 mod app_api;
 mod handler;
+#[cfg(test)]
+mod interop;
 mod transport;
 mod tui;
 
@@ -1098,21 +1100,26 @@ async fn wait_for_file_ack(hash: &str, chunk_index: usize, timeout: Duration) ->
     }
 }
 
-async fn send_typed_message(
+/// Build the signed + encrypted outbound [`ChatMessage`] destined for `contact_name`,
+/// without sending it. Extracted from [`send_typed_message`] so the full
+/// sign/encrypt/wire-format path is testable end-to-end without a transport.
+///
+/// Uses the double-ratchet (v3) if ratchet state exists for the contact and this
+/// is a normal `"msg"`, otherwise static X25519 (v2). `sender_onion` is embedded
+/// so the recipient can auto-discover us.
+pub(crate) fn build_outbound_message(
     profile: &Path,
-    to_onion: &str,
     contact_name: &str,
     message_type: &str,
     plaintext: &str,
-    tor_client: Arc<TorClient<PreferredRuntime>>,
-) -> Result<()> {
+    sender_onion: &str,
+) -> Result<ChatMessage> {
     let key = load_signing_key(profile)?;
     let our_ed25519_pub = B64.encode(key.verifying_key().to_bytes());
     let sender_name = load_display_name(profile).unwrap_or_else(|_| String::new());
     let sender_x25519_pubkey_b64 = load_x25519_public(profile)
         .map(|pk| B64.encode(pk.as_bytes()))
         .unwrap_or_default();
-    let sender_onion = std::env::var("SIDEBAND_REPLY_ONION").unwrap_or_default();
     let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
 
     let ratchet_path = RatchetState::path(profile, std::path::Path::new(contact_name));
@@ -1132,7 +1139,7 @@ async fn send_typed_message(
             r#type: message_type.into(),
             from: our_ed25519_pub.clone(),
             sender_name: sender_name.clone(),
-            sender_onion: sender_onion.clone(),
+            sender_onion: sender_onion.to_string(),
             sender_x25519_pubkey_b64: sender_x25519_pubkey_b64.clone(),
             timestamp_ms,
             body: plaintext.to_string(),
@@ -1151,7 +1158,7 @@ async fn send_typed_message(
             r#type: message_type.into(),
             from: our_ed25519_pub.clone(),
             sender_name: sender_name.clone(),
-            sender_onion: sender_onion.clone(),
+            sender_onion: sender_onion.to_string(),
             sender_x25519_pubkey_b64: sender_x25519_pubkey_b64.clone(),
             timestamp_ms,
             body: plaintext.to_string(),
@@ -1169,6 +1176,26 @@ async fn send_typed_message(
         msg.body.clear();
         msg
     };
+
+    Ok(msg)
+}
+
+async fn send_typed_message(
+    profile: &Path,
+    to_onion: &str,
+    contact_name: &str,
+    message_type: &str,
+    plaintext: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    let sender_onion = std::env::var("SIDEBAND_REPLY_ONION").unwrap_or_default();
+    let msg = build_outbound_message(
+        profile,
+        contact_name,
+        message_type,
+        plaintext,
+        &sender_onion,
+    )?;
 
     let payload = format!("{}\n", serde_json::to_string(&msg)?);
     let connect_timeout = if message_type == "file_chunk" {
@@ -4610,12 +4637,12 @@ pub(crate) async fn serve(
 /// forwards them to the serve control channel, and writes broadcast responses back.
 async fn handle_remote_client(
     mut stream: tokio::net::TcpStream,
-    mut control_tx: mpsc::Sender<ServeControlCommand>,
+    control_tx: mpsc::Sender<ServeControlCommand>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
+    let reader = BufReader::new(reader);
     let mut lines = reader.lines();
     let mut broadcast_rx = (*RESP_BROADCAST).subscribe();
 

@@ -3,6 +3,19 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sideband_gui/main.dart';
 
 void main() {
+  test('parseAddCommandContact preserves base64 +/= characters', () {
+    // A real /share line whose keys contain '+', '/', and trailing '='.
+    const line =
+        '/add Rocky qdnx34k2b3fzp3umv7ryvzxtbzjluzkvuvqixvuooy43b5n6lddaspid.onion '
+        'fLo7TRtqCxE2wtjTvNvUJjRDBewhYV7bkW3P/F/451w= '
+        'K4+eWfSYw8TtmsViirLxsNs7zAWzKQ/YtJtQFVcncUk=';
+    final c = parseAddCommandContact(line);
+    expect(c, isNotNull);
+    expect(c!.name, 'Rocky');
+    expect(c.pubkey, 'fLo7TRtqCxE2wtjTvNvUJjRDBewhYV7bkW3P/F/451w=');
+    expect(c.x25519Pubkey, 'K4+eWfSYw8TtmsViirLxsNs7zAWzKQ/YtJtQFVcncUk=');
+  });
+
   test('contact security label shows ratchet as strongest state', () {
     const contact = Contact(
       name: 'bob',
