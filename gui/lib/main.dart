@@ -2981,7 +2981,7 @@ class _ChatScreenState extends State<_ChatScreen>
     }
     // Android: post OS notifications for inbound messages that arrive while the
     // app is not in the foreground. Coalesce per sender via a stable id.
-    if (Platform.isAndroid && !_appResumed) {
+    if (Platform.isAndroid && !_appResumed && _showSystemNotifications) {
       for (final m in msgs) {
         if (m.direction != 'in') continue;
         final sender = m.contact.isNotEmpty ? m.contact : 'Unknown';
@@ -4657,19 +4657,28 @@ class _ChatScreenState extends State<_ChatScreen>
           backgroundColor: _t.surface,
           title: Text('Settings', style: TextStyle(color: _t.text)),
           content: SizedBox(
-            width: 560,
+            // Fixed comfortable width on desktop; fill the dialog on mobile so
+            // long subtitles wrap instead of overflowing a narrow screen.
+            width: _canUseMobileBackend ? double.maxFinite : 560,
             child: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   SwitchListTile(
                     secondary: const Icon(Icons.notifications_active_outlined),
-                    title: const Text('Desktop notifications'),
-                    subtitle: const Text('System notification daemon popups'),
+                    title: Text(_canUseMobileBackend
+                        ? 'Message notifications'
+                        : 'Desktop notifications'),
+                    subtitle: Text(_canUseMobileBackend
+                        ? 'Notify me of new messages while the app is in the background'
+                        : 'System notification daemon popups'),
                     value: _showSystemNotifications,
                     onChanged: (value) {
                       setState(() => _showSystemNotifications = value);
                       setDialogState(() {});
+                      if (value && _canUseMobileBackend) {
+                        unawaited(_requestNotificationPermission());
+                      }
                     },
                   ),
                   SwitchListTile(
@@ -4682,16 +4691,19 @@ class _ChatScreenState extends State<_ChatScreen>
                       setDialogState(() {});
                     },
                   ),
-                  SwitchListTile(
-                    secondary: const Icon(Icons.volume_up_outlined),
-                    title: const Text('Notification sound'),
-                    subtitle: const Text('Play a sound on new messages'),
-                    value: _showAudibleNotifications,
-                    onChanged: (value) {
-                      setState(() => _showAudibleNotifications = value);
-                      setDialogState(() {});
-                    },
-                  ),
+                  // Audible notifications play through the desktop sound server;
+                  // on Android the OS handles the channel's sound.
+                  if (!_canUseMobileBackend)
+                    SwitchListTile(
+                      secondary: const Icon(Icons.volume_up_outlined),
+                      title: const Text('Notification sound'),
+                      subtitle: const Text('Play a sound on new messages'),
+                      value: _showAudibleNotifications,
+                      onChanged: (value) {
+                        setState(() => _showAudibleNotifications = value);
+                        setDialogState(() {});
+                      },
+                    ),
                   ListTile(
                     leading: const Icon(Icons.palette_outlined),
                     title: const Text('Theme'),
@@ -4701,27 +4713,30 @@ class _ChatScreenState extends State<_ChatScreen>
                       unawaited(_showThemePicker());
                     },
                   ),
-                  const Divider(height: 20),
-                  ListTile(
-                    leading: const Icon(Icons.open_in_full),
-                    title: const Text('Show Sideband'),
-                    subtitle: const Text('Restore and focus the app window'),
-                    onTap: () {
-                      Navigator.pop(dialogContext);
-                      unawaited(_showWindow());
-                    },
-                  ),
-                  SwitchListTile(
-                    secondary: const Icon(Icons.vertical_align_bottom),
-                    title: const Text('Minimize to tray'),
-                    subtitle:
-                        const Text('Minimize button sends to system tray'),
-                    value: _minimizeToTrayEnabled,
-                    onChanged: (value) {
-                      setState(() => _minimizeToTrayEnabled = value);
-                      setDialogState(() {});
-                    },
-                  ),
+                  // Window + tray controls are desktop-only.
+                  if (!_canUseMobileBackend) ...[
+                    const Divider(height: 20),
+                    ListTile(
+                      leading: const Icon(Icons.open_in_full),
+                      title: const Text('Show Sideband'),
+                      subtitle: const Text('Restore and focus the app window'),
+                      onTap: () {
+                        Navigator.pop(dialogContext);
+                        unawaited(_showWindow());
+                      },
+                    ),
+                    SwitchListTile(
+                      secondary: const Icon(Icons.vertical_align_bottom),
+                      title: const Text('Minimize to tray'),
+                      subtitle:
+                          const Text('Minimize button sends to system tray'),
+                      value: _minimizeToTrayEnabled,
+                      onChanged: (value) {
+                        setState(() => _minimizeToTrayEnabled = value);
+                        setDialogState(() {});
+                      },
+                    ),
+                  ],
                   const Divider(height: 20),
                   ListTile(
                     leading: const Icon(Icons.badge_outlined),
