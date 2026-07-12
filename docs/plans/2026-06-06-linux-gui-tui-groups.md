@@ -1,6 +1,19 @@
 # Linux GUI/TUI Group Chats Implementation Plan
 
-> **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
+> **STATUS: ✅ COMPLETE (shipped).** This plan is kept as a historical record.
+> Do not re-implement it. Groups exist across all three clients (Rust core,
+> TUI, desktop GUI, and Android via FFI), including create/list/show/delete,
+> member management, the `group_message` wire payload, fan-out send, and the
+> serve control channel. For ongoing work and the Claude ↔ Codex handoff
+> protocol, read [`AGENTS.md`](../../AGENTS.md), not this file.
+>
+> Notes on drift since this was written:
+> - `gui/build-appimage.sh` and `build-android-rust.sh` were merged into one
+>   root `./build.sh` (`./build.sh desktop` / `./build.sh android`).
+> - Vendored `gui/.tools/flutter` is not present; use `flutter` from PATH.
+> - Android is a real `dart:ffi` client, not just a future concern.
+> - A deterministic two/three-peer test now exists as `src/interop.rs`
+>   (no Tor), superseding the manual Phase 6 runtime steps for regression.
 
 **Goal:** Make Linux GUI/TUI the primary proving ground, harden AppImage packaging, then add group chats without painting mobile into a corner.
 
