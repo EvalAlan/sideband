@@ -74,7 +74,7 @@ jobs:
         run: flutter test
 
       - name: Build AppImage
-        run: ./gui/build-appimage.sh
+        run: ./build.sh desktop
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v7

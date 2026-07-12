@@ -26,11 +26,13 @@ export ANDROID_NDK_HOME=~/Android/Sdk/ndk/28.2.13676358  # or any recent NDK ver
 ```bash
 cd ~/repos/sideband
 
-# Build Rust JNI libraries for Android
-./build-android-rust.sh
+# Build the Rust JNI libraries + the release APK for Android
+./build.sh android
 ```
 
-This compiles `libsideband.so` for all 4 Android ABIs into `target/<arch>/release/`.
+This compiles `libsideband.so` for all 4 Android ABIs into
+`gui/android/app/src/main/jniLibs/<abi>/` and then builds the release APK.
+(Use `./build.sh` with no arguments to build every client: `tui`, `desktop`, `android`.)
 
 ---
 
@@ -83,7 +85,7 @@ cd ~/repos/sideband/gui/android
 | `gui/android/app/src/main/kotlin/ListenerForegroundService.kt` | Foreground service to keep Tor listener running in background |
 | `android/app/build.gradle.kts` | Standard Flutter Android app config |
 | `android/settings.gradle.kts` | Standard Flutter Gradle plugin setup |
-| `build-android-rust.sh` | Script to compile Rust `.so` for all Android ABIs; auto-detects NDK in standard locations |
+| `build.sh` | Unified build script (`./build.sh android` builds Rust `.so` for all ABIs + the APK; auto-detects NDK) |
 
 ---
 
@@ -103,7 +105,7 @@ cd ~/repos/sideband/gui/android
 |-------|-----|
 | `flutter.sdk not set in local.properties` | Add `flutter.sdk=/path/to/flutter` to `android/local.properties` |
 | `NDK not found` | Set `ANDROID_NDK_HOME` or install NDK via SDK Manager |
-| `libsideband.so not found` | Run `./build-android-rust.sh` from repo root |
+| `libsideband.so not found` | Run `./build.sh android` from repo root |
 | `Duplicate class` errors | Clean: `./gradlew clean` then rebuild |
 | Tor bootstrap fails on Android | Arti needs network permission; add `<uses-permission android:name="android.permission.INTERNET"/>` to `AndroidManifest.xml` (already in Flutter template) |
 
@@ -120,7 +122,7 @@ keyAlias=your_key_alias
 keyPassword=your_key_password
 ```
 
-The build-android-rust.sh and Gradle build will automatically detect this file. If absent, builds default to debug signing.
+`./build.sh android` and the Gradle build will automatically detect this file. If absent, builds default to debug signing.
 
 **Note**: The `applicationId` remains `com.example.sideband_gui` by design; changing it will orphan existing user data on devices that have the app installed. Use Play Store internal testing tracks to validate signed builds without changing the ID.
 

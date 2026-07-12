@@ -6,7 +6,7 @@ For a real Rust-backed Android build, use the FRB codegen CLI/package workflow:
 
 1. Add the Dart `flutter_rust_bridge` package to `pubspec.yaml`.
 2. Run `frb_codegen generate` from `gui/` using `flutter_rust_bridge.yaml`.
-3. Build `libsideband.so` for Android ABIs with `cargo-ndk` or the repo's `build-android-rust.sh` after NDK/OpenSSL are configured.
+3. Build `libsideband.so` for Android ABIs with `cargo-ndk` or the repo's `./build.sh android` after NDK/OpenSSL are configured.
 4. Copy/link the generated JNI libs under `android/app/src/main/jniLibs/<abi>/` or configure Gradle source sets for them.
 
 Until that bridge is fully generated and wired, Android builds are Flutter-shell smoke builds only; desktop still uses the CLI subprocess backend.
