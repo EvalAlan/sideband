@@ -180,6 +180,32 @@ enum CommandKind {
         /// New display name. Omit to print the current name.
         name: Option<String>,
     },
+    /// Export this profile (identity, contacts, history, ratchet state) as a
+    /// passphrase-encrypted archive for backup or migration.
+    Export {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Output file for the encrypted archive.
+        #[arg(long)]
+        out: String,
+        /// Passphrase (or set SIDEBAND_EXPORT_PASSPHRASE).
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+    /// Restore a profile from an encrypted archive made by `export`.
+    Import {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Encrypted archive file to restore from.
+        #[arg(long = "in")]
+        input: String,
+        /// Passphrase (or set SIDEBAND_EXPORT_PASSPHRASE).
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Replace an existing identity in the target profile.
+        #[arg(long)]
+        overwrite: bool,
+    },
     Tui(ProfileArg),
 }
 
@@ -2853,6 +2879,35 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        CommandKind::Export {
+            profile,
+            out,
+            passphrase,
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let pass = resolve_export_passphrase(passphrase)?;
+            let bytes = export_profile_bytes(&profile, &pass)?;
+            write_private(Path::new(&out), &bytes)?;
+            println!(
+                "exported profile to {out} ({} bytes, encrypted)",
+                bytes.len()
+            );
+            Ok(())
+        }
+        CommandKind::Import {
+            profile,
+            input,
+            passphrase,
+            overwrite,
+        } => {
+            let profile = profile.path()?;
+            let pass = resolve_export_passphrase(passphrase)?;
+            let data = fs::read(&input).with_context(|| format!("read {input}"))?;
+            import_profile_bytes(&profile, &data, &pass, overwrite)?;
+            println!("imported profile from {input}");
+            Ok(())
+        }
         CommandKind::Tui(args) => {
             let profile = args.path()?;
             ensure_profile(&profile)?;
@@ -2957,6 +3012,169 @@ fn load_identity(profile: &Path) -> Result<IdentityFile> {
 
 fn save_identity(profile: &Path, id: &IdentityFile) -> Result<()> {
     write_private(&identity_path(profile), toml::to_string_pretty(id)?).context("write identity")
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted profile export / import
+//
+// Bundles the profile's durable state (identity, contacts, message DB, ratchet
+// state) into a single file, encrypted with a passphrase. The archive contains
+// long-term private keys, so it is ALWAYS encrypted (Argon2id-derived key +
+// ChaCha20-Poly1305). Used for backup and for device / applicationId migration.
+// ---------------------------------------------------------------------------
+
+const EXPORT_MAGIC: &[u8] = b"SBEXP1\n";
+
+#[derive(Serialize, Deserialize)]
+struct ProfileArchive {
+    version: u32,
+    exported_at_ms: u128,
+    display_name: String,
+    identity_toml: String,
+    #[serde(default)]
+    contacts_toml: Option<String>,
+    #[serde(default)]
+    messages_db_b64: Option<String>,
+    #[serde(default)]
+    ratchet: std::collections::BTreeMap<String, String>,
+}
+
+fn derive_export_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
+    let mut key = [0u8; 32];
+    argon2::Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| anyhow!("argon2 key derivation failed: {e}"))?;
+    Ok(key)
+}
+
+/// Serialize the profile's durable state into a passphrase-encrypted archive.
+pub(crate) fn export_profile_bytes(profile: &Path, passphrase: &str) -> Result<Vec<u8>> {
+    if passphrase.is_empty() {
+        return Err(anyhow!("export passphrase must not be empty"));
+    }
+    let identity_toml =
+        fs::read_to_string(identity_path(profile)).context("profile has no identity to export")?;
+    let contacts_toml = fs::read_to_string(contacts_path(profile)).ok();
+    let messages_db_b64 = {
+        let p = db_path(profile);
+        if p.exists() {
+            Some(B64.encode(fs::read(&p).context("read messages.db")?))
+        } else {
+            None
+        }
+    };
+    let mut ratchet = std::collections::BTreeMap::new();
+    let rdir = profile.join("ratchet");
+    if rdir.is_dir() {
+        for entry in fs::read_dir(&rdir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    ratchet.insert(name.to_string(), B64.encode(fs::read(&path)?));
+                }
+            }
+        }
+    }
+
+    let archive = ProfileArchive {
+        version: 1,
+        exported_at_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+        display_name: load_display_name(profile).unwrap_or_default(),
+        identity_toml,
+        contacts_toml,
+        messages_db_b64,
+        ratchet,
+    };
+    let plaintext = serde_json::to_vec(&archive)?;
+
+    let mut salt = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+    let key = derive_export_key(passphrase, &salt)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let mut nonce_bytes = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
+        .map_err(|e| anyhow!("export encryption failed: {e}"))?;
+
+    let mut out = Vec::with_capacity(EXPORT_MAGIC.len() + 16 + 12 + ct.len());
+    out.extend_from_slice(EXPORT_MAGIC);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Restore a profile from an archive made by [`export_profile_bytes`]. Refuses to
+/// clobber an existing identity unless `overwrite` is set.
+pub(crate) fn import_profile_bytes(
+    profile: &Path,
+    data: &[u8],
+    passphrase: &str,
+    overwrite: bool,
+) -> Result<()> {
+    let header = EXPORT_MAGIC.len() + 16 + 12;
+    if data.len() < header || &data[..EXPORT_MAGIC.len()] != EXPORT_MAGIC {
+        return Err(anyhow!("not a Sideband export file"));
+    }
+    if !overwrite && identity_path(profile).exists() {
+        return Err(anyhow!(
+            "target profile already has an identity; pass --overwrite to replace it"
+        ));
+    }
+    let rest = &data[EXPORT_MAGIC.len()..];
+    let (salt, rest) = rest.split_at(16);
+    let (nonce_bytes, ct) = rest.split_at(12);
+    let key = derive_export_key(passphrase, salt)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+        .map_err(|_| anyhow!("decryption failed (wrong passphrase or corrupt file)"))?;
+    let archive: ProfileArchive =
+        serde_json::from_slice(&plaintext).context("parse export archive")?;
+    if archive.version != 1 {
+        return Err(anyhow!("unsupported export version {}", archive.version));
+    }
+
+    create_private_dir(profile)?;
+    write_private(&identity_path(profile), archive.identity_toml.as_bytes())?;
+    if let Some(contacts) = &archive.contacts_toml {
+        fs::write(contacts_path(profile), contacts).context("write contacts.toml")?;
+    }
+    if let Some(db_b64) = &archive.messages_db_b64 {
+        let bytes = B64.decode(db_b64).context("decode messages.db")?;
+        fs::write(db_path(profile), bytes).context("write messages.db")?;
+    }
+    if !archive.ratchet.is_empty() {
+        let rdir = profile.join("ratchet");
+        create_private_dir(&rdir)?;
+        for (name, b64) in &archive.ratchet {
+            // file_name() strips any path components in an archive-supplied key.
+            let safe = Path::new(name)
+                .file_name()
+                .ok_or_else(|| anyhow!("invalid ratchet entry name"))?;
+            let bytes = B64.decode(b64).context("decode ratchet state")?;
+            write_private(&rdir.join(safe), &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the export/import passphrase from the flag or `SIDEBAND_EXPORT_PASSPHRASE`.
+fn resolve_export_passphrase(flag: Option<String>) -> Result<String> {
+    if let Some(p) = flag {
+        if !p.is_empty() {
+            return Ok(p);
+        }
+    }
+    if let Ok(p) = std::env::var("SIDEBAND_EXPORT_PASSPHRASE") {
+        if !p.is_empty() {
+            return Ok(p);
+        }
+    }
+    Err(anyhow!(
+        "provide --passphrase or set SIDEBAND_EXPORT_PASSPHRASE"
+    ))
 }
 
 pub fn load_display_name(profile: &Path) -> Result<String> {

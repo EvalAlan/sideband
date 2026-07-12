@@ -210,6 +210,48 @@ fn recover_add_key_fields_splits_concatenated_keys() {
     assert_eq!(ok[2], ed);
 }
 
+/// A passphrase-encrypted profile export must round-trip: identity, contacts,
+/// display name, and ratchet state restore into a fresh profile, and the wrong
+/// passphrase must fail.
+#[test]
+fn profile_export_import_round_trips() {
+    const ONION: &str = "qdnx34k2b3fzp3umv7ryvzxtbzjluzkvuvqixvuooy43b5n6lddaspid.onion";
+    const ED: &str = "fLo7TRtqCxE2wtjTvNvUJjRDBewhYV7bkW3P/F/451w=";
+    const X: &str = "K4+eWfSYw8TtmsViirLxsNs7zAWzKQ/YtJtQFVcncUk=";
+
+    let src = tempfile::tempdir().unwrap();
+    init_profile_with_name(src.path(), "Mercury").unwrap();
+    contact_add(src.path(), "Rocky", ONION, ED, X).unwrap();
+    init_ratchet_for_contact(src.path(), "Rocky").unwrap();
+
+    let archive = crate::export_profile_bytes(src.path(), "hunter2").unwrap();
+    assert!(archive.starts_with(b"SBEXP1\n"));
+
+    // Wrong passphrase must not decrypt.
+    let wrong = tempfile::tempdir().unwrap();
+    assert!(crate::import_profile_bytes(wrong.path(), &archive, "nope", false).is_err());
+
+    // Correct passphrase restores into a fresh profile.
+    let dst = tempfile::tempdir().unwrap();
+    crate::import_profile_bytes(dst.path(), &archive, "hunter2", false).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(src.path().join("identity.toml")).unwrap(),
+        std::fs::read_to_string(dst.path().join("identity.toml")).unwrap(),
+        "identity must be identical after import"
+    );
+    assert_eq!(crate::load_display_name(dst.path()).unwrap(), "Mercury");
+    assert!(load_contacts(dst.path()).unwrap().contains_key("Rocky"));
+    assert!(
+        dst.path().join("ratchet").join("Rocky.bin").exists(),
+        "ratchet state must be restored"
+    );
+
+    // Importing over an existing identity is refused without overwrite.
+    assert!(crate::import_profile_bytes(dst.path(), &archive, "hunter2", false).is_err());
+    crate::import_profile_bytes(dst.path(), &archive, "hunter2", true).unwrap();
+}
+
 /// Discovering a group from a peer must never add our own identity as a contact
 /// or a group member — the UI represents self implicitly as "You".
 #[test]
