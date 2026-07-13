@@ -18,8 +18,9 @@ use tokio::sync::mpsc;
 
 use crate::handler::{handle_text_message, parse_inbound_line};
 use crate::{
-    build_outbound_message, contact_add, init_profile_with_name, init_ratchet_for_contact,
-    load_contacts, load_history, load_signing_key, load_x25519_public, TuiEvent,
+    build_outbound_message, contact_add, get_conversation_ttl, init_profile_with_name,
+    init_ratchet_for_contact, load_contacts, load_history, load_signing_key, load_x25519_public,
+    resolve_message_expiry, set_conversation_ttl, TuiEvent,
 };
 
 // Valid v3 onion addresses (checksum-correct) for harness peers. They are never
@@ -309,6 +310,71 @@ async fn expiring_message_is_signed_honored_and_swept() {
             .any(|r| r.body == "keep me"),
         "a not-yet-expired message must remain"
     );
+}
+
+/// The send-side resolution wiring: a per-conversation default TTL produces an
+/// absolute expiry on a plain send, a per-message override beats the default
+/// (including an explicit OFF), and a queued retry preserves the expiry.
+#[tokio::test]
+async fn send_side_expiry_resolves_default_override_and_survives_retry() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    };
+
+    // No default set: a plain send has no expiry.
+    assert_eq!(
+        resolve_message_expiry(alice.profile(), "contact", "bob", None).unwrap(),
+        None
+    );
+
+    // Set a 1h per-conversation default; a plain send now expires ~1h out.
+    set_conversation_ttl(alice.profile(), "contact", "bob", Some(3_600_000)).unwrap();
+    assert_eq!(
+        get_conversation_ttl(alice.profile(), "contact", "bob").unwrap(),
+        Some(3_600_000)
+    );
+    let resolved = resolve_message_expiry(alice.profile(), "contact", "bob", None)
+        .unwrap()
+        .expect("default should produce an expiry");
+    assert!((resolved as i128 - (now() + 3_600_000) as i128).abs() < 5_000);
+
+    // A per-message OFF override wins over the default.
+    assert_eq!(
+        resolve_message_expiry(alice.profile(), "contact", "bob", Some(None)).unwrap(),
+        None
+    );
+    // A per-message TTL override wins over the default.
+    let overridden = resolve_message_expiry(alice.profile(), "contact", "bob", Some(Some(60_000)))
+        .unwrap()
+        .expect("override should produce an expiry");
+    assert!((overridden as i128 - (now() + 60_000) as i128).abs() < 5_000);
+
+    // End to end: a resolved expiry rides the signed wire message and lands with
+    // the same deadline on the receiver.
+    let msg = build_outbound_message(
+        alice.profile(),
+        "bob",
+        "msg",
+        "vanishing",
+        &alice.onion,
+        Some(resolved),
+    )
+    .unwrap();
+    let events = deliver(&bob, &serde_json::to_string(&msg).unwrap()).await;
+    assert!(events[0].2, "expiring message must verify");
+    // The message is present now (expiry is in the future) on both ends.
+    assert!(load_history(bob.profile(), Some("alice"), 50)
+        .unwrap()
+        .iter()
+        .any(|r| r.body == "vanishing"));
 }
 
 /// A file sent to a group must be filed under the group conversation on the

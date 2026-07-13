@@ -17,6 +17,9 @@ type ListenerStatusCallback = extern "C" fn(status: *const c_char, onion: *const
 struct MobileSendCommand {
     to: String,
     payload: MobileSendPayload,
+    /// Per-message disappearing override (ms): negative/absent = conversation
+    /// default, 0 = off, positive = TTL. Only meaningful for `Message` payloads.
+    expires_ms: Option<i64>,
     response: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
@@ -190,7 +193,12 @@ pub fn api_unblock_contact(profile_path: &str, name: &str) -> Result<bool> {
     crate::contact_unblock(&profile, name)
 }
 
-pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Result<()> {
+pub async fn api_send_message(
+    profile_path: &str,
+    to: &str,
+    body: &str,
+    expires_ms: Option<i64>,
+) -> Result<()> {
     let profile = expand_profile(profile_path);
     let listener_send_tx = {
         let guard = LISTENER_STATE
@@ -205,6 +213,7 @@ pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Resul
             .send(MobileSendCommand {
                 to: to.to_string(),
                 payload: MobileSendPayload::Message(body.to_string()),
+                expires_ms,
                 response: response_tx,
             })
             .await
@@ -218,10 +227,46 @@ pub async fn api_send_message(profile_path: &str, to: &str, body: &str) -> Resul
 
     // No listener: never bootstrap Tor on the caller's thread. Persist to the
     // retry queue so the message is delivered when the listener next runs, and
-    // return immediately.
+    // return immediately. Resolve the message's absolute expiry now so it keeps
+    // its deadline while queued.
     let onion = crate::resolve_to(&profile, to)?;
-    crate::enqueue_retry(&profile, to, &onion, body, "queued: no listener running")?;
+    let override_ttl = crate::override_ttl_from_i64(expires_ms);
+    let expires_at_ms =
+        crate::resolve_message_expiry(&profile, "contact", to, override_ttl).unwrap_or(None);
+    crate::enqueue_retry(
+        &profile,
+        to,
+        &onion,
+        body,
+        "queued: no listener running",
+        expires_at_ms,
+    )?;
     Ok(())
+}
+
+/// Read the per-conversation default disappearing-message TTL (ms; 0 = off).
+pub fn api_get_conversation_expiry(profile_path: &str, kind: &str, id: &str) -> Result<i64> {
+    let profile = expand_profile(profile_path);
+    Ok(crate::get_conversation_ttl(&profile, kind, id)?
+        .map(|t| t as i64)
+        .unwrap_or(0))
+}
+
+/// Set the per-conversation default disappearing-message TTL (ms; 0/negative = off).
+pub fn api_set_conversation_expiry(
+    profile_path: &str,
+    kind: &str,
+    id: &str,
+    ttl_ms: i64,
+) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    let ttl = if ttl_ms > 0 {
+        Some(ttl_ms as u128)
+    } else {
+        None
+    };
+    crate::set_conversation_ttl(&profile, kind, id, ttl)?;
+    Ok(true)
 }
 
 pub async fn api_send_file(profile_path: &str, to: &str, file_path: &str) -> Result<()> {
@@ -239,6 +284,7 @@ pub async fn api_send_file(profile_path: &str, to: &str, file_path: &str) -> Res
             .send(MobileSendCommand {
                 to: to.to_string(),
                 payload: MobileSendPayload::File(file_path.to_string()),
+                expires_ms: None,
                 response: response_tx,
             })
             .await
@@ -388,7 +434,8 @@ pub fn api_send_group_message(profile_path: &str, group_id: &str, message: &str)
     rt.spawn(async move {
         match TorTransport::bootstrap(&profile).await {
             Ok(tor_client) => {
-                if let Err(e) = crate::send_group(&profile, &group, &body, tor_client, false).await
+                if let Err(e) =
+                    crate::send_group(&profile, &group, &body, tor_client, false, None).await
                 {
                     tracing::error!(error=%e, group=%group, "background group send failed");
                 }
@@ -616,15 +663,53 @@ pub extern "C" fn sideband_api_send_message(
     profile_path: *const c_char,
     to: *const c_char,
     body: *const c_char,
+    expires_ms: i64,
 ) -> *mut c_char {
     json_response((|| {
         // These async fns enqueue-and-return without awaiting network I/O, so
         // block_on completes immediately and never freezes the caller.
+        // expires_ms: negative = conversation default, 0 = off, positive = TTL.
         shared_runtime()?.block_on(api_send_message(
             cstr_arg(profile_path, "profile_path")?,
             cstr_arg(to, "to")?,
             cstr_arg(body, "body")?,
+            Some(expires_ms),
         ))
+    })())
+}
+
+/// Read the per-conversation default disappearing-message TTL (ms; 0 = off).
+/// `kind` is "contact" or "group"; `id` is the contact name or group id.
+#[no_mangle]
+pub extern "C" fn sideband_api_get_conversation_expiry(
+    profile_path: *const c_char,
+    kind: *const c_char,
+    id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_get_conversation_expiry(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(kind, "kind")?,
+            cstr_arg(id, "id")?,
+        )
+    })())
+}
+
+/// Set the per-conversation default disappearing-message TTL (ms; 0 = off).
+#[no_mangle]
+pub extern "C" fn sideband_api_set_conversation_expiry(
+    profile_path: *const c_char,
+    kind: *const c_char,
+    id: *const c_char,
+    ttl_ms: i64,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_conversation_expiry(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(kind, "kind")?,
+            cstr_arg(id, "id")?,
+            ttl_ms,
+        )
     })())
 }
 
@@ -870,17 +955,29 @@ pub extern "C" fn sideband_api_listener_start(profile_path: *const c_char) -> *m
                         let result = match cmd.payload {
                             MobileSendPayload::Message(body) => {
                                 match crate::resolve_to(&send_profile, &cmd.to) {
-                                    Ok(onion) => crate::send(
-                                        &send_profile,
-                                        &onion,
-                                        &body,
-                                        &cmd.to,
-                                        None,
-                                        send_client.clone(),
-                                        false,
-                                    )
-                                    .await
-                                    .map_err(|e| e.to_string()),
+                                    Ok(onion) => {
+                                        let override_ttl =
+                                            crate::override_ttl_from_i64(cmd.expires_ms);
+                                        let expires_at_ms = crate::resolve_message_expiry(
+                                            &send_profile,
+                                            "contact",
+                                            &cmd.to,
+                                            override_ttl,
+                                        )
+                                        .unwrap_or(None);
+                                        crate::send(
+                                            &send_profile,
+                                            &onion,
+                                            &body,
+                                            &cmd.to,
+                                            None,
+                                            send_client.clone(),
+                                            false,
+                                            expires_at_ms,
+                                        )
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                    }
                                     Err(e) => Err(e.to_string()),
                                 }
                             }
@@ -1277,7 +1374,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            api_send_message("/tmp/sideband-test-profile", "bob", "hi there"),
+            api_send_message("/tmp/sideband-test-profile", "bob", "hi there", Some(-1)),
         )
         .await;
         assert!(result.is_ok(), "api_send_message waited for delivery");
@@ -1299,7 +1396,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().to_str().unwrap();
         assert_eq!(api_retry_status(profile).unwrap(), 0);
-        crate::enqueue_retry(dir.path(), "alice", "alice.onion", "hi", "err").unwrap();
+        crate::enqueue_retry(dir.path(), "alice", "alice.onion", "hi", "err", None).unwrap();
         assert_eq!(api_retry_status(profile).unwrap(), 1);
     }
 

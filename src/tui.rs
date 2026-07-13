@@ -1270,8 +1270,15 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
                 let group = cmd.group.clone();
                 let message = cmd.message.clone();
                 if let Some(group) = group {
-                    match crate::send_group(&profile, &group, &message, Arc::clone(&tor), false)
-                        .await
+                    match crate::send_group(
+                        &profile,
+                        &group,
+                        &message,
+                        Arc::clone(&tor),
+                        false,
+                        None,
+                    )
+                    .await
                     {
                         Ok(result) => {
                             let status = if result.failures.is_empty() {

@@ -17,7 +17,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use qrcode::{render::unicode, Color as QrColor, QrCode};
 use rand::rngs::OsRng;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -140,6 +140,24 @@ enum CommandKind {
         /// Force static X25519 encryption instead of Double Ratchet.
         #[arg(long = "static")]
         force_static: bool,
+        /// Disappearing-message override for this message: a duration
+        /// (e.g. 30s, 5m, 1h, 7d) or "off". Omit to use the conversation default.
+        #[arg(long)]
+        expire: Option<String>,
+    },
+    /// Show or set the per-conversation default disappearing-message timer.
+    Expiry {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Contact name to scope the timer to.
+        #[arg(long, conflicts_with = "group")]
+        contact: Option<String>,
+        /// Group id or exact title to scope the timer to.
+        #[arg(long)]
+        group: Option<String>,
+        /// New default: a duration (30s, 5m, 1h, 7d) or "off". Omit to just show.
+        #[arg(long)]
+        set: Option<String>,
     },
     Contact {
         #[command(subcommand)]
@@ -289,6 +307,10 @@ enum GroupAction {
         /// Force static X25519 encryption instead of Double Ratchet.
         #[arg(long = "static")]
         force_static: bool,
+        /// Disappearing-message override for this message: a duration
+        /// (30s, 5m, 1h, 7d) or "off". Omit to use the group default.
+        #[arg(long)]
+        expire: Option<String>,
     },
     Delete {
         #[command(flatten)]
@@ -1471,6 +1493,15 @@ fn init_db(profile: &Path) -> Result<Connection> {
             ON retry_queue(next_retry_at)",
         [],
     )?;
+    // Disappearing messages: a queued retry must carry the same *absolute* expiry
+    // the message was created with, so a message that expires while waiting to be
+    // delivered dies rather than resurrecting with a fresh clock (0 = never).
+    ensure_column(
+        &conn,
+        "retry_queue",
+        "expires_at_ms",
+        "ALTER TABLE retry_queue ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS seen_messages (
             envelope_hash TEXT PRIMARY KEY,
@@ -1679,7 +1710,12 @@ fn parse_stored_group_message_payload(body: &str) -> Option<GroupMessagePayload>
 }
 
 fn ensure_message_column(conn: &Connection, column: &str, alter_sql: &str) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+    ensure_column(conn, "messages", column, alter_sql)
+}
+
+/// Idempotently add `column` to `table` (runs `alter_sql` only if absent).
+fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
     for col in cols {
         if col? == column {
@@ -1784,19 +1820,116 @@ pub(crate) fn purge_expired_messages(profile: &Path) -> Result<usize> {
     Ok(n)
 }
 
+/// Read the per-conversation default disappearing-message TTL, in ms.
+/// `None` means disappearing messages are off for this conversation.
+pub(crate) fn get_conversation_ttl(
+    profile: &Path,
+    conversation_kind: &str,
+    conversation_id: &str,
+) -> Result<Option<u128>> {
+    let conn = init_db(profile)?;
+    let ttl: Option<i64> = conn
+        .query_row(
+            "SELECT ttl_ms FROM conversation_expiry
+             WHERE conversation_kind = ?1 AND conversation_id = ?2",
+            params![conversation_kind, conversation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match ttl {
+        Some(t) if t > 0 => Some(t as u128),
+        _ => None,
+    })
+}
+
+/// Set (or clear, with `None`/`Some(0)`) the per-conversation default TTL, in ms.
+pub(crate) fn set_conversation_ttl(
+    profile: &Path,
+    conversation_kind: &str,
+    conversation_id: &str,
+    ttl_ms: Option<u128>,
+) -> Result<()> {
+    let conn = init_db(profile)?;
+    match ttl_ms {
+        Some(t) if t > 0 => {
+            conn.execute(
+                "INSERT INTO conversation_expiry (conversation_kind, conversation_id, ttl_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(conversation_kind, conversation_id)
+                 DO UPDATE SET ttl_ms = excluded.ttl_ms",
+                params![conversation_kind, conversation_id, t as i64],
+            )?;
+        }
+        _ => {
+            conn.execute(
+                "DELETE FROM conversation_expiry
+                 WHERE conversation_kind = ?1 AND conversation_id = ?2",
+                params![conversation_kind, conversation_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the *absolute* expiry (ms since epoch) for a new outgoing message.
+///
+/// `override_ttl` encodes the per-message choice:
+/// - `None` — no override; use the conversation default.
+/// - `Some(None)` — override OFF; this message never expires.
+/// - `Some(Some(t))` — override; this message expires `t` ms from now.
+pub(crate) fn resolve_message_expiry(
+    profile: &Path,
+    conversation_kind: &str,
+    conversation_id: &str,
+    override_ttl: Option<Option<u128>>,
+) -> Result<Option<u128>> {
+    let ttl = match override_ttl {
+        Some(explicit) => explicit,
+        None => get_conversation_ttl(profile, conversation_kind, conversation_id)?,
+    };
+    Ok(match ttl {
+        Some(t) if t > 0 => {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            Some(now + t)
+        }
+        _ => None,
+    })
+}
+
+/// Decode the tri-state per-message expiry override used at the CLI/FFI/control
+/// boundary from a single integer: negative/absent = use conversation default,
+/// `0` = explicitly off, positive = TTL in ms.
+pub(crate) fn override_ttl_from_i64(v: Option<i64>) -> Option<Option<u128>> {
+    match v {
+        None => None,
+        Some(n) if n < 0 => None,
+        Some(0) => Some(None),
+        Some(n) => Some(Some(n as u128)),
+    }
+}
+
 /// Enqueue a failed outbound message for retry. Returns the queue ID.
+/// `expires_at_ms` is the message's absolute expiry (ms, `None` = never); it is
+/// preserved so a retried message keeps its original deadline.
 pub(crate) fn enqueue_retry(
     profile: &Path,
     contact: &str,
     onion: &str,
     message: &str,
     error: &str,
+    expires_at_ms: Option<u128>,
 ) -> Result<i64> {
     let conn = init_db(profile)?;
     conn.execute(
-        "INSERT INTO retry_queue (contact, onion, message, attempts, next_retry_at, last_error)
-         VALUES (?1, ?2, ?3, 1, datetime('now', '+30 seconds'), ?4)",
-        params![contact, onion, message, error],
+        "INSERT INTO retry_queue (contact, onion, message, attempts, next_retry_at, last_error, expires_at_ms)
+         VALUES (?1, ?2, ?3, 1, datetime('now', '+30 seconds'), ?4, ?5)",
+        params![
+            contact,
+            onion,
+            message,
+            error,
+            expires_at_ms.map(|v| v as i64).unwrap_or(0),
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -1808,16 +1941,32 @@ pub(crate) fn retry_queue_len(profile: &Path) -> Result<usize> {
     Ok(count as usize)
 }
 
+/// A retry-queue row due for another delivery attempt.
+pub(crate) struct RetryItem {
+    pub id: i64,
+    pub contact: String,
+    pub onion: String,
+    pub message: String,
+    /// Absolute expiry (ms since epoch); 0 = never.
+    pub expires_at_ms: i64,
+}
+
 /// Get all due retry items (next_retry_at <= now).
-pub(crate) fn retry_due(profile: &Path) -> Result<Vec<(i64, String, String, String)>> {
+pub(crate) fn retry_due(profile: &Path) -> Result<Vec<RetryItem>> {
     let conn = init_db(profile)?;
     let mut stmt = conn.prepare(
-        "SELECT id, contact, onion, message FROM retry_queue
+        "SELECT id, contact, onion, message, expires_at_ms FROM retry_queue
          WHERE next_retry_at <= datetime('now')
          ORDER BY created_at ASC LIMIT 5",
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        Ok(RetryItem {
+            id: row.get(0)?,
+            contact: row.get(1)?,
+            onion: row.get(2)?,
+            message: row.get(3)?,
+            expires_at_ms: row.get(4)?,
+        })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("retry_due query: {e}"))
@@ -2034,6 +2183,54 @@ fn history_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
 
 fn now_ms_i64() -> Result<i64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
+}
+
+/// Parse a human disappearing-message duration into a TTL in ms.
+/// `off`/`none`/`0` → `None` (never expire). Otherwise a number with an optional
+/// unit suffix: `s`, `m` (minutes), `h`, `d`, `w`. A bare number is seconds.
+fn parse_expire_duration(s: &str) -> Result<Option<u128>> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() || s == "off" || s == "none" || s == "never" || s == "0" {
+        return Ok(None);
+    }
+    let (num, unit_ms): (&str, u128) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1_000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400_000)
+    } else if let Some(n) = s.strip_suffix('w') {
+        (n, 604_800_000)
+    } else {
+        (s.as_str(), 1_000)
+    };
+    let value: u128 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid expire duration: '{s}' (try 30s, 5m, 1h, 7d, or off)"))?;
+    if value == 0 {
+        return Ok(None);
+    }
+    Ok(Some(value * unit_ms))
+}
+
+/// Render a TTL in ms as a compact human string (e.g. `1h`, `7d`, `90m`).
+fn format_duration_ms(ms: u128) -> String {
+    const S: u128 = 1_000;
+    const M: u128 = 60 * S;
+    const H: u128 = 60 * M;
+    const D: u128 = 24 * H;
+    const W: u128 = 7 * D;
+    for (unit, label) in [(W, "w"), (D, "d"), (H, "h"), (M, "m"), (S, "s")] {
+        if ms >= unit && ms.is_multiple_of(unit) {
+            return format!("{}{}", ms / unit, label);
+        }
+    }
+    format!("{ms}ms")
 }
 
 fn generate_group_id() -> String {
@@ -2450,11 +2647,17 @@ pub(crate) async fn send_group(
     message: &str,
     tor_client: Arc<TorClient<PreferredRuntime>>,
     force_static: bool,
+    override_ttl: Option<Option<u128>>,
 ) -> Result<GroupSendResult> {
     let group = resolve_group(profile, group_ref)?;
     let contacts = load_contacts(profile)?;
     let mut failures = Vec::new();
     let mut sent = 0usize;
+
+    // Resolve the absolute expiry once so every member copy and the local record
+    // share the same deadline (per-message override falls back to the group's
+    // conversation default).
+    let expires_at_ms = resolve_message_expiry(profile, "group", &group.id, override_ttl)?;
 
     for member in &group.members {
         let Some(contact) = contacts.get(&member.contact) else {
@@ -2477,6 +2680,7 @@ pub(crate) async fn send_group(
             &group.id,
             false,
             false,
+            expires_at_ms,
         )
         .await
         {
@@ -2488,7 +2692,7 @@ pub(crate) async fn send_group(
         }
     }
 
-    if let Err(e) = store_message_for_conversation(
+    if let Err(e) = store_message_for_conversation_expiring(
         profile,
         "out",
         "You",
@@ -2502,6 +2706,7 @@ pub(crate) async fn send_group(
         },
         "group",
         &group.id,
+        expires_at_ms,
     ) {
         error!(error=%e, "failed to store outbound group message");
     }
@@ -2577,6 +2782,10 @@ struct ServeControlCommand {
     group: Option<String>,
     message: Option<String>,
     path: Option<String>,
+    /// Per-message disappearing override (ms): absent/negative = use the
+    /// conversation default, 0 = explicitly off, positive = TTL in ms.
+    #[serde(default)]
+    expires_ms: Option<i64>,
 }
 
 /// Typed response emitted as JSON on stdout for the GUI to parse.
@@ -2756,10 +2965,18 @@ async fn main() -> Result<()> {
             to,
             message,
             force_static,
+            expire,
         } => {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
             let onion = resolve_to(&profile, &to)?;
+            // Per-message override: `--expire` present ⇒ override (off or a TTL);
+            // absent ⇒ fall back to the contact's conversation default.
+            let override_ttl = match expire {
+                Some(s) => Some(parse_expire_duration(&s)?),
+                None => None,
+            };
+            let expires_at_ms = resolve_message_expiry(&profile, "contact", &to, override_ttl)?;
             let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
             send(
                 &profile,
@@ -2769,8 +2986,32 @@ async fn main() -> Result<()> {
                 None,
                 tor_client,
                 force_static,
+                expires_at_ms,
             )
             .await
+        }
+        CommandKind::Expiry {
+            profile,
+            contact,
+            group,
+            set,
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let (kind, id) = match (&contact, &group) {
+                (Some(c), _) => ("contact", c.clone()),
+                (_, Some(g)) => ("group", resolve_group(&profile, g)?.id),
+                (None, None) => return Err(anyhow!("specify --contact or --group")),
+            };
+            if let Some(s) = set {
+                let ttl = parse_expire_duration(&s)?;
+                set_conversation_ttl(&profile, kind, &id, ttl)?;
+            }
+            match get_conversation_ttl(&profile, kind, &id)? {
+                Some(ttl) => println!("disappearing messages: on ({})", format_duration_ms(ttl)),
+                None => println!("disappearing messages: off"),
+            }
+            Ok(())
         }
         CommandKind::Contact { action } => match action {
             ContactAction::Add {
@@ -2882,12 +3123,24 @@ async fn main() -> Result<()> {
                 group,
                 message,
                 force_static,
+                expire,
             } => {
                 let profile = profile.path()?;
                 ensure_profile(&profile)?;
+                let override_ttl = match expire {
+                    Some(s) => Some(parse_expire_duration(&s)?),
+                    None => None,
+                };
                 let tor_client = transport::tor::TorTransport::bootstrap(&profile).await?;
-                let result =
-                    send_group(&profile, &group, &message, tor_client, force_static).await?;
+                let result = send_group(
+                    &profile,
+                    &group,
+                    &message,
+                    tor_client,
+                    force_static,
+                    override_ttl,
+                )
+                .await?;
                 println!(
                     "group '{}' sent to {}/{} member(s)",
                     result.group_title, result.sent, result.total
@@ -4707,12 +4960,25 @@ pub(crate) async fn serve(
                         continue;
                     };
                     emit_response(&ServeResponse::Ack { cmd: "send".into() });
+                    let override_ttl = override_ttl_from_i64(cmd.expires_ms);
                     tokio::spawn(async move {
                         let _guard = send_lock.lock().await;
                         match resolve_to(&profile, &to) {
                             Ok(onion) => {
-                                match send(&profile, &onion, &message, &to, None, tor_client, false)
-                                    .await
+                                let expires_at_ms =
+                                    resolve_message_expiry(&profile, "contact", &to, override_ttl)
+                                        .unwrap_or(None);
+                                match send(
+                                    &profile,
+                                    &onion,
+                                    &message,
+                                    &to,
+                                    None,
+                                    tor_client,
+                                    false,
+                                    expires_at_ms,
+                                )
+                                .await
                                 {
                                     Ok(()) => {
                                         println!("message sent");
@@ -4762,9 +5028,19 @@ pub(crate) async fn serve(
                     emit_response(&ServeResponse::Ack {
                         cmd: "group_send".into(),
                     });
+                    let override_ttl = override_ttl_from_i64(cmd.expires_ms);
                     tokio::spawn(async move {
                         let _guard = send_lock.lock().await;
-                        match send_group(&profile, &group, &message, tor_client, false).await {
+                        match send_group(
+                            &profile,
+                            &group,
+                            &message,
+                            tor_client,
+                            false,
+                            override_ttl,
+                        )
+                        .await
+                        {
                             Ok(result) => {
                                 println!(
                                     "group message sent: {} {}/{}",
@@ -5003,13 +5279,44 @@ pub(crate) async fn serve(
                 let profile = profile.to_path_buf();
                 let tc = tor_client.clone();
                 tokio::spawn(async move {
+                    // Sweep expired disappearing messages on the same cadence so a
+                    // long-running listener drops them without waiting for a history
+                    // load (which also purges).
+                    match purge_expired_messages(&profile) {
+                        Ok(n) if n > 0 => info!(purged = n, "swept expired messages"),
+                        Ok(_) => {}
+                        Err(e) => warn!(error=%e, "expired-message sweep failed"),
+                    }
                     match retry_due(&profile) {
                         Ok(items) if items.is_empty() => {}
                         Ok(items) => {
-                            for (id, contact, onion, message) in items {
+                            for item in items {
+                                let RetryItem {
+                                    id,
+                                    contact,
+                                    onion,
+                                    message,
+                                    expires_at_ms,
+                                } = item;
+                                // Drop messages that expired while queued instead of
+                                // delivering them past their deadline.
+                                let now = now_ms_i64().unwrap_or(i64::MAX);
+                                if expires_at_ms > 0 && expires_at_ms <= now {
+                                    info!(id, contact = %contact, "retry: dropping expired message");
+                                    let _ = retry_update(&profile, id, true, None);
+                                    continue;
+                                }
+                                let expiry = (expires_at_ms > 0).then_some(expires_at_ms as u128);
                                 info!(id, contact = %contact, "retry: attempting delivery");
-                                match send_retry(&profile, &onion, &message, &contact, tc.clone())
-                                    .await
+                                match send_retry(
+                                    &profile,
+                                    &onion,
+                                    &message,
+                                    &contact,
+                                    tc.clone(),
+                                    expiry,
+                                )
+                                .await
                                 {
                                     Ok(()) => {
                                         info!(id, contact = %contact, "retry: success");
@@ -5180,6 +5487,7 @@ async fn bridge_query_to_hermes(profile: &Path, contact: &str, query: &str) -> R
 // Send
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send(
     profile: &Path,
     to: &str,
@@ -5188,6 +5496,7 @@ pub async fn send(
     reuse_socks_port: Option<u16>,
     tor_client: Arc<TorClient<PreferredRuntime>>,
     force_static: bool,
+    expires_at_ms: Option<u128>,
 ) -> Result<()> {
     send_in_conversation(
         profile,
@@ -5201,6 +5510,7 @@ pub async fn send(
         contact_hint,
         true,
         false,
+        expires_at_ms,
     )
     .await
 }
@@ -5215,6 +5525,7 @@ pub(crate) async fn send_retry(
     message: &str,
     contact_hint: &str,
     tor_client: Arc<TorClient<PreferredRuntime>>,
+    expires_at_ms: Option<u128>,
 ) -> Result<()> {
     send_in_conversation(
         profile,
@@ -5228,6 +5539,7 @@ pub(crate) async fn send_retry(
         contact_hint,
         true,
         true,
+        expires_at_ms,
     )
     .await
 }
@@ -5245,6 +5557,7 @@ pub(crate) async fn send_in_conversation(
     conversation_id: &str,
     store_outbound_history: bool,
     is_retry: bool,
+    expires_at_ms: Option<u128>,
 ) -> Result<()> {
     if !to.ends_with(".onion") {
         return Err(anyhow!("resolved --to must be an onion address"));
@@ -5289,9 +5602,7 @@ pub(crate) async fn send_in_conversation(
             ratchet_header_b64: header_b64,
             ratchet_nonce_hex: nonce_hex,
             ratchet_ct_hex: ct_hex,
-            // TODO(expiry): thread a per-message/conversation TTL through this
-            // send path; the wire + storage already honor expires_at_ms.
-            expires_at_ms: None,
+            expires_at_ms,
         };
         sign_message(&key, &mut sign_msg)?;
         sign_msg.body.clear(); // Don't send plaintext on wire.
@@ -5312,7 +5623,7 @@ pub(crate) async fn send_in_conversation(
             ratchet_header_b64: String::new(),
             ratchet_nonce_hex: String::new(),
             ratchet_ct_hex: String::new(),
-            expires_at_ms: None, // TODO(expiry): thread TTL through this send path.
+            expires_at_ms,
         };
         sign_message(&key, &mut msg)?;
         let our_x25519 = load_x25519_secret(profile)?;
@@ -5388,7 +5699,7 @@ pub(crate) async fn send_in_conversation(
         .map(|payload| payload.body)
         .unwrap_or_else(|| message.to_string());
     if store_outbound_history {
-        if let Err(e) = store_message_for_conversation(
+        if let Err(e) = store_message_for_conversation_expiring(
             profile,
             "out",
             contact_hint,
@@ -5398,6 +5709,7 @@ pub(crate) async fn send_in_conversation(
             status,
             conversation_kind,
             conversation_id,
+            expires_at_ms,
         ) {
             error!(error=%e, "failed to store outbound message");
         }
@@ -5411,7 +5723,7 @@ pub(crate) async fn send_in_conversation(
         // success — nothing to enqueue
     } else if conversation_kind == "contact" && !is_retry {
         let err_text = last_error.as_deref().unwrap_or("unknown");
-        match enqueue_retry(profile, contact_hint, to, message, err_text) {
+        match enqueue_retry(profile, contact_hint, to, message, err_text, expires_at_ms) {
             Ok(qid) => info!(qid, contact = %contact_hint, "enqueued for retry"),
             Err(e) => warn!(error=%e, "failed to enqueue retry"),
         }
@@ -7158,7 +7470,7 @@ fn failed_retries_do_not_duplicate_queue_row() {
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path();
 
-    let id = enqueue_retry(profile, "alice", "alice.onion", "hello", "timeout").unwrap();
+    let id = enqueue_retry(profile, "alice", "alice.onion", "hello", "timeout", None).unwrap();
     assert_eq!(retry_queue_len(profile).unwrap(), 1);
 
     // Simulate several failed retry attempts (what the retry loop does).
@@ -7180,7 +7492,7 @@ fn failed_retries_do_not_duplicate_queue_row() {
 fn retry_update_drops_after_max_attempts() {
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path();
-    let id = enqueue_retry(profile, "bob", "bob.onion", "hi", "err").unwrap();
+    let id = enqueue_retry(profile, "bob", "bob.onion", "hi", "err", None).unwrap();
     // attempts starts at 1; each failing update increments until the row is
     // dropped at the max. Stop once the queue is empty (the retry loop only
     // updates rows that are still present/due).
@@ -7191,6 +7503,102 @@ fn retry_update_drops_after_max_attempts() {
         retry_update(profile, id, false, Some("nope")).unwrap();
     }
     assert_eq!(retry_queue_len(profile).unwrap(), 0);
+}
+
+#[test]
+fn enqueue_retry_preserves_absolute_expiry() {
+    // A queued disappearing message must keep its original deadline so it dies
+    // if it can't be delivered before it expires, rather than resurrecting.
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    let deadline: u128 = 1_900_000_000_000;
+    let id = enqueue_retry(
+        profile,
+        "alice",
+        "alice.onion",
+        "boom",
+        "offline",
+        Some(deadline),
+    )
+    .unwrap();
+    let conn = init_db(profile).unwrap();
+    let stored: i64 = conn
+        .query_row(
+            "SELECT expires_at_ms FROM retry_queue WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, deadline as i64);
+    // A non-expiring queued message stores 0 (never).
+    let id2 = enqueue_retry(profile, "bob", "bob.onion", "hi", "offline", None).unwrap();
+    let stored2: i64 = conn
+        .query_row(
+            "SELECT expires_at_ms FROM retry_queue WHERE id = ?1",
+            params![id2],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored2, 0);
+}
+
+#[test]
+fn parse_and_format_expire_durations_round_trip() {
+    assert_eq!(parse_expire_duration("off").unwrap(), None);
+    assert_eq!(parse_expire_duration("none").unwrap(), None);
+    assert_eq!(parse_expire_duration("0").unwrap(), None);
+    assert_eq!(parse_expire_duration("30s").unwrap(), Some(30_000));
+    assert_eq!(parse_expire_duration("5m").unwrap(), Some(300_000));
+    assert_eq!(parse_expire_duration("1h").unwrap(), Some(3_600_000));
+    assert_eq!(parse_expire_duration("7d").unwrap(), Some(604_800_000));
+    assert_eq!(parse_expire_duration("2w").unwrap(), Some(1_209_600_000));
+    assert_eq!(parse_expire_duration("45").unwrap(), Some(45_000)); // bare = seconds
+    assert!(parse_expire_duration("banana").is_err());
+    assert_eq!(format_duration_ms(3_600_000), "1h");
+    assert_eq!(format_duration_ms(604_800_000), "1w"); // largest exact unit wins
+    assert_eq!(format_duration_ms(86_400_000), "1d");
+    assert_eq!(format_duration_ms(90_000), "90s"); // not a whole minute → seconds
+}
+
+#[test]
+fn conversation_ttl_default_and_override_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    // Unset ⇒ off.
+    assert_eq!(
+        get_conversation_ttl(profile, "contact", "alice").unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_message_expiry(profile, "contact", "alice", None).unwrap(),
+        None
+    );
+    // Set default ⇒ resolves to now + ttl.
+    set_conversation_ttl(profile, "contact", "alice", Some(60_000)).unwrap();
+    let now = now_ms_i64().unwrap() as i128;
+    let resolved = resolve_message_expiry(profile, "contact", "alice", None)
+        .unwrap()
+        .unwrap() as i128;
+    assert!((resolved - (now + 60_000)).abs() < 5_000);
+    // Override OFF beats the default.
+    assert_eq!(
+        resolve_message_expiry(profile, "contact", "alice", Some(None)).unwrap(),
+        None
+    );
+    // Clearing the default turns it off again.
+    set_conversation_ttl(profile, "contact", "alice", None).unwrap();
+    assert_eq!(
+        get_conversation_ttl(profile, "contact", "alice").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn override_ttl_from_i64_encodes_tri_state() {
+    assert_eq!(override_ttl_from_i64(None), None);
+    assert_eq!(override_ttl_from_i64(Some(-1)), None);
+    assert_eq!(override_ttl_from_i64(Some(0)), Some(None));
+    assert_eq!(override_ttl_from_i64(Some(60_000)), Some(Some(60_000)));
 }
 
 #[test]

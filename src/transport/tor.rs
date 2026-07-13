@@ -332,6 +332,10 @@ impl Transport for TorTransport {
             .map(|c| c.name.clone())
             .ok_or_else(|| anyhow!("unknown contact for onion '{}'", envelope.to))?;
 
+        // Honor the contact's per-conversation disappearing-message default
+        // (the TUI 1:1 path has no per-message override yet).
+        let expires_at_ms =
+            crate::resolve_message_expiry(profile, "contact", &contact_name, None).unwrap_or(None);
         crate::send(
             profile,
             &envelope.to,
@@ -340,6 +344,7 @@ impl Transport for TorTransport {
             None,
             self.client.clone(),
             false,
+            expires_at_ms,
         )
         .await
     }
