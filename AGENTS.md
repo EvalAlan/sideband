@@ -163,26 +163,35 @@ migrated** `com.example.sideband_gui` → `com.evalalan.sideband` (Kotlin packag
 moved too; APK id verified via aapt); **group file sends now file under the
 group conversation** on the receiving side and as a single local group record,
 instead of showing up as 1:1 PMs (file offer/chunk/inline payloads carry
-optional group context; `store_file_message` helper routes them).
+optional group context; `store_file_message` helper routes them);
+**disappearing / expiring messages, end to end** — a signed, sender-enforced
+absolute `expires_at_ms` on `ChatMessage` (in `payload_to_sign`, so a relay can't
+strip it; backward-compatible via serde default); `expires_at_ms` column on
+`messages` + a `conversation_expiry(kind,id,ttl_ms)` default table;
+`get/set_conversation_ttl` + `resolve_message_expiry` (per-message override with
+tri-state `override_ttl_from_i64`, falling back to the conversation default);
+expiry threaded through `send` / `send_retry` / `send_in_conversation` (v2+v3) and
+`send_group`; the retry queue carries `expires_at_ms` and drops messages that
+expired while queued; `serve` sweeps on its periodic tick (not only on history
+load). CLI `send --expire <dur|off>`, `group send --expire`, and an `expiry`
+subcommand (`--json` for the GUI). FFI `sideband_api_send_message` takes an
+`expires_ms` arg; new `sideband_api_get/set_conversation_expiry`. Both GUIs get a
+message-input timer control (per-conversation default + one-shot per-message
+override, default OFF). **Android `FLAG_SECURE`** — a "Block screenshots" setting
+toggles a `setFlagSecure` MethodChannel (blocks screenshots/recording + recents
+preview). Tests: `expiring_message_is_signed_honored_and_swept`,
+`send_side_expiry_resolves_default_override_and_survives_retry`,
+`enqueue_retry_preserves_absolute_expiry`, plus duration-parse / resolution /
+tri-state units.
 
 **Open / backlog (roughly prioritized):**
-1. **Disappearing / expiring messages** — MECHANISM DONE, send-side UX next.
-   Done: signed `expires_at_ms` on `ChatMessage` (in `payload_to_sign`, so a
-   relay can't strip it; backward-compatible via serde default); `expires_at_ms`
-   column on `messages` + `conversation_expiry(kind,id,ttl_ms)` table;
-   `store_message_for_conversation_expiring` + `purge_expired_messages` (called
-   in `load_history`); inbound honors the sender's expiry. Test:
-   `expiring_message_is_signed_honored_and_swept`.
-   NEXT (send side, per confirmed design — absolute TTL, sender-enforced,
-   per-conversation default + per-message override, default OFF): thread a TTL
-   through `send_in_conversation` (and its callers / the retry queue, which must
-   preserve expiry) and `send_group`; `build_outbound_message` already takes the
-   arg. Add get/set for the `conversation_expiry` default; CLI (`send --expire`,
-   `expiry --set/--off`); GUI (per-conversation default + per-message override).
-   Also add a periodic sweep in `serve` (currently only purged on history load).
-   FUTURE (noted, not started): Android `FLAG_SECURE` to block screenshots.
-2. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
-3. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
-3. After an in-app import, the running listener still holds the old identity —
+1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
+2. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
+3. Group per-message expiry override on the **mobile** FFI (contact overrides work
+   on both backends; groups currently honor only the per-conversation default on
+   Android — desktop group sends already carry an override via the control channel).
+4. `FLAG_SECURE` / GUI toggles are session-scoped (matches the other in-memory
+   settings). If any of them should persist across restarts, add a settings store.
+5. After an in-app import, the running listener still holds the old identity —
    the UI just tells the user to restart. A cleaner flow would reload the profile
    (restart the listener) in place.
