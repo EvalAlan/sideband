@@ -1143,6 +1143,27 @@ class _Cli {
     await _run(
         ['send', '--profile', profile, '--to', to, '--message', message]);
   }
+
+  /// Per-conversation default disappearing timer in ms (0 = off). `kind` is
+  /// 'contact' or 'group'; `id` is the contact name or group id.
+  Future<int> getConversationExpiry(
+      {required String kind, required String id}) async {
+    final flag = kind == 'group' ? '--group' : '--contact';
+    final raw = await _run(['expiry', '--profile', profile, flag, id, '--json']);
+    final decoded = jsonDecode(raw);
+    if (decoded is Map && decoded['ttl_ms'] is num) {
+      return (decoded['ttl_ms'] as num).toInt();
+    }
+    return 0;
+  }
+
+  Future<void> setConversationExpiry(
+      {required String kind, required String id, required int ttlMs}) async {
+    final flag = kind == 'group' ? '--group' : '--contact';
+    final set = ttlMs > 0 ? '${ttlMs}ms' : 'off';
+    await _run(
+        ['expiry', '--profile', profile, flag, id, '--set', set, '--json']);
+  }
 }
 
 // Native/Dart signatures for the string-returning FFI entry points. Every
@@ -1196,10 +1217,22 @@ class _MobileApi {
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
                     int)>('sideband_api_list_group_messages'),
         _sendMessage = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
-            ffi.Pointer<Utf8> Function(
-                ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
-                ffi.Pointer<Utf8>)>('sideband_api_send_message'),
+                ffi.Pointer<Utf8>, ffi.Int64),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>, int)>('sideband_api_send_message'),
+        _getConversationExpiry = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>)>('sideband_api_get_conversation_expiry'),
+        _setConversationExpiry = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Int64),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>, int)>('sideband_api_set_conversation_expiry'),
         _sendFile = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(
                 ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
@@ -1287,7 +1320,14 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
       _listGroupMessages;
   final ffi.Pointer<Utf8> Function(
-      ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _sendMessage;
+          ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
+      _sendMessage;
+  final ffi.Pointer<Utf8> Function(
+          ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _getConversationExpiry;
+  final ffi.Pointer<Utf8> Function(
+          ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
+      _setConversationExpiry;
   final ffi.Pointer<Utf8> Function(
       ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _sendFile;
   final ffi.Pointer<Utf8> Function(
@@ -1529,16 +1569,50 @@ class _MobileApi {
     }
   }
 
-  Future<void> send({required String to, required String message}) async {
+  Future<void> send(
+      {required String to,
+      required String message,
+      int expiresMs = -1}) async {
     final profile = (await profilePath()).toNativeUtf8();
     final cto = to.toNativeUtf8();
     final cmessage = message.toNativeUtf8();
     try {
-      _decode<Object?>(_sendMessage(profile, cto, cmessage));
+      // expiresMs: negative = conversation default, 0 = off, positive = TTL ms.
+      _decode<Object?>(_sendMessage(profile, cto, cmessage, expiresMs));
     } finally {
       calloc.free(profile);
       calloc.free(cto);
       calloc.free(cmessage);
+    }
+  }
+
+  /// Per-conversation default disappearing timer in ms (0 = off). `kind` is
+  /// 'contact' or 'group'; `id` is the contact name or group id.
+  Future<int> getConversationExpiry(
+      {required String kind, required String id}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final ckind = kind.toNativeUtf8();
+    final cid = id.toNativeUtf8();
+    try {
+      return _decode<int>(_getConversationExpiry(profile, ckind, cid));
+    } finally {
+      calloc.free(profile);
+      calloc.free(ckind);
+      calloc.free(cid);
+    }
+  }
+
+  Future<void> setConversationExpiry(
+      {required String kind, required String id, required int ttlMs}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final ckind = kind.toNativeUtf8();
+    final cid = id.toNativeUtf8();
+    try {
+      _decode<Object?>(_setConversationExpiry(profile, ckind, cid, ttlMs));
+    } finally {
+      calloc.free(profile);
+      calloc.free(ckind);
+      calloc.free(cid);
     }
   }
 
@@ -1910,6 +1984,30 @@ class _DisplayNameDialogState extends State<_DisplayNameDialog> {
   }
 }
 
+// ── disappearing-message durations ──────────────────────────────────────────
+
+/// Preset disappearing-message timers, in ms. 0 = off (never expire).
+const List<int> _expiryPresetsMs = <int>[
+  0, // off
+  30 * 1000, // 30s
+  5 * 60 * 1000, // 5m
+  60 * 60 * 1000, // 1h
+  6 * 60 * 60 * 1000, // 6h
+  24 * 60 * 60 * 1000, // 1d
+  7 * 24 * 60 * 60 * 1000, // 1w
+];
+
+/// Human label for a disappearing timer in ms (0/negative = "Off").
+String _expiryLabel(int ms) {
+  if (ms <= 0) return 'Off';
+  const s = 1000, m = 60 * s, h = 60 * m, d = 24 * h, w = 7 * d;
+  if (ms % w == 0) return '${ms ~/ w}w';
+  if (ms % d == 0) return '${ms ~/ d}d';
+  if (ms % h == 0) return '${ms ~/ h}h';
+  if (ms % m == 0) return '${ms ~/ m}m';
+  return '${ms ~/ s}s';
+}
+
 // ── screen ──────────────────────────────────────────────────────────────────
 
 class _ChatScreen extends StatefulWidget {
@@ -1946,10 +2044,20 @@ class _ChatScreenState extends State<_ChatScreen>
   bool _showSystemNotifications = true;
   bool _showAudibleNotifications = true;
   bool _minimizeToTrayEnabled = false;
+  // Android FLAG_SECURE: block screenshots/recording and hide the app in the
+  // recents switcher. Session-scoped (matches the other in-memory settings).
+  bool _blockScreenshots = false;
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
   GroupInfo? _selGroup;
+  // Disappearing messages. `_convExpiryMs` is the loaded per-conversation default
+  // (0 = off). `_msgExpireOverrideMs` is a one-shot per-message override: null =
+  // use the default, 0 = off for this message, >0 = TTL ms. `_expiryLoadedFor`
+  // keys which conversation the default was loaded for so we reload on switch.
+  int _convExpiryMs = 0;
+  int? _msgExpireOverrideMs;
+  String? _expiryLoadedFor;
   Process? _listener;
   bool _listenerRunning = false;
   String _listenerStatus = 'listener stopped';
@@ -2313,6 +2421,16 @@ class _ChatScreenState extends State<_ChatScreen>
     if (!Platform.isAndroid) return;
     try {
       await _nativeChannel.invokeMethod<void>('cancelMessageNotifications');
+    } catch (_) {}
+  }
+
+  /// Toggle Android FLAG_SECURE (block screenshots + screen recording, and hide
+  /// contents in the recents switcher). No-op off Android.
+  Future<void> _applyFlagSecure(bool enable) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _nativeChannel
+          .invokeMethod<void>('setFlagSecure', {'enable': enable});
     } catch (_) {}
   }
 
@@ -2687,17 +2805,160 @@ class _ChatScreenState extends State<_ChatScreen>
                   ? Icons.lock_outline
                   : Icons.edit_outlined;
 
+  /// Conversation key ('contact:<name>' or 'group:<id>') for the current
+  /// selection, or null when nothing is selected.
+  String? get _convKey => _selGroup != null
+      ? 'group:${_selGroup!.id}'
+      : (_sel != null ? 'contact:${_sel!.name}' : null);
+
+  /// Load the selected conversation's default disappearing timer, once per
+  /// conversation switch. Resets any per-message override on switch.
+  Future<void> _maybeLoadConversationExpiry() async {
+    final key = _convKey;
+    if (key == null || key == _expiryLoadedFor) return;
+    _expiryLoadedFor = key;
+    _msgExpireOverrideMs = null;
+    final kind = _selGroup != null ? 'group' : 'contact';
+    final id = _selGroup?.id ?? _sel!.name;
+    try {
+      final ms = (_canUseMobileBackend && _mobile != null)
+          ? await _mobile!.getConversationExpiry(kind: kind, id: id)
+          : await _cli.getConversationExpiry(kind: kind, id: id);
+      if (!mounted || _convKey != key) return;
+      setState(() => _convExpiryMs = ms);
+    } catch (_) {
+      // A read failure just leaves the timer control showing "off".
+    }
+  }
+
+  /// Persist a new per-conversation default timer (ms; 0 = off) for the current
+  /// conversation and refresh the shown value.
+  Future<void> _setConversationExpiry(int ttlMs) async {
+    final kind = _selGroup != null ? 'group' : 'contact';
+    final id = _selGroup?.id ?? _sel?.name;
+    if (id == null) return;
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.setConversationExpiry(kind: kind, id: id, ttlMs: ttlMs);
+      } else {
+        await _cli.setConversationExpiry(kind: kind, id: id, ttlMs: ttlMs);
+      }
+      if (mounted) setState(() => _convExpiryMs = ttlMs);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'could not set timer: $e');
+    }
+  }
+
+  /// Timer applied to the *next* message: the per-message override if set,
+  /// otherwise the conversation default. >0 means it will disappear.
+  int get _effectiveNextExpiryMs => _msgExpireOverrideMs ?? _convExpiryMs;
+
+  /// Bottom sheet to set the conversation's default disappearing timer and/or a
+  /// one-shot override for the next message.
+  Future<void> _showExpiryMenu() async {
+    if (_convKey == null) return;
+    final isGroup = _selGroup != null;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _t.surface,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) {
+          Widget chips({
+            required int selected,
+            required void Function(int) onPick,
+            bool includeDefault = false,
+          }) =>
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  if (includeDefault)
+                    ChoiceChip(
+                      label: const Text('Default'),
+                      selected: _msgExpireOverrideMs == null,
+                      onSelected: (_) {
+                        setState(() => _msgExpireOverrideMs = null);
+                        setSheet(() {});
+                      },
+                    ),
+                  for (final ms in _expiryPresetsMs)
+                    ChoiceChip(
+                      label: Text(_expiryLabel(ms)),
+                      selected: selected == ms &&
+                          (!includeDefault || _msgExpireOverrideMs != null),
+                      onSelected: (_) {
+                        onPick(ms);
+                        setSheet(() {});
+                      },
+                    ),
+                ],
+              );
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  Icon(Icons.timer_outlined, size: 18, color: _t.text),
+                  const SizedBox(width: 8),
+                  Text('Disappearing messages',
+                      style: TextStyle(
+                          color: _t.text,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600)),
+                ]),
+                const SizedBox(height: 4),
+                Text(
+                  'Messages are deleted on both ends after the timer. The sender '
+                  'sets it and it is signed into the message.',
+                  style: TextStyle(color: _t.textDim, fontSize: 11),
+                ),
+                const SizedBox(height: 16),
+                Text('Default for this ${isGroup ? 'group' : 'chat'}',
+                    style: TextStyle(
+                        color: _t.text, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 8),
+                chips(
+                  selected: _convExpiryMs,
+                  onPick: (ms) => _setConversationExpiry(ms),
+                ),
+                const SizedBox(height: 20),
+                Text('Just the next message',
+                    style: TextStyle(
+                        color: _t.text, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 8),
+                chips(
+                  includeDefault: true,
+                  selected: _msgExpireOverrideMs ?? _convExpiryMs,
+                  onPick: (ms) => setState(() => _msgExpireOverrideMs = ms),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Future<void> _sendViaListener(
-      {String? to, String? group, required String message}) async {
+      {String? to,
+      String? group,
+      required String message,
+      int expiresMs = -1}) async {
+    // expiresMs: negative = use the conversation default, 0 = off (this message
+    // never expires), positive = TTL in ms for this message only.
     if (_canUseMobileBackend && _mobile != null) {
       if (group != null) {
+        // Group per-message override is not plumbed through the mobile group FFI
+        // yet; groups honor their per-conversation default.
         await _mobile!.sendGroupMessage(groupId: group, message: message);
         return;
       }
       if (to == null || to.isEmpty) {
         throw Exception('missing contact for Android send');
       }
-      await _mobile!.send(to: to, message: message);
+      await _mobile!.send(to: to, message: message, expiresMs: expiresMs);
       return;
     }
     final listener = _listener;
@@ -2710,6 +2971,7 @@ class _ChatScreenState extends State<_ChatScreen>
       if (to != null) 'to': to,
       if (group != null) 'group': group,
       'message': message,
+      'expires_ms': expiresMs,
     }));
     await listener.stdin.flush();
   }
@@ -2966,6 +3228,7 @@ class _ChatScreenState extends State<_ChatScreen>
       _groups = g;
       _sel = s;
       _selGroup = sg;
+      unawaited(_maybeLoadConversationExpiry());
 
       if (s == null && sg == null) {
         await _checkUnread();
@@ -3263,10 +3526,17 @@ class _ChatScreenState extends State<_ChatScreen>
     try {
       // send message text first (if any)
       if (t.isNotEmpty) {
+        // -1 = use the conversation default; the override (off/TTL) wins when set.
+        final expiresMs = _msgExpireOverrideMs ?? -1;
         if (g != null) {
-          await _sendViaListener(group: g.id, message: t);
+          await _sendViaListener(group: g.id, message: t, expiresMs: expiresMs);
         } else {
-          await _sendViaListener(to: c!.name, message: t);
+          await _sendViaListener(
+              to: c!.name, message: t, expiresMs: expiresMs);
+        }
+        // A per-message override applies to a single send only.
+        if (_msgExpireOverrideMs != null) {
+          setState(() => _msgExpireOverrideMs = null);
         }
       }
 
@@ -4952,6 +5222,20 @@ class _ChatScreenState extends State<_ChatScreen>
                         setDialogState(() {});
                       },
                     ),
+                  if (_canUseMobileBackend)
+                    SwitchListTile(
+                      secondary: const Icon(Icons.screenshot_monitor_outlined),
+                      title: const Text('Block screenshots'),
+                      subtitle: const Text(
+                          'Prevent screenshots, screen recording, and previews '
+                          'in the recent-apps switcher'),
+                      value: _blockScreenshots,
+                      onChanged: (value) {
+                        setState(() => _blockScreenshots = value);
+                        setDialogState(() {});
+                        unawaited(_applyFlagSecure(value));
+                      },
+                    ),
                   ListTile(
                     leading: const Icon(Icons.palette_outlined),
                     title: const Text('Theme'),
@@ -6604,6 +6888,57 @@ class _ChatScreenState extends State<_ChatScreen>
                   constraints:
                       const BoxConstraints(minWidth: 32, minHeight: 32),
                   splashRadius: 18,
+                ),
+              ),
+              const SizedBox(width: 4),
+              // disappearing-message timer
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    IconButton(
+                      icon: Icon(
+                        _effectiveNextExpiryMs > 0
+                            ? Icons.timer
+                            : Icons.timer_outlined,
+                        size: 18,
+                        color: _effectiveNextExpiryMs > 0
+                            ? _t.primary
+                            : _t.textDim,
+                      ),
+                      tooltip: _effectiveNextExpiryMs > 0
+                          ? 'Disappearing: ${_expiryLabel(_effectiveNextExpiryMs)}'
+                          : 'Disappearing messages: off',
+                      onPressed: canSend ? _showExpiryMenu : null,
+                      padding: EdgeInsets.zero,
+                      constraints:
+                          const BoxConstraints(minWidth: 32, minHeight: 32),
+                      splashRadius: 18,
+                    ),
+                    if (_effectiveNextExpiryMs > 0)
+                      Positioned(
+                        right: -2,
+                        bottom: -2,
+                        child: IgnorePointer(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 3, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: _t.primary,
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Text(
+                              _expiryLabel(_effectiveNextExpiryMs),
+                              style: TextStyle(
+                                  color: _t.bg,
+                                  fontSize: 8,
+                                  fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
               const SizedBox(width: 4),

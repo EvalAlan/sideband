@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.view.WindowManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -106,6 +107,25 @@ class MainActivity : FlutterActivity() {
                             result.success(null)
                         } catch (e: Exception) {
                             result.error("cancel_notifications_failed", e.message, null)
+                        }
+                    }
+
+                    // Block screenshots and screen recording, and hide app
+                    // contents in the recent-apps switcher, by toggling
+                    // FLAG_SECURE on the window.
+                    "setFlagSecure" -> {
+                        val enable = call.argument<Boolean>("enable") ?: false
+                        try {
+                            runOnUiThread {
+                                if (enable) {
+                                    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                                } else {
+                                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                                }
+                            }
+                            result.success(null)
+                        } catch (e: Exception) {
+                            result.error("set_flag_secure_failed", e.message, null)
                         }
                     }
 

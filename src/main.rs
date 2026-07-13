@@ -158,6 +158,9 @@ enum CommandKind {
         /// New default: a duration (30s, 5m, 1h, 7d) or "off". Omit to just show.
         #[arg(long)]
         set: Option<String>,
+        /// Emit machine-readable JSON ({"ttl_ms": <n>}, 0 = off) instead of text.
+        #[arg(long)]
+        json: bool,
     },
     Contact {
         #[command(subcommand)]
@@ -2995,6 +2998,7 @@ async fn main() -> Result<()> {
             contact,
             group,
             set,
+            json,
         } => {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
@@ -3007,9 +3011,14 @@ async fn main() -> Result<()> {
                 let ttl = parse_expire_duration(&s)?;
                 set_conversation_ttl(&profile, kind, &id, ttl)?;
             }
-            match get_conversation_ttl(&profile, kind, &id)? {
-                Some(ttl) => println!("disappearing messages: on ({})", format_duration_ms(ttl)),
-                None => println!("disappearing messages: off"),
+            let ttl = get_conversation_ttl(&profile, kind, &id)?;
+            if json {
+                println!("{{\"ttl_ms\":{}}}", ttl.unwrap_or(0));
+            } else {
+                match ttl {
+                    Some(t) => println!("disappearing messages: on ({})", format_duration_ms(t)),
+                    None => println!("disappearing messages: off"),
+                }
             }
             Ok(())
         }
