@@ -1164,6 +1164,27 @@ class _Cli {
     await _run(
         ['expiry', '--profile', profile, flag, id, '--set', set, '--json']);
   }
+
+  /// Offline-retry window in ms (how long an undelivered message keeps retrying).
+  Future<int> getRetryWindow() async {
+    final raw = await _run(['retry-window', '--profile', profile, '--json']);
+    final decoded = jsonDecode(raw);
+    if (decoded is Map && decoded['max_age_ms'] is num) {
+      return (decoded['max_age_ms'] as num).toInt();
+    }
+    return 0;
+  }
+
+  Future<void> setRetryWindow(int maxAgeMs) async {
+    await _run([
+      'retry-window',
+      '--profile',
+      profile,
+      '--set',
+      '${maxAgeMs}ms',
+      '--json'
+    ]);
+  }
 }
 
 // Native/Dart signatures for the string-returning FFI entry points. Every
@@ -1233,6 +1254,16 @@ class _MobileApi {
                     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Int64),
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
                     ffi.Pointer<Utf8>, int)>('sideband_api_set_conversation_expiry'),
+        _getRetryWindow = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>)>('sideband_api_get_retry_window'),
+        _setRetryWindow = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Int64),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    int)>('sideband_api_set_retry_window'),
         _sendFile = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(
                 ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
@@ -1328,6 +1359,8 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(
           ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
       _setConversationExpiry;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getRetryWindow;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, int) _setRetryWindow;
   final ffi.Pointer<Utf8> Function(
       ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _sendFile;
   final ffi.Pointer<Utf8> Function(
@@ -1613,6 +1646,25 @@ class _MobileApi {
       calloc.free(profile);
       calloc.free(ckind);
       calloc.free(cid);
+    }
+  }
+
+  /// Offline-retry window in ms (how long an undelivered message keeps retrying).
+  Future<int> getRetryWindow() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      return _decode<int>(_getRetryWindow(profile));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<void> setRetryWindow(int maxAgeMs) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      _decode<Object?>(_setRetryWindow(profile, maxAgeMs));
+    } finally {
+      calloc.free(profile);
     }
   }
 
@@ -2008,6 +2060,27 @@ String _expiryLabel(int ms) {
   return '${ms ~/ s}s';
 }
 
+/// Preset offline-retry windows, in ms.
+const List<int> _retryWindowPresetsMs = <int>[
+  60 * 60 * 1000, // 1 hour
+  6 * 60 * 60 * 1000, // 6 hours
+  12 * 60 * 60 * 1000, // 12 hours
+  24 * 60 * 60 * 1000, // 1 day
+  3 * 24 * 60 * 60 * 1000, // 3 days
+  7 * 24 * 60 * 60 * 1000, // 7 days
+];
+
+/// Long human label for a duration in ms (e.g. "1 day", "6 hours").
+String _expiryLabelLong(int ms) {
+  const h = 60 * 60 * 1000, d = 24 * h;
+  if (ms % d == 0) {
+    final n = ms ~/ d;
+    return n == 1 ? '1 day' : '$n days';
+  }
+  final n = (ms / h).round();
+  return n == 1 ? '1 hour' : '$n hours';
+}
+
 // ── screen ──────────────────────────────────────────────────────────────────
 
 class _ChatScreen extends StatefulWidget {
@@ -2047,6 +2120,9 @@ class _ChatScreenState extends State<_ChatScreen>
   // Android FLAG_SECURE: block screenshots/recording and hide the app in the
   // recents switcher. Session-scoped (matches the other in-memory settings).
   bool _blockScreenshots = false;
+  // Offline-retry window (ms): how long an undelivered message keeps retrying.
+  // Persisted in the profile, so this survives restarts (default 1 day).
+  int _retryWindowMs = 24 * 60 * 60 * 1000;
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -2847,6 +2923,52 @@ class _ChatScreenState extends State<_ChatScreen>
     } catch (e) {
       if (mounted) setState(() => _error = 'could not set timer: $e');
     }
+  }
+
+  /// Persist the offline-retry window (ms) via the active backend.
+  Future<void> _setRetryWindow(int maxAgeMs) async {
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.setRetryWindow(maxAgeMs);
+      } else {
+        await _cli.setRetryWindow(maxAgeMs);
+      }
+      if (mounted) setState(() => _retryWindowMs = maxAgeMs);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'could not set retry window: $e');
+    }
+  }
+
+  /// Dialog to pick the offline-retry window. Returns the chosen ms, or null.
+  Future<int?> _pickRetryWindow() async {
+    return showDialog<int>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        backgroundColor: _t.surface,
+        title: Text('Offline message retry',
+            style: TextStyle(color: _t.text, fontSize: 16)),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text(
+              'How long to keep retrying a message to a contact who is offline '
+              'before giving up. Disappearing messages still expire on their own '
+              'shorter timer.',
+              style: TextStyle(color: _t.textDim, fontSize: 12),
+            ),
+          ),
+          for (final ms in _retryWindowPresetsMs)
+            ListTile(
+              title:
+                  Text(_expiryLabelLong(ms), style: TextStyle(color: _t.text)),
+              trailing: ms == _retryWindowMs
+                  ? Icon(Icons.check, color: _t.primary, size: 18)
+                  : null,
+              onTap: () => Navigator.pop(ctx, ms),
+            ),
+        ],
+      ),
+    );
   }
 
   /// Timer applied to the *next* message: the per-message override if set,
@@ -5168,6 +5290,14 @@ class _ChatScreenState extends State<_ChatScreen>
   }
 
   Future<void> _showSettings() async {
+    // Load the persisted offline-retry window so the picker shows the real value.
+    try {
+      final ms = (_canUseMobileBackend && _mobile != null)
+          ? await _mobile!.getRetryWindow()
+          : await _cli.getRetryWindow();
+      if (ms > 0 && mounted) setState(() => _retryWindowMs = ms);
+    } catch (_) {}
+    if (!mounted) return;
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
@@ -5236,6 +5366,19 @@ class _ChatScreenState extends State<_ChatScreen>
                         unawaited(_applyFlagSecure(value));
                       },
                     ),
+                  ListTile(
+                    leading: const Icon(Icons.schedule_send_outlined),
+                    title: const Text('Offline message retry'),
+                    subtitle: Text(
+                        'Keep retrying undelivered messages for ${_expiryLabelLong(_retryWindowMs)}'),
+                    onTap: () async {
+                      final picked = await _pickRetryWindow();
+                      if (picked != null) {
+                        await _setRetryWindow(picked);
+                        setDialogState(() {});
+                      }
+                    },
+                  ),
                   ListTile(
                     leading: const Icon(Icons.palette_outlined),
                     title: const Text('Theme'),
