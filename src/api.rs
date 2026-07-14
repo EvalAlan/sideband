@@ -23,9 +23,12 @@ struct MobileSendCommand {
     response: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
+#[derive(Debug)]
 enum MobileSendPayload {
     Message(String),
     File(String),
+    /// Read receipt acknowledging messages from `to` up to this ms.
+    ReadReceipt(i64),
 }
 
 struct ListenerState {
@@ -302,6 +305,48 @@ pub fn api_set_retry_window(profile_path: &str, max_age_ms: i64) -> Result<bool>
     let profile = expand_profile(profile_path);
     crate::set_retry_max_age_ms(&profile, max_age_ms as u128)?;
     Ok(true)
+}
+
+/// Whether this profile sends read receipts.
+pub fn api_get_read_receipts(profile_path: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    Ok(crate::read_receipts_enabled(&profile))
+}
+
+pub fn api_set_read_receipts(profile_path: &str, enabled: bool) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::set_read_receipts_enabled(&profile, enabled)?;
+    Ok(true)
+}
+
+/// Send a read receipt to `to` acknowledging messages up to `up_to_ms`. Routed
+/// through the running listener (needs its Tor client); best-effort, so it is a
+/// no-op when no listener is running.
+pub async fn api_mark_conversation_read(profile_path: &str, to: &str, up_to_ms: i64) -> Result<()> {
+    let profile = expand_profile(profile_path);
+    if !crate::read_receipts_enabled(&profile) {
+        return Ok(());
+    }
+    let listener_send_tx = {
+        let guard = LISTENER_STATE
+            .lock()
+            .map_err(|_| anyhow!("listener mutex poisoned"))?;
+        guard.as_ref().and_then(|state| state.send_tx.clone())
+    };
+    if let Some(send_tx) = listener_send_tx {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        send_tx
+            .send(MobileSendCommand {
+                to: to.to_string(),
+                payload: MobileSendPayload::ReadReceipt(up_to_ms),
+                expires_ms: None,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| anyhow!("mobile listener send channel is closed"))?;
+        drop(response_rx);
+    }
+    Ok(())
 }
 
 pub async fn api_send_file(profile_path: &str, to: &str, file_path: &str) -> Result<()> {
@@ -767,6 +812,40 @@ pub extern "C" fn sideband_api_set_retry_window(
     })())
 }
 
+/// Whether this profile sends read receipts.
+#[no_mangle]
+pub extern "C" fn sideband_api_get_read_receipts(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_get_read_receipts(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_set_read_receipts(
+    profile_path: *const c_char,
+    enabled: bool,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_read_receipts(cstr_arg(profile_path, "profile_path")?, enabled)
+    })())
+}
+
+/// Send a read receipt acknowledging messages from `to` up to `up_to_ms`.
+#[no_mangle]
+pub extern "C" fn sideband_api_mark_conversation_read(
+    profile_path: *const c_char,
+    to: *const c_char,
+    up_to_ms: i64,
+) -> *mut c_char {
+    json_response((|| {
+        shared_runtime()?.block_on(api_mark_conversation_read(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(to, "to")?,
+            up_to_ms,
+        ))
+    })())
+}
+
 #[no_mangle]
 pub extern "C" fn sideband_api_send_file(
     profile_path: *const c_char,
@@ -1044,6 +1123,20 @@ pub extern "C" fn sideband_api_listener_start(profile_path: *const c_char) -> *m
                             )
                             .await
                             .map_err(|e| e.to_string()),
+                            MobileSendPayload::ReadReceipt(up_to) => {
+                                match crate::resolve_to(&send_profile, &cmd.to) {
+                                    Ok(onion) => crate::send_read_receipt(
+                                        &send_profile,
+                                        &cmd.to,
+                                        &onion,
+                                        up_to.max(0) as u128,
+                                        send_client.clone(),
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string()),
+                                    Err(e) => Err(e.to_string()),
+                                }
+                            }
                         };
                         let _ = cmd.response.send(result);
                     }
@@ -1406,7 +1499,7 @@ mod tests {
         assert_eq!(cmd.to, "bob");
         match cmd.payload {
             MobileSendPayload::File(path) => assert_eq!(path, "/tmp/photo.jpg"),
-            MobileSendPayload::Message(_) => panic!("queued message payload instead of file"),
+            other => panic!("expected file payload, got {other:?}"),
         }
 
         let mut guard = LISTENER_STATE.lock().unwrap();
@@ -1438,7 +1531,7 @@ mod tests {
         assert_eq!(cmd.to, "bob");
         match cmd.payload {
             MobileSendPayload::Message(body) => assert_eq!(body, "hi there"),
-            MobileSendPayload::File(_) => panic!("queued file payload instead of message"),
+            other => panic!("expected message payload, got {other:?}"),
         }
 
         let mut guard = LISTENER_STATE.lock().unwrap();

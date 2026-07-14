@@ -173,6 +173,17 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set whether this profile sends read receipts.
+    ReadReceipts {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Turn read receipts on or off. Omit to just show.
+        #[arg(long)]
+        set: Option<bool>,
+        /// Emit machine-readable JSON ({"enabled": <bool>}) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     Contact {
         #[command(subcommand)]
         action: ContactAction,
@@ -1377,6 +1388,7 @@ pub(crate) enum DeliveryStatus {
     Sent = 0,
     Delivered = 1,
     Failed = 2,
+    Read = 3,
 }
 
 impl DeliveryStatus {
@@ -1388,6 +1400,7 @@ impl DeliveryStatus {
             0 => Some(Self::Sent),
             1 => Some(Self::Delivered),
             2 => Some(Self::Failed),
+            3 => Some(Self::Read),
             _ => None,
         }
     }
@@ -1396,8 +1409,22 @@ impl DeliveryStatus {
             Self::Sent => "sent",
             Self::Delivered => "delivered",
             Self::Failed => "failed",
+            Self::Read => "read",
         }
     }
+}
+
+/// Delivery/read receipt payload. `delivered` references a single message by its
+/// replay fingerprint (both peers compute the same value from the ciphertext);
+/// `read` acknowledges every message from the sender up to `up_to_ms`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReceiptPayload {
+    pub kind: String,  // always "receipt"
+    pub state: String, // "delivered" | "read"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_to_ms: Option<u128>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1595,18 @@ fn init_db(profile: &Path) -> Result<Connection> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at_ms)",
+        [],
+    )?;
+    // Delivery/read receipts: an outbound message stores the replay fingerprint
+    // both peers derive from its ciphertext, so an inbound receipt can match the
+    // exact row it acknowledges.
+    ensure_message_column(
+        &conn,
+        "msg_fingerprint",
+        "ALTER TABLE messages ADD COLUMN msg_fingerprint TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint ON messages(msg_fingerprint)",
         [],
     )?;
     conn.execute(
@@ -2031,6 +2070,125 @@ pub(crate) fn mark_message_sent(profile: &Path, message_row_id: i64) -> Result<(
         params![DeliveryStatus::Sent.as_i64(), message_row_id],
     )?;
     Ok(())
+}
+
+/// Record the replay fingerprint of an outbound message row so an inbound
+/// delivery receipt can match it later.
+pub(crate) fn set_message_fingerprint(
+    profile: &Path,
+    message_row_id: i64,
+    fingerprint: &str,
+) -> Result<()> {
+    if message_row_id <= 0 {
+        return Ok(());
+    }
+    let conn = init_db(profile)?;
+    conn.execute(
+        "UPDATE messages SET msg_fingerprint = ?1 WHERE id = ?2",
+        params![fingerprint, message_row_id],
+    )?;
+    Ok(())
+}
+
+/// Apply an inbound delivery receipt: mark the matching outbound message
+/// Delivered (unless it is already Read). Returns true if a row changed.
+pub(crate) fn mark_delivered_by_fingerprint(profile: &Path, fingerprint: &str) -> Result<bool> {
+    if fingerprint.is_empty() {
+        return Ok(false);
+    }
+    let conn = init_db(profile)?;
+    let n = conn.execute(
+        "UPDATE messages SET status = ?1
+         WHERE direction = 'out' AND msg_fingerprint = ?2 AND status IN (?3, ?4)",
+        params![
+            DeliveryStatus::Delivered.as_i64(),
+            fingerprint,
+            DeliveryStatus::Sent.as_i64(),
+            DeliveryStatus::Failed.as_i64(),
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+/// Apply an inbound read receipt: mark every outbound message to `contact` sent
+/// at or before `up_to_ms` as Read. Returns the number of rows updated.
+pub(crate) fn mark_read_up_to(profile: &Path, contact: &str, up_to_ms: u128) -> Result<usize> {
+    let conn = init_db(profile)?;
+    let n = conn.execute(
+        "UPDATE messages SET status = ?1
+         WHERE direction = 'out' AND conversation_kind = 'contact' AND conversation_id = ?2
+           AND timestamp_ms <= ?3 AND status != ?1",
+        params![DeliveryStatus::Read.as_i64(), contact, up_to_ms as i64],
+    )?;
+    Ok(n)
+}
+
+const READ_RECEIPTS_KEY: &str = "send_read_receipts";
+
+/// Whether this profile sends read receipts (default true).
+pub(crate) fn read_receipts_enabled(profile: &Path) -> bool {
+    match get_setting(profile, READ_RECEIPTS_KEY) {
+        Ok(Some(s)) => s != "false",
+        _ => true,
+    }
+}
+
+pub(crate) fn set_read_receipts_enabled(profile: &Path, enabled: bool) -> Result<()> {
+    set_setting(
+        profile,
+        READ_RECEIPTS_KEY,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// Build and send a signed+encrypted receipt (delivered/read) to a contact.
+pub(crate) async fn send_receipt(
+    profile: &Path,
+    contact_name: &str,
+    onion: &str,
+    payload: &ReceiptPayload,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    let body = serde_json::to_string(payload)?;
+    send_typed_message(profile, onion, contact_name, "receipt", &body, tor_client).await
+}
+
+/// Send a delivery receipt for a single received message (by fingerprint).
+pub(crate) async fn send_delivered_receipt(
+    profile: &Path,
+    contact_name: &str,
+    onion: &str,
+    fingerprint: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    let payload = ReceiptPayload {
+        kind: "receipt".to_string(),
+        state: "delivered".to_string(),
+        msg_fingerprint: Some(fingerprint.to_string()),
+        up_to_ms: None,
+    };
+    send_receipt(profile, contact_name, onion, &payload, tor_client).await
+}
+
+/// Send a read receipt acknowledging all messages from `contact` up to `up_to_ms`.
+/// No-op (returns Ok) when read receipts are disabled for this profile.
+pub(crate) async fn send_read_receipt(
+    profile: &Path,
+    contact_name: &str,
+    onion: &str,
+    up_to_ms: u128,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    if !read_receipts_enabled(profile) {
+        return Ok(());
+    }
+    let payload = ReceiptPayload {
+        kind: "receipt".to_string(),
+        state: "read".to_string(),
+        msg_fingerprint: None,
+        up_to_ms: Some(up_to_ms),
+    };
+    send_receipt(profile, contact_name, onion, &payload, tor_client).await
 }
 
 /// How many messages are currently queued for retry.
@@ -2889,6 +3047,9 @@ struct ServeControlCommand {
     /// conversation default, 0 = explicitly off, positive = TTL in ms.
     #[serde(default)]
     expires_ms: Option<i64>,
+    /// For `mark_read`: acknowledge messages from `to` sent at or before this ms.
+    #[serde(default)]
+    up_to_ms: Option<i64>,
 }
 
 /// Typed response emitted as JSON on stdout for the GUI to parse.
@@ -3140,6 +3301,20 @@ async fn main() -> Result<()> {
                 println!("{{\"max_age_ms\":{ms}}}");
             } else {
                 println!("offline retry window: {}", format_duration_ms(ms));
+            }
+            Ok(())
+        }
+        CommandKind::ReadReceipts { profile, set, json } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if let Some(enabled) = set {
+                set_read_receipts_enabled(&profile, enabled)?;
+            }
+            let enabled = read_receipts_enabled(&profile);
+            if json {
+                println!("{{\"enabled\":{enabled}}}");
+            } else {
+                println!("read receipts: {}", if enabled { "on" } else { "off" });
             }
             Ok(())
         }
@@ -5138,6 +5313,25 @@ pub(crate) async fn serve(
                         }
                     });
                 }
+                "mark_read" => {
+                    // Best-effort read receipt; no ack/response needed.
+                    if let (Some(to), Some(up_to)) = (cmd.to.clone(), cmd.up_to_ms) {
+                        if up_to > 0 {
+                            tokio::spawn(async move {
+                                if let Ok(onion) = resolve_to(&profile, &to) {
+                                    let _ = send_read_receipt(
+                                        &profile,
+                                        &to,
+                                        &onion,
+                                        up_to as u128,
+                                        tor_client,
+                                    )
+                                    .await;
+                                }
+                            });
+                        }
+                    }
+                }
                 "group_send" => {
                     let Some(message) = cmd.message else {
                         emit_response(&ServeResponse::Error {
@@ -5861,6 +6055,13 @@ pub(crate) async fn send_in_conversation(
             Ok(id) => stored_row_id = id,
             Err(e) => error!(error=%e, "failed to store outbound message"),
         }
+    }
+    // Record the message's fingerprint so an inbound delivery receipt can match
+    // this exact row (1:1 only — group receipts are out of scope). Note: a message
+    // delivered on a later retry is rebuilt with fresh ciphertext, so its receipt
+    // won't match this fingerprint; retried messages just stay at Sent/Delivered.
+    if stored_row_id > 0 && conversation_kind == "contact" {
+        let _ = set_message_fingerprint(profile, stored_row_id, &message_replay_fingerprint(&msg));
     }
 
     // On final failure, enqueue for background retry (contact-only, not groups).

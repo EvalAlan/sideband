@@ -15,11 +15,14 @@ use crate::transport::tor::SharedTransferState;
 use crate::transport::tor::TorTransport;
 use crate::{
     contact_is_blocked, decrypt_and_verify, discover_or_update_group,
-    resolve_contact_name_by_pubkey, send_typed_message, store_message,
+    mark_delivered_by_fingerprint, mark_read_up_to, message_replay_fingerprint,
+    resolve_contact_name_by_pubkey, send_delivered_receipt, send_typed_message, store_message,
     store_message_for_conversation, store_message_for_conversation_expiring, ChatMessage,
     ContactsMap, DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload,
-    FileOfferPayload, GroupMessagePayload, IncomingFileState, TuiEvent,
+    FileOfferPayload, GroupMessagePayload, IncomingFileState, ReceiptPayload, TuiEvent,
 };
+
+type TorClientArc = Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>;
 
 /// Parse a raw inbound line into a [`ChatMessage`].
 ///
@@ -87,8 +90,56 @@ pub async fn handle_inbound(
         return handle_group_deleted(profile, tui_tx, contacts, msg).await;
     }
 
-    // Normal message.
-    handle_text_message(profile, tui_tx, contacts, msg).await
+    if msg.r#type == "receipt" {
+        return handle_receipt(profile, contacts, msg).await;
+    }
+
+    // Normal message. Pass the Tor client so a delivery receipt can be sent back.
+    handle_text_message(profile, tui_tx, contacts, msg, Some(tor_client)).await
+}
+
+/// Handle an inbound delivery/read receipt: verify it, then update the status of
+/// the outbound message(s) it acknowledges. Receipts are never stored or shown.
+pub(crate) async fn handle_receipt(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let (plaintext, verified) = match decrypt_and_verify(msg, profile, contacts) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error=%e, "receipt decrypt/verify failed");
+            return Ok(());
+        }
+    };
+    if !verified {
+        tracing::warn!(from=%msg.from, "dropping unverified receipt");
+        return Ok(());
+    }
+    let payload: ReceiptPayload = match serde_json::from_str(&plaintext) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error=%e, "malformed receipt payload");
+            return Ok(());
+        }
+    };
+    let contact_name = contact_name_for_pubkey(profile, contacts, &msg.from, verified);
+    match payload.state.as_str() {
+        "delivered" => {
+            if let Some(fp) = payload.msg_fingerprint {
+                let changed = mark_delivered_by_fingerprint(profile, &fp).unwrap_or(false);
+                tracing::info!(contact = %contact_name, changed, "receipt: delivered");
+            }
+        }
+        "read" => {
+            if let Some(up_to) = payload.up_to_ms {
+                let n = mark_read_up_to(profile, &contact_name, up_to).unwrap_or(0);
+                tracing::info!(contact = %contact_name, marked = n, "receipt: read");
+            }
+        }
+        other => tracing::debug!(state = %other, "unknown receipt state"),
+    }
+    Ok(())
 }
 
 /// Decrypt/verify a normal text message, resolve the sender's contact name, and
@@ -99,6 +150,7 @@ pub(crate) async fn handle_text_message(
     tui_tx: &mpsc::Sender<TuiEvent>,
     contacts: &ContactsMap,
     msg: &mut ChatMessage,
+    tor_client: Option<TorClientArc>,
 ) -> Result<()> {
     let decrypt_result = decrypt_and_verify(msg, profile, contacts);
     let decrypt_error = decrypt_result.as_ref().err().map(|e| e.to_string());
@@ -131,6 +183,24 @@ pub(crate) async fn handle_text_message(
                 tracing::info!(contact = %contact_name, woke = n, "retry: peer online, flushing queue")
             }
             _ => {}
+        }
+        // Acknowledge receipt to a known (non-pending) contact. Fire-and-forget so
+        // inbound processing is never blocked on a Tor round-trip.
+        if let Some(tc) = tor_client {
+            if let Some(contact) = contacts
+                .values()
+                .find(|c| c.pubkey_b64 == msg.from && !c.pending && !c.onion.is_empty())
+            {
+                let fp = message_replay_fingerprint(msg);
+                let name = contact.name.clone();
+                let onion = contact.onion.clone();
+                let profile = profile.to_path_buf();
+                tokio::spawn(async move {
+                    if let Err(e) = send_delivered_receipt(&profile, &name, &onion, &fp, tc).await {
+                        tracing::debug!(error=%e, "failed to send delivery receipt");
+                    }
+                });
+            }
         }
     } else {
         tracing::warn!(from=%msg.from, "signature verification FAILED");

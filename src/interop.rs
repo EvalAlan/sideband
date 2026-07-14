@@ -16,11 +16,13 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use crate::handler::{handle_text_message, parse_inbound_line};
+use crate::handler::{handle_receipt, handle_text_message, parse_inbound_line};
 use crate::{
     build_outbound_message, contact_add, get_conversation_ttl, init_profile_with_name,
     init_ratchet_for_contact, load_contacts, load_history, load_signing_key, load_x25519_public,
-    resolve_message_expiry, set_conversation_ttl, TuiEvent,
+    message_replay_fingerprint, resolve_message_expiry, set_conversation_ttl,
+    set_message_fingerprint, store_message_for_conversation, DeliveryStatus, ReceiptPayload,
+    TuiEvent,
 };
 
 // Valid v3 onion addresses (checksum-correct) for harness peers. They are never
@@ -91,7 +93,8 @@ async fn deliver(to: &Peer, line: &str) -> Vec<(String, String, bool)> {
         .unwrap()
         .expect("wire line must parse into a ChatMessage");
     let (tx, mut rx) = mpsc::channel::<TuiEvent>(64);
-    handle_text_message(to.profile(), &tx, &contacts, &mut msg)
+    // No Tor client in the harness → no auto delivery receipt is sent.
+    handle_text_message(to.profile(), &tx, &contacts, &mut msg, None)
         .await
         .unwrap();
     drop(tx);
@@ -375,6 +378,122 @@ async fn send_side_expiry_resolves_default_override_and_survives_retry() {
         .unwrap()
         .iter()
         .any(|r| r.body == "vanishing"));
+}
+
+/// Alice sends a message; Bob's node returns a delivery receipt. Alice's outbound
+/// row must flip Sent → Delivered, matched by the ciphertext fingerprint both
+/// peers derive independently.
+#[tokio::test]
+async fn delivery_receipt_marks_sender_message_delivered() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+
+    // Alice builds + stores an outbound message to Bob (as a real send would).
+    let sent = build_outbound_message(alice.profile(), "bob", "msg", "hi bob", &alice.onion, None)
+        .unwrap();
+    let fp = message_replay_fingerprint(&sent);
+    let row = store_message_for_conversation(
+        alice.profile(),
+        "out",
+        "bob",
+        BOB_ONION,
+        "hi bob",
+        sent.timestamp_ms,
+        DeliveryStatus::Sent,
+        "contact",
+        "bob",
+    )
+    .unwrap();
+    set_message_fingerprint(alice.profile(), row, &fp).unwrap();
+
+    // Bob's node acknowledges delivery (fingerprint is identical on both ends).
+    let payload = ReceiptPayload {
+        kind: "receipt".into(),
+        state: "delivered".into(),
+        msg_fingerprint: Some(fp),
+        up_to_ms: None,
+    };
+    let mut receipt = build_outbound_message(
+        bob.profile(),
+        "alice",
+        "receipt",
+        &serde_json::to_string(&payload).unwrap(),
+        &bob.onion,
+        None,
+    )
+    .unwrap();
+    let contacts = load_contacts(alice.profile()).unwrap();
+    handle_receipt(alice.profile(), &contacts, &mut receipt)
+        .await
+        .unwrap();
+
+    let hist = load_history(alice.profile(), Some("bob"), 50).unwrap();
+    let m = hist.iter().find(|m| m.body == "hi bob").unwrap();
+    assert_eq!(
+        m.status,
+        DeliveryStatus::Delivered as i64,
+        "a delivery receipt must mark the sender's message delivered"
+    );
+}
+
+/// A read receipt acknowledges every message up to a timestamp: Alice's messages
+/// at or before `up_to_ms` flip to Read, later ones stay behind.
+#[tokio::test]
+async fn read_receipt_marks_messages_read_up_to_timestamp() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+
+    let store = |body: &str, ts: u128| {
+        store_message_for_conversation(
+            alice.profile(),
+            "out",
+            "bob",
+            BOB_ONION,
+            body,
+            ts,
+            DeliveryStatus::Sent,
+            "contact",
+            "bob",
+        )
+        .unwrap()
+    };
+    store("first", 1_000);
+    store("second", 2_000);
+    store("third", 3_000);
+
+    let payload = ReceiptPayload {
+        kind: "receipt".into(),
+        state: "read".into(),
+        msg_fingerprint: None,
+        up_to_ms: Some(2_000),
+    };
+    let mut receipt = build_outbound_message(
+        bob.profile(),
+        "alice",
+        "receipt",
+        &serde_json::to_string(&payload).unwrap(),
+        &bob.onion,
+        None,
+    )
+    .unwrap();
+    let contacts = load_contacts(alice.profile()).unwrap();
+    handle_receipt(alice.profile(), &contacts, &mut receipt)
+        .await
+        .unwrap();
+
+    let hist = load_history(alice.profile(), Some("bob"), 50).unwrap();
+    let status = |body: &str| hist.iter().find(|m| m.body == body).unwrap().status;
+    assert_eq!(status("first"), DeliveryStatus::Read as i64);
+    assert_eq!(status("second"), DeliveryStatus::Read as i64);
+    assert_eq!(
+        status("third"),
+        DeliveryStatus::Sent as i64,
+        "a message sent after the read watermark must stay unread"
+    );
 }
 
 /// A file sent to a group must be filed under the group conversation on the
