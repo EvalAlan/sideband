@@ -6220,6 +6220,47 @@ class _ChatScreenState extends State<_ChatScreen>
               ],
             ),
           ),
+          // Disappearing-message timer (conversation default + one-shot override).
+          Stack(
+            clipBehavior: Clip.none,
+            children: [
+              IconButton(
+                icon: Icon(
+                  _effectiveNextExpiryMs > 0
+                      ? Icons.timer
+                      : Icons.timer_outlined,
+                  size: 18,
+                  color: _effectiveNextExpiryMs > 0 ? _t.primary : null,
+                ),
+                tooltip: _effectiveNextExpiryMs > 0
+                    ? 'Disappearing: ${_expiryLabel(_effectiveNextExpiryMs)}'
+                    : 'Disappearing messages: off',
+                onPressed: _showExpiryMenu,
+              ),
+              if (_effectiveNextExpiryMs > 0)
+                Positioned(
+                  right: 2,
+                  bottom: 2,
+                  child: IgnorePointer(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 3, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: _t.primary,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        _expiryLabel(_effectiveNextExpiryMs),
+                        style: TextStyle(
+                            color: _t.bg,
+                            fontSize: 8,
+                            fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
           IconButton(
             icon: const Icon(Icons.history, size: 18),
             tooltip: 'History',
@@ -6888,57 +6929,6 @@ class _ChatScreenState extends State<_ChatScreen>
                   constraints:
                       const BoxConstraints(minWidth: 32, minHeight: 32),
                   splashRadius: 18,
-                ),
-              ),
-              const SizedBox(width: 4),
-              // disappearing-message timer
-              Padding(
-                padding: const EdgeInsets.only(bottom: 2),
-                child: Stack(
-                  clipBehavior: Clip.none,
-                  children: [
-                    IconButton(
-                      icon: Icon(
-                        _effectiveNextExpiryMs > 0
-                            ? Icons.timer
-                            : Icons.timer_outlined,
-                        size: 18,
-                        color: _effectiveNextExpiryMs > 0
-                            ? _t.primary
-                            : _t.textDim,
-                      ),
-                      tooltip: _effectiveNextExpiryMs > 0
-                          ? 'Disappearing: ${_expiryLabel(_effectiveNextExpiryMs)}'
-                          : 'Disappearing messages: off',
-                      onPressed: canSend ? _showExpiryMenu : null,
-                      padding: EdgeInsets.zero,
-                      constraints:
-                          const BoxConstraints(minWidth: 32, minHeight: 32),
-                      splashRadius: 18,
-                    ),
-                    if (_effectiveNextExpiryMs > 0)
-                      Positioned(
-                        right: -2,
-                        bottom: -2,
-                        child: IgnorePointer(
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 3, vertical: 1),
-                            decoration: BoxDecoration(
-                              color: _t.primary,
-                              borderRadius: BorderRadius.circular(6),
-                            ),
-                            child: Text(
-                              _expiryLabel(_effectiveNextExpiryMs),
-                              style: TextStyle(
-                                  color: _t.bg,
-                                  fontSize: 8,
-                                  fontWeight: FontWeight.w700),
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
                 ),
               ),
               const SizedBox(width: 4),
