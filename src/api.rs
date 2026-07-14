@@ -32,6 +32,7 @@ enum MobileSendPayload {
 }
 
 struct ListenerState {
+    profile: PathBuf,
     quit_tx: Option<tokio::sync::oneshot::Sender<()>>,
     send_tx: Option<tokio::sync::mpsc::Sender<MobileSendCommand>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -328,6 +329,31 @@ pub fn api_get_lan_enabled(profile_path: &str) -> Result<bool> {
 pub fn api_set_lan_enabled(profile_path: &str, enabled: bool) -> Result<bool> {
     let profile = expand_profile(profile_path);
     crate::set_lan_enabled(&profile, enabled)?;
+    Ok(true)
+}
+
+/// Whether Android Bluetooth/RFCOMM delivery is enabled (default off).
+pub fn api_get_bluetooth_enabled(profile_path: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    Ok(crate::bluetooth_enabled(&profile))
+}
+
+pub fn api_set_bluetooth_enabled(profile_path: &str, enabled: bool) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::set_bluetooth_enabled(&profile, enabled)?;
+    Ok(true)
+}
+
+pub(crate) fn api_get_bluetooth_bridge_config(
+    profile_path: &str,
+) -> Result<crate::transport::bluetooth::BridgeConfig> {
+    let profile = expand_profile(profile_path);
+    crate::transport::bluetooth::bridge_config(&profile)
+}
+
+pub(crate) fn api_set_bluetooth_local_device(profile_path: &str, device: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::transport::bluetooth::set_local_device(&profile, device)?;
     Ok(true)
 }
 
@@ -862,6 +888,45 @@ pub extern "C" fn sideband_api_set_lan_enabled(
     })())
 }
 
+#[no_mangle]
+pub extern "C" fn sideband_api_get_bluetooth_enabled(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_get_bluetooth_enabled(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_set_bluetooth_enabled(
+    profile_path: *const c_char,
+    enabled: bool,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_bluetooth_enabled(cstr_arg(profile_path, "profile_path")?, enabled)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_get_bluetooth_bridge_config(
+    profile_path: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_get_bluetooth_bridge_config(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_set_bluetooth_local_device(
+    profile_path: *const c_char,
+    device: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_bluetooth_local_device(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(device, "device")?,
+        )
+    })())
+}
+
 /// Send a read receipt acknowledging messages from `to` up to `up_to_ms`.
 #[no_mangle]
 pub extern "C" fn sideband_api_mark_conversation_read(
@@ -1086,8 +1151,11 @@ pub extern "C" fn sideband_api_listener_start(profile_path: *const c_char) -> *m
         let mut guard = LISTENER_STATE
             .lock()
             .map_err(|_| anyhow!("listener mutex poisoned"))?;
-        if guard.as_ref().map(listener_is_running).unwrap_or(false) {
-            return Err(anyhow!("listener already running"));
+        if let Some(state) = guard.as_ref().filter(|state| listener_is_running(state)) {
+            if state.profile == profile_buf {
+                return Ok(());
+            }
+            return Err(anyhow!("listener already running for another profile"));
         }
         if guard.is_some() {
             *guard = None;
@@ -1210,6 +1278,7 @@ pub extern "C" fn sideband_api_listener_start(profile_path: *const c_char) -> *m
         });
 
         *guard = Some(ListenerState {
+            profile: profile_buf,
             quit_tx: Some(quit_tx),
             send_tx: Some(send_tx),
             handle: Some(handle),
@@ -1511,6 +1580,7 @@ mod tests {
         {
             let mut guard = LISTENER_STATE.lock().unwrap();
             *guard = Some(ListenerState {
+                profile: PathBuf::from("/tmp/sideband-test-profile"),
                 quit_tx: None,
                 send_tx: Some(send_tx),
                 handle: None,
@@ -1545,6 +1615,7 @@ mod tests {
         {
             let mut guard = LISTENER_STATE.lock().unwrap();
             *guard = Some(ListenerState {
+                profile: PathBuf::from("/tmp/sideband-test-profile"),
                 quit_tx: None,
                 send_tx: Some(send_tx),
                 handle: None,

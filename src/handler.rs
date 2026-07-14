@@ -16,10 +16,12 @@ use crate::transport::tor::TorTransport;
 use crate::{
     contact_is_blocked, decrypt_and_verify, discover_or_update_group,
     mark_delivered_by_fingerprint, mark_read_up_to, message_replay_fingerprint,
-    resolve_contact_name_by_pubkey, send_delivered_receipt, send_typed_message, store_message,
-    store_message_for_conversation, store_message_for_conversation_expiring, ChatMessage,
-    ContactsMap, DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload,
-    FileOfferPayload, GroupMessagePayload, IncomingFileState, ReceiptPayload, TuiEvent,
+    resolve_contact_name_by_pubkey, send_delivered_receipt, send_sync_ack, send_sync_inventory,
+    send_sync_items, send_sync_request, send_typed_message, set_contact_transport_prop,
+    store_message, store_message_for_conversation, store_message_for_conversation_expiring,
+    ChatMessage, ContactsMap, DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload,
+    FileOfferPayload, GroupMessagePayload, IncomingFileState, ReceiptPayload,
+    TransportPropsPayload, TuiEvent,
 };
 
 type TorClientArc = Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>;
@@ -94,8 +96,240 @@ pub async fn handle_inbound(
         return handle_receipt(profile, contacts, msg).await;
     }
 
-    // Normal message. Pass the Tor client so a delivery receipt can be sent back.
-    handle_text_message(profile, tui_tx, contacts, msg, Some(tor_client)).await
+    if msg.r#type == "transport_props" {
+        handle_transport_props(profile, contacts, msg).await?;
+        if let Ok(contact_name) = resolve_contact_name_by_pubkey(contacts, &msg.from) {
+            let profile = profile.to_path_buf();
+            tokio::spawn(async move {
+                if let Err(e) = send_sync_inventory(&profile, &contact_name, true, tor_client).await
+                {
+                    tracing::debug!(error=%e, "BSP inventory initiation failed");
+                }
+            });
+        }
+        return Ok(());
+    }
+
+    if msg.r#type == "sync_inventory" {
+        return handle_sync_inventory(profile, contacts, msg, tor_client).await;
+    }
+    if msg.r#type == "sync_request" {
+        return handle_sync_request(profile, contacts, msg, tor_client).await;
+    }
+    if msg.r#type == "sync_item" {
+        return handle_sync_item(profile, tui_tx, contacts, msg, tor_client).await;
+    }
+    if msg.r#type == "sync_ack" {
+        return handle_sync_ack(profile, contacts, msg).await;
+    }
+
+    // Normal message. Pass the Tor client so a delivery receipt can be sent back,
+    // then use this authenticated contact activity as a bidirectional sync opportunity.
+    let contact_name = resolve_contact_name_by_pubkey(contacts, &msg.from);
+    handle_text_message(
+        profile,
+        tui_tx,
+        contacts,
+        msg,
+        Some(Arc::clone(&tor_client)),
+    )
+    .await?;
+    if let Ok(contact_name) = contact_name {
+        let profile = profile.to_path_buf();
+        tokio::spawn(async move {
+            if let Err(e) = send_sync_inventory(&profile, &contact_name, true, tor_client).await {
+                tracing::debug!(error=%e, "BSP inventory initiation failed");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Persist transport addresses shared by an authenticated, accepted contact.
+/// The typed payload is never stored as chat history or shown in a client.
+pub(crate) async fn handle_transport_props(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let (plaintext, verified) = match decrypt_and_verify(msg, profile, contacts) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::debug!(error=%e, "transport properties decrypt/verify failed");
+            return Ok(());
+        }
+    };
+    if !verified {
+        tracing::warn!(from=%msg.from, "dropping unverified transport properties");
+        return Ok(());
+    }
+
+    let Some(contact) = contacts
+        .values()
+        .find(|contact| contact.pubkey_b64 == msg.from && !contact.pending && !contact.blocked)
+    else {
+        tracing::debug!(from=%msg.from, "dropping transport properties from non-contact");
+        return Ok(());
+    };
+
+    let payload: TransportPropsPayload = match serde_json::from_str(&plaintext) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::debug!(error=%e, "malformed transport properties payload");
+            return Ok(());
+        }
+    };
+    if payload.kind != "transport_props" || payload.properties.len() > 16 {
+        tracing::debug!("invalid transport properties payload");
+        return Ok(());
+    }
+
+    for property in payload.properties {
+        if property.transport.is_empty()
+            || property.transport.len() > 64
+            || property.value.is_empty()
+            || property.value.len() > 1024
+        {
+            continue;
+        }
+        if property.transport == "lan" {
+            let Ok(addr) = property.value.parse::<std::net::SocketAddr>() else {
+                continue;
+            };
+            if addr.ip().is_unspecified() || addr.ip().is_multicast() || addr.port() == 0 {
+                continue;
+            }
+            if set_contact_transport_prop(
+                profile,
+                &contact.name,
+                &property.transport,
+                &property.value,
+                msg.timestamp_ms,
+            )? {
+                crate::transport::lan::PEERS.note(&contact.pubkey_b64, addr, msg.timestamp_ms);
+            }
+        } else {
+            set_contact_transport_prop(
+                profile,
+                &contact.name,
+                &property.transport,
+                &property.value,
+                msg.timestamp_ms,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn decrypt_authenticated_sync(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<Option<(String, String)>> {
+    let (plaintext, verified) = match decrypt_and_verify(msg, profile, contacts) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::debug!(error=%e, "sync decrypt/verify failed");
+            return Ok(None);
+        }
+    };
+    if !verified {
+        return Ok(None);
+    }
+    let Some(contact) = contacts
+        .values()
+        .find(|contact| contact.pubkey_b64 == msg.from && !contact.pending && !contact.blocked)
+    else {
+        return Ok(None);
+    };
+    Ok(Some((plaintext, contact.name.clone())))
+}
+
+pub(crate) async fn handle_sync_inventory(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+    tor_client: TorClientArc,
+) -> Result<()> {
+    let Some((plaintext, contact_name)) = decrypt_authenticated_sync(profile, contacts, msg)?
+    else {
+        return Ok(());
+    };
+    let inventory: crate::sync::SyncInventoryPayload = serde_json::from_str(&plaintext)?;
+    let request = crate::sync::missing_from_inventory(profile, &msg.from, &inventory)?;
+    if !request.ids.is_empty() {
+        send_sync_request(profile, &contact_name, &request, Arc::clone(&tor_client)).await?;
+    }
+    if inventory.reply {
+        send_sync_inventory(profile, &contact_name, false, tor_client).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn handle_sync_request(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+    tor_client: TorClientArc,
+) -> Result<()> {
+    let Some((plaintext, contact_name)) = decrypt_authenticated_sync(profile, contacts, msg)?
+    else {
+        return Ok(());
+    };
+    let request: crate::sync::SyncRequestPayload = serde_json::from_str(&plaintext)?;
+    send_sync_items(profile, &contact_name, &request, tor_client).await
+}
+
+pub(crate) async fn handle_sync_item(
+    profile: &Path,
+    tui_tx: &mpsc::Sender<TuiEvent>,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+    tor_client: TorClientArc,
+) -> Result<()> {
+    let Some((plaintext, contact_name)) = decrypt_authenticated_sync(profile, contacts, msg)?
+    else {
+        return Ok(());
+    };
+    let mut item: crate::sync::SyncItemPayload = serde_json::from_str(&plaintext)?;
+    if item.kind != "sync_item"
+        || item.message.from != msg.from
+        || item.message.r#type != "sync_chat"
+    {
+        return Ok(());
+    }
+    if !crate::sync::mark_received(profile, &msg.from, &item.id)? {
+        return send_sync_ack(profile, &contact_name, &item.id, tor_client).await;
+    }
+    if let Err(e) = handle_text_message(
+        profile,
+        tui_tx,
+        contacts,
+        &mut item.message,
+        Some(Arc::clone(&tor_client)),
+    )
+    .await
+    {
+        crate::sync::unmark_received(profile, &msg.from, &item.id)?;
+        return Err(e);
+    }
+    send_sync_ack(profile, &contact_name, &item.id, tor_client).await
+}
+
+pub(crate) async fn handle_sync_ack(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let Some((plaintext, contact_name)) = decrypt_authenticated_sync(profile, contacts, msg)?
+    else {
+        return Ok(());
+    };
+    let ack: crate::sync::SyncAckPayload = serde_json::from_str(&plaintext)?;
+    if ack.kind == "sync_ack" {
+        crate::sync::ack_outbound(profile, &contact_name, &ack.id)?;
+    }
+    Ok(())
 }
 
 /// Handle an inbound delivery/read receipt: verify it, then update the status of

@@ -34,6 +34,7 @@ mod app_api;
 mod handler;
 #[cfg(test)]
 mod interop;
+mod sync;
 mod transport;
 mod tui;
 
@@ -190,6 +191,17 @@ enum CommandKind {
         #[command(flatten)]
         profile: ProfileArg,
         /// Turn LAN discovery on or off. Omit to just show.
+        #[arg(long)]
+        set: Option<bool>,
+        /// Emit machine-readable JSON ({"enabled": <bool>}) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or set Android Bluetooth/RFCOMM delivery (off by default).
+    Bluetooth {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Turn Bluetooth delivery on or off. Omit to just show.
         #[arg(long)]
         set: Option<bool>,
         /// Emit machine-readable JSON ({"enabled": <bool>}) instead of text.
@@ -1343,6 +1355,42 @@ async fn send_typed_message(
     )?;
 
     let payload = format!("{}\n", serde_json::to_string(&msg)?);
+    for route in outbound_routes(profile, contact_name, to_onion) {
+        match route.endpoint() {
+            crate::transport::registry::RouteEndpoint::Lan(addr) => {
+                match crate::transport::lan::send_btp(profile, contact_name, *addr, &payload).await
+                {
+                    Ok(()) => {
+                        tracing::info!(%addr, %contact_name, message_type, "typed message sent over LAN");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::debug!(%addr, %contact_name, message_type, error=%e, "typed LAN send failed; falling back to Tor");
+                    }
+                }
+            }
+            crate::transport::registry::RouteEndpoint::Bluetooth(property) => {
+                match crate::transport::bluetooth::send_btp(
+                    profile,
+                    contact_name,
+                    property,
+                    &payload,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(%contact_name, message_type, "typed message sent over Bluetooth");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::debug!(%contact_name, message_type, error=%e, "typed Bluetooth send failed; falling back")
+                    }
+                }
+            }
+            crate::transport::registry::RouteEndpoint::Tor => break,
+            _ => continue,
+        }
+    }
     let connect_timeout = if message_type == "file_chunk" {
         Duration::from_secs(120)
     } else {
@@ -1437,6 +1485,20 @@ pub(crate) struct ReceiptPayload {
     pub msg_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up_to_ms: Option<u128>,
+}
+
+/// Contact-only transport addresses. The outer `ChatMessage` supplies both
+/// encryption and an Ed25519 signature, just like a receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TransportPropsPayload {
+    pub kind: String,
+    pub properties: Vec<TransportProp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TransportProp {
+    pub transport: String,
+    pub value: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1563,6 +1625,29 @@ fn init_db(profile: &Path) -> Result<Connection> {
         "message_row_id",
         "ALTER TABLE retry_queue ADD COLUMN message_row_id INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(
+        &conn,
+        "retry_queue",
+        "sync_id",
+        "ALTER TABLE retry_queue ADD COLUMN sync_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute(
+        "UPDATE retry_queue SET sync_id=lower(hex(randomblob(16))) WHERE sync_id=''",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_retry_queue_sync_id ON retry_queue(sync_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_seen_items (
+            peer_ed25519 TEXT NOT NULL,
+            sync_id      TEXT NOT NULL,
+            seen_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (peer_ed25519, sync_id)
+        )",
+        [],
+    )?;
     // Generic key/value app settings (persisted per profile). Used for the
     // offline-retry window and other core-visible preferences.
     conn.execute(
@@ -1571,6 +1656,28 @@ fn init_db(profile: &Path) -> Result<Connection> {
             value TEXT NOT NULL
         )",
         [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS contact_transport_props (
+            contact    TEXT NOT NULL,
+            transport  TEXT NOT NULL,
+            value      TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (contact, transport)
+        )",
+        [],
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS btp_stream_state (
+            peer_ed25519 TEXT PRIMARY KEY,
+            tx_next      INTEGER NOT NULL DEFAULT 0,
+            rx_base      INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS btp_seen_streams (
+            peer_ed25519 TEXT NOT NULL,
+            stream_no    INTEGER NOT NULL,
+            PRIMARY KEY (peer_ed25519, stream_no)
+        );",
     )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS seen_messages (
@@ -2044,9 +2151,12 @@ pub(crate) fn enqueue_retry(
     message_row_id: i64,
 ) -> Result<i64> {
     let conn = init_db(profile)?;
+    let mut sync_id = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut OsRng, &mut sync_id);
+    let sync_id = hex::encode(sync_id);
     conn.execute(
-        "INSERT INTO retry_queue (contact, onion, message, attempts, next_retry_at, last_error, expires_at_ms, message_row_id)
-         VALUES (?1, ?2, ?3, 1, datetime('now', '+30 seconds'), ?4, ?5, ?6)",
+        "INSERT INTO retry_queue (contact, onion, message, attempts, next_retry_at, last_error, expires_at_ms, message_row_id, sync_id)
+         VALUES (?1, ?2, ?3, 1, datetime('now', '+30 seconds'), ?4, ?5, ?6, ?7)",
         params![
             contact,
             onion,
@@ -2054,6 +2164,7 @@ pub(crate) fn enqueue_retry(
             error,
             expires_at_ms.map(|v| v as i64).unwrap_or(0),
             message_row_id,
+            sync_id,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -2155,9 +2266,8 @@ pub(crate) fn set_read_receipts_enabled(profile: &Path, enabled: bool) -> Result
 
 const LAN_ENABLED_KEY: &str = "lan_enabled";
 
-/// Whether LAN discovery + delivery is enabled. Default OFF: a LAN beacon
-/// advertises this identity's presence to everyone on the local network, which is
-/// a metadata leak that should be opt-in for a privacy tool.
+/// Whether LAN discovery + delivery is enabled. Default OFF: even rotating,
+/// contact-only tokens reveal that an unknown protocol is active on the LAN.
 pub(crate) fn lan_enabled(profile: &Path) -> bool {
     matches!(get_setting(profile, LAN_ENABLED_KEY), Ok(Some(s)) if s == "true")
 }
@@ -2170,6 +2280,311 @@ pub(crate) fn set_lan_enabled(profile: &Path, enabled: bool) -> Result<()> {
     )
 }
 
+const BLUETOOTH_ENABLED_KEY: &str = "bluetooth_enabled";
+
+/// Bluetooth is opt-in. A stored contact property alone never activates the
+/// platform adapter or makes the route selectable.
+pub(crate) fn bluetooth_enabled(profile: &Path) -> bool {
+    matches!(get_setting(profile, BLUETOOTH_ENABLED_KEY), Ok(Some(s)) if s == "true")
+}
+
+pub(crate) fn set_bluetooth_enabled(profile: &Path, enabled: bool) -> Result<()> {
+    set_setting(
+        profile,
+        BLUETOOTH_ENABLED_KEY,
+        if enabled { "true" } else { "false" },
+    )?;
+    if !enabled {
+        crate::transport::bluetooth::clear_local_device(profile)?;
+    }
+    Ok(())
+}
+
+fn lan_beacon_contacts(profile: &Path) -> Vec<crate::transport::lan::LanBeaconContact> {
+    let Ok(our_secret) = load_x25519_secret(profile) else {
+        return Vec::new();
+    };
+    let Ok(contacts) = load_contacts(profile) else {
+        return Vec::new();
+    };
+    contacts
+        .values()
+        .filter(|contact| !contact.pending && !contact.blocked && !contact.pubkey_b64.is_empty())
+        .filter_map(|contact| {
+            let their_public = resolve_x25519_pubkey(profile, &contact.name).ok()?;
+            let shared_secret = our_secret.diffie_hellman(&their_public).to_bytes();
+            if shared_secret.iter().all(|byte| *byte == 0) {
+                return None;
+            }
+            Some(crate::transport::lan::LanBeaconContact {
+                ed25519_b64: contact.pubkey_b64.clone(),
+                shared_secret,
+            })
+        })
+        .collect()
+}
+
+fn reachable_lan_addr(tcp_port: u16) -> Option<std::net::SocketAddr> {
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    // UDP connect selects a route without sending a packet. TEST-NET-1 avoids a
+    // dependency on public DNS or an actually reachable internet host.
+    socket
+        .connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9))
+        .ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return None;
+    }
+    Some(std::net::SocketAddr::new(ip, tcp_port))
+}
+
+fn local_transport_properties(
+    profile: &Path,
+    lan_addr: Option<std::net::SocketAddr>,
+) -> Vec<TransportProp> {
+    let mut properties = Vec::new();
+    if let Some(addr) = lan_addr {
+        properties.push(TransportProp {
+            transport: "lan".to_string(),
+            value: addr.to_string(),
+        });
+    }
+    if let Ok(Some(property)) = crate::transport::bluetooth::local_property(profile) {
+        if let Ok(value) = serde_json::to_string(&property) {
+            properties.push(TransportProp {
+                transport: "bluetooth".to_string(),
+                value,
+            });
+        }
+    }
+    properties
+}
+
+fn transport_props_revision(profile: &Path, properties: &[TransportProp]) -> String {
+    let mut contacts = load_contacts(profile)
+        .map(|contacts| {
+            contacts
+                .values()
+                .filter(|contact| !contact.pending && !contact.blocked)
+                .map(|contact| contact.pubkey_b64.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    contacts.sort();
+    format!(
+        "{}|{}",
+        serde_json::to_string(properties).unwrap_or_default(),
+        contacts.join("|")
+    )
+}
+
+async fn publish_transport_props(
+    profile: &Path,
+    properties: Vec<TransportProp>,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) {
+    let payload = TransportPropsPayload {
+        kind: "transport_props".to_string(),
+        properties,
+    };
+    let Ok(body) = serde_json::to_string(&payload) else {
+        return;
+    };
+    let Ok(contacts) = load_contacts(profile) else {
+        return;
+    };
+    for contact in contacts
+        .values()
+        .filter(|contact| !contact.pending && !contact.blocked && !contact.onion.is_empty())
+    {
+        if let Err(e) = send_typed_message(
+            profile,
+            &contact.onion,
+            &contact.name,
+            "transport_props",
+            &body,
+            Arc::clone(&tor_client),
+        )
+        .await
+        {
+            tracing::debug!(contact=%contact.name, error=%e, "transport properties refresh failed");
+        }
+    }
+}
+
+pub(crate) fn btp_contact_crypto(
+    profile: &Path,
+    contact_name: &str,
+) -> Result<(String, crate::transport::btp::ContactCrypto)> {
+    let contacts = load_contacts(profile)?;
+    let contact = contacts
+        .values()
+        .find(|contact| contact.name == contact_name && !contact.pending && !contact.blocked)
+        .ok_or_else(|| anyhow!("unknown accepted contact '{contact_name}'"))?;
+    let remote_ed = B64
+        .decode(&contact.pubkey_b64)
+        .context("decode contact Ed25519 key")?;
+    let remote_ed = <[u8; 32]>::try_from(remote_ed.as_slice())
+        .map_err(|_| anyhow!("contact Ed25519 key must be 32 bytes"))?;
+    let local_ed = load_signing_key(profile)?.verifying_key().to_bytes();
+    let local_secret = load_x25519_secret(profile)?;
+    let remote_x25519 = resolve_x25519_pubkey(profile, contact_name)?;
+    let crypto = crate::transport::btp::derive_contact_crypto(
+        &local_secret,
+        local_ed,
+        &remote_x25519,
+        remote_ed,
+    )?;
+    Ok((contact.pubkey_b64.clone(), crypto))
+}
+
+pub(crate) fn btp_reserve_outbound_stream(profile: &Path, peer: &str) -> Result<u64> {
+    let conn = init_db(profile)?;
+    let stream: i64 = conn.query_row(
+        "INSERT INTO btp_stream_state(peer_ed25519, tx_next, rx_base)
+         VALUES (?1, 1, 0)
+         ON CONFLICT(peer_ed25519) DO UPDATE SET tx_next = tx_next + 1
+         RETURNING tx_next - 1",
+        [peer],
+        |row| row.get(0),
+    )?;
+    u64::try_from(stream).map_err(|_| anyhow!("BTP outbound stream counter exhausted"))
+}
+
+pub(crate) struct BtpInboundCandidate {
+    pub peer_ed25519: String,
+    pub stream_no: u64,
+    pub material: crate::transport::btp::StreamMaterial,
+}
+
+pub(crate) fn btp_inbound_candidates(
+    profile: &Path,
+    wire_stream: u64,
+    salt: [u8; crate::transport::btp::STREAM_SALT_LEN],
+) -> Result<Vec<BtpInboundCandidate>> {
+    let contacts = load_contacts(profile)?;
+    let current_period = crate::transport::btp::current_period();
+    let first_period = current_period.saturating_sub(crate::transport::btp::PERIOD_SKEW);
+    let last_period = current_period.saturating_add(crate::transport::btp::PERIOD_SKEW);
+    let mut candidates = Vec::new();
+    for contact in contacts
+        .values()
+        .filter(|contact| !contact.pending && !contact.blocked)
+    {
+        let Ok((peer_ed25519, crypto)) = btp_contact_crypto(profile, &contact.name) else {
+            continue;
+        };
+        for period in first_period..=last_period {
+            let stream_no = crate::transport::btp::recover_stream_number(
+                &crypto.root,
+                crypto.receive_direction(),
+                period,
+                wire_stream,
+                &salt,
+            )?;
+            if i64::try_from(stream_no).is_err() {
+                continue;
+            }
+            candidates.push(BtpInboundCandidate {
+                peer_ed25519: peer_ed25519.clone(),
+                stream_no,
+                material: crate::transport::btp::derive_stream_material(
+                    &crypto.root,
+                    crypto.receive_direction(),
+                    period,
+                    stream_no,
+                    salt,
+                )?,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+pub(crate) fn btp_mark_inbound_stream(
+    profile: &Path,
+    peer_ed25519: &str,
+    stream_no: u64,
+) -> Result<bool> {
+    let mut conn = init_db(profile)?;
+    let tx = conn.transaction()?;
+    // `rx_base` is the next value after the highest authenticated stream, not
+    // the first unfilled hole. This sliding window permits counters burned by a
+    // failed carrier write while retaining bounded out-of-order replay state.
+    let high_next: i64 = tx
+        .query_row(
+            "SELECT rx_base FROM btp_stream_state WHERE peer_ed25519=?1",
+            [peer_ed25519],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let stream_no = i64::try_from(stream_no)?;
+    let window = i64::try_from(crate::transport::btp::STREAM_WINDOW)?;
+    if stream_no < high_next.saturating_sub(window) {
+        return Ok(false);
+    }
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO btp_seen_streams(peer_ed25519, stream_no) VALUES (?1, ?2)",
+        params![peer_ed25519, stream_no],
+    )?;
+    if inserted == 0 {
+        return Ok(false);
+    }
+    let new_high_next = high_next.max(
+        stream_no
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("BTP rx counter exhausted"))?,
+    );
+    let window_start = new_high_next.saturating_sub(window);
+    tx.execute(
+        "DELETE FROM btp_seen_streams WHERE peer_ed25519=?1 AND stream_no < ?2",
+        params![peer_ed25519, window_start],
+    )?;
+    tx.execute(
+        "INSERT INTO btp_stream_state(peer_ed25519, tx_next, rx_base)
+         VALUES (?1, 0, ?2)
+         ON CONFLICT(peer_ed25519) DO UPDATE SET rx_base=excluded.rx_base",
+        params![peer_ed25519, new_high_next],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+pub(crate) fn set_contact_transport_prop(
+    profile: &Path,
+    contact: &str,
+    transport: &str,
+    value: &str,
+    updated_at: u128,
+) -> Result<bool> {
+    let updated_at = i64::try_from(updated_at).context("transport property timestamp overflow")?;
+    let conn = init_db(profile)?;
+    Ok(conn.execute(
+        "INSERT INTO contact_transport_props(contact, transport, value, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(contact, transport) DO UPDATE SET
+           value=excluded.value, updated_at=excluded.updated_at
+         WHERE excluded.updated_at >= contact_transport_props.updated_at",
+        params![contact, transport, value, updated_at],
+    )? > 0)
+}
+
+pub(crate) fn get_contact_transport_prop(
+    profile: &Path,
+    contact: &str,
+    transport: &str,
+) -> Result<Option<String>> {
+    let conn = init_db(profile)?;
+    Ok(conn
+        .query_row(
+            "SELECT value FROM contact_transport_props WHERE contact=?1 AND transport=?2",
+            params![contact, transport],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 /// A fresh LAN address for `contact_name`, if that contact is currently
 /// discovered on the local network (used by the send path for a LAN fast-path).
 pub(crate) fn lan_peer_addr(profile: &Path, contact_name: &str) -> Option<std::net::SocketAddr> {
@@ -2178,7 +2593,55 @@ pub(crate) fn lan_peer_addr(profile: &Path, contact_name: &str) -> Option<std::n
     if contact.pubkey_b64.is_empty() {
         return None;
     }
-    crate::transport::lan::PEERS.lookup(&contact.pubkey_b64)
+    crate::transport::lan::PEERS
+        .lookup(&contact.pubkey_b64)
+        .or_else(|| {
+            get_contact_transport_prop(profile, contact_name, "lan")
+                .ok()
+                .flatten()?
+                .parse::<std::net::SocketAddr>()
+                .ok()
+        })
+}
+
+fn outbound_routes(
+    profile: &Path,
+    contact_name: &str,
+    to_onion: &str,
+) -> Vec<crate::transport::registry::RouteCandidate> {
+    use crate::transport::registry::{RouteCandidate, RouteEndpoint, TransportRegistry};
+
+    let mut registry = TransportRegistry::default();
+    let lan_addr = lan_enabled(profile)
+        .then(|| lan_peer_addr(profile, contact_name))
+        .flatten();
+    registry.register(RouteCandidate::with_endpoint(
+        "lan",
+        100,
+        lan_addr.is_some(),
+        lan_addr.map_or(RouteEndpoint::Opaque, RouteEndpoint::Lan),
+    ));
+    let bluetooth = (cfg!(target_os = "android") && bluetooth_enabled(profile))
+        .then(|| {
+            get_contact_transport_prop(profile, contact_name, "bluetooth")
+                .ok()
+                .flatten()
+        })
+        .flatten()
+        .and_then(|value| crate::transport::bluetooth::BluetoothProperty::parse(&value).ok());
+    registry.register(RouteCandidate::with_endpoint(
+        "bluetooth",
+        80,
+        bluetooth.is_some(),
+        bluetooth.map_or(RouteEndpoint::Opaque, RouteEndpoint::Bluetooth),
+    ));
+    registry.register(RouteCandidate::with_endpoint(
+        "tor",
+        10,
+        !to_onion.is_empty(),
+        RouteEndpoint::Tor,
+    ));
+    registry.routes()
 }
 
 /// Build and send a signed+encrypted receipt (delivered/read) to a contact.
@@ -2229,6 +2692,113 @@ pub(crate) async fn send_read_receipt(
         up_to_ms: Some(up_to_ms),
     };
     send_receipt(profile, contact_name, onion, &payload, tor_client).await
+}
+
+fn sync_contact_onion(profile: &Path, contact_name: &str) -> Result<String> {
+    load_contacts(profile)?
+        .get(contact_name)
+        .filter(|contact| !contact.pending && !contact.blocked)
+        .map(|contact| contact.onion.clone())
+        .ok_or_else(|| anyhow!("sync contact not accepted: {contact_name}"))
+}
+
+pub(crate) async fn send_sync_inventory(
+    profile: &Path,
+    contact_name: &str,
+    reply: bool,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    let onion = sync_contact_onion(profile, contact_name)?;
+    let payload = crate::sync::pending_inventory(profile, contact_name, reply)?;
+    send_typed_message(
+        profile,
+        &onion,
+        contact_name,
+        "sync_inventory",
+        &serde_json::to_string(&payload)?,
+        tor_client,
+    )
+    .await
+}
+
+pub(crate) async fn send_sync_request(
+    profile: &Path,
+    contact_name: &str,
+    payload: &crate::sync::SyncRequestPayload,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    crate::sync::validate_request(payload)?;
+    let onion = sync_contact_onion(profile, contact_name)?;
+    send_typed_message(
+        profile,
+        &onion,
+        contact_name,
+        "sync_request",
+        &serde_json::to_string(payload)?,
+        tor_client,
+    )
+    .await
+}
+
+pub(crate) async fn send_sync_items(
+    profile: &Path,
+    contact_name: &str,
+    request: &crate::sync::SyncRequestPayload,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    crate::sync::validate_request(request)?;
+    let onion = sync_contact_onion(profile, contact_name)?;
+    let sender_onion = std::env::var("SIDEBAND_REPLY_ONION").unwrap_or_default();
+    for id in &request.ids {
+        let Some(item) = crate::sync::queued_item(profile, contact_name, id)? else {
+            continue;
+        };
+        let inner = build_outbound_message(
+            profile,
+            contact_name,
+            "sync_chat",
+            &item.message,
+            &sender_onion,
+            (item.expires_at_ms > 0).then_some(item.expires_at_ms as u128),
+        )?;
+        let payload = crate::sync::SyncItemPayload {
+            kind: "sync_item".into(),
+            id: id.clone(),
+            message: inner,
+        };
+        send_typed_message(
+            profile,
+            &onion,
+            contact_name,
+            "sync_item",
+            &serde_json::to_string(&payload)?,
+            Arc::clone(&tor_client),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn send_sync_ack(
+    profile: &Path,
+    contact_name: &str,
+    id: &str,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<()> {
+    let onion = sync_contact_onion(profile, contact_name)?;
+    let payload = crate::sync::SyncAckPayload {
+        kind: "sync_ack".into(),
+        id: id.to_string(),
+    };
+    send_typed_message(
+        profile,
+        &onion,
+        contact_name,
+        "sync_ack",
+        &serde_json::to_string(&payload)?,
+        tor_client,
+    )
+    .await
 }
 
 /// How many messages are currently queued for retry.
@@ -3369,6 +3939,20 @@ async fn main() -> Result<()> {
                 println!("{{\"enabled\":{enabled}}}");
             } else {
                 println!("lan discovery: {}", if enabled { "on" } else { "off" });
+            }
+            Ok(())
+        }
+        CommandKind::Bluetooth { profile, set, json } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if let Some(enabled) = set {
+                set_bluetooth_enabled(&profile, enabled)?;
+            }
+            let enabled = bluetooth_enabled(&profile);
+            if json {
+                println!("{{\"enabled\":{enabled}}}");
+            } else {
+                println!("bluetooth: {}", if enabled { "on" } else { "off" });
             }
             Ok(())
         }
@@ -5293,20 +5877,23 @@ pub(crate) async fn serve(
     let io_handle = tokio::spawn(async move { io_transport.run_inbound_loop(quit_rx).await });
 
     // Optional LAN carrier: a local TCP listener feeding the same inbound channel,
-    // plus signed UDP-broadcast discovery. Opt-in (a beacon advertises our identity
-    // on the local network). Failures here never affect the Tor path.
+    // plus signed, rotating contact-token discovery. Failures here never affect
+    // the Tor path.
+    let mut lan_listener_port = None;
     if lan_enabled(profile) {
-        match crate::transport::lan::spawn_listener(transport.inbound_sender()).await {
+        match crate::transport::lan::spawn_listener(
+            profile.to_path_buf(),
+            transport.inbound_sender(),
+        )
+        .await
+        {
             Ok((lan_port, _lan_handle)) => {
+                lan_listener_port = Some(lan_port);
                 if let Ok(key) = load_signing_key(profile) {
                     let profile_for_lan = profile.to_path_buf();
-                    let accept = move |ed: &str| {
-                        load_contacts(&profile_for_lan)
-                            .map(|c| c.values().any(|ct| ct.pubkey_b64 == ed))
-                            .unwrap_or(false)
-                    };
+                    let contacts = move || lan_beacon_contacts(&profile_for_lan);
                     if let Err(e) =
-                        crate::transport::lan::spawn_discovery(key, lan_port, accept).await
+                        crate::transport::lan::spawn_discovery(key, lan_port, contacts).await
                     {
                         warn!(error=%e, "LAN discovery failed to start");
                     } else {
@@ -5318,9 +5905,24 @@ pub(crate) async fn serve(
         }
     }
 
+    #[cfg(target_os = "android")]
+    match crate::transport::bluetooth::spawn_bridge_server(
+        profile.to_path_buf(),
+        transport.inbound_sender(),
+    )
+    .await
+    {
+        Ok((socket, _bluetooth_handle)) => {
+            info!(socket=%socket.display(), "Bluetooth platform bridge ready");
+        }
+        Err(e) => warn!(error=%e, "Bluetooth platform bridge failed to start"),
+    }
+
     // Main dispatch loop: pull envelopes from the channel and handle them.
     // This is the only place that calls handle_inbound — transport is agnostic.
     let transfer_state = transport.transfer_state();
+    let mut last_lan_props_revision = String::new();
+    let mut next_lan_props_check = std::time::Instant::now();
     loop {
         while let Ok(cmd) = control_rx.try_recv() {
             let profile = profile.to_path_buf();
@@ -5754,6 +6356,24 @@ pub(crate) async fn serve(
             }
         }
 
+        // Share reachable local routes only with accepted contacts. The revision
+        // includes properties and contact set, so route/settings changes and newly
+        // accepted contacts trigger a refresh without periodic Tor chatter.
+        if std::time::Instant::now() >= next_lan_props_check {
+            next_lan_props_check = std::time::Instant::now() + Duration::from_secs(10);
+            let lan_addr = lan_listener_port.and_then(reachable_lan_addr);
+            let properties = local_transport_properties(profile, lan_addr);
+            let revision = transport_props_revision(profile, &properties);
+            if !properties.is_empty() && revision != last_lan_props_revision {
+                last_lan_props_revision = revision;
+                let profile = profile.to_path_buf();
+                let tc = Arc::clone(&tor_client);
+                tokio::spawn(async move {
+                    publish_transport_props(&profile, properties, tc).await;
+                });
+            }
+        }
+
         // If the IO loop has finished, we're done.
         if io_handle.is_finished() {
             break;
@@ -6058,18 +6678,40 @@ pub(crate) async fn send_in_conversation(
     let mut last_error: Option<String> = None;
     let payload = format!("{}\n", serde_json::to_string(&msg)?);
 
-    // LAN fast-path: if this contact is currently discovered on the local network
-    // and LAN is enabled, deliver over LAN (fast, no internet). The wire bytes are
-    // identical end-to-end-encrypted; a LAN failure just falls through to Tor.
-    if lan_enabled(profile) {
-        if let Some(addr) = lan_peer_addr(profile, contact_hint) {
-            match crate::transport::lan::send_line(addr, &payload).await {
-                Ok(()) => {
-                    info!(%addr, to=%contact_hint, "message delivered over LAN");
-                    status = DeliveryStatus::Sent;
+    // Iterate the central route registry. Carrier failures fall through in
+    // preference order; Tor remains the terminal route below.
+    for route in outbound_routes(profile, contact_hint, to) {
+        match route.endpoint() {
+            crate::transport::registry::RouteEndpoint::Lan(addr) => {
+                match crate::transport::lan::send_btp(profile, contact_hint, *addr, &payload).await
+                {
+                    Ok(()) => {
+                        info!(%addr, to=%contact_hint, "message delivered over LAN");
+                        status = DeliveryStatus::Sent;
+                        break;
+                    }
+                    Err(e) => warn!(%addr, error=%e, "LAN delivery failed; falling back to Tor"),
                 }
-                Err(e) => warn!(%addr, error=%e, "LAN delivery failed; falling back to Tor"),
             }
+            crate::transport::registry::RouteEndpoint::Bluetooth(property) => {
+                match crate::transport::bluetooth::send_btp(
+                    profile,
+                    contact_hint,
+                    property,
+                    &payload,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        info!(to=%contact_hint, "message delivered over Bluetooth");
+                        status = DeliveryStatus::Sent;
+                        break;
+                    }
+                    Err(e) => warn!(error=%e, "Bluetooth delivery failed; falling back"),
+                }
+            }
+            crate::transport::registry::RouteEndpoint::Tor => break,
+            _ => continue,
         }
     }
 
@@ -8009,6 +8651,42 @@ fn lan_enabled_default_off_and_peer_lookup_drives_send_choice() {
     );
     // A contact we don't have returns None regardless of discovery.
     assert_eq!(lan_peer_addr(profile, "nobody"), None);
+}
+
+#[test]
+fn btp_stream_counters_are_persistent_and_replay_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    init_profile_with_name(profile, "me").unwrap();
+    let peer = "peer-ed25519";
+
+    assert_eq!(btp_reserve_outbound_stream(profile, peer).unwrap(), 0);
+    assert_eq!(btp_reserve_outbound_stream(profile, peer).unwrap(), 1);
+    assert!(btp_mark_inbound_stream(profile, peer, 0).unwrap());
+    assert!(!btp_mark_inbound_stream(profile, peer, 0).unwrap());
+    assert!(btp_mark_inbound_stream(profile, peer, 2).unwrap());
+    assert!(!btp_mark_inbound_stream(profile, peer, 2).unwrap());
+    assert!(btp_mark_inbound_stream(profile, peer, 1).unwrap());
+    assert!(!btp_mark_inbound_stream(profile, peer, 1).unwrap());
+    // Carrier failures may burn arbitrary outbound counters. A later valid
+    // stream must advance the replay window without requiring every hole.
+    assert!(btp_mark_inbound_stream(profile, peer, 100).unwrap());
+    assert!(!btp_mark_inbound_stream(profile, peer, 100).unwrap());
+    assert!(btp_mark_inbound_stream(profile, peer, 50).unwrap());
+    assert!(!btp_mark_inbound_stream(profile, peer, 36).unwrap());
+
+    let conn = init_db(profile).unwrap();
+    let base: i64 = conn
+        .query_row(
+            "SELECT rx_base FROM btp_stream_state WHERE peer_ed25519=?1",
+            [peer],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        base, 101,
+        "skipped streams advance the sliding high-water mark"
+    );
 }
 
 #[test]

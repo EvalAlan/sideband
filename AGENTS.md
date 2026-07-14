@@ -215,40 +215,67 @@ FFI `sideband_api_get/set_read_receipts` + `mark_conversation_read`; serve
 `read_receipt_marks_messages_read_up_to_timestamp`. Known gap: a message delivered
 on a later retry is rebuilt with fresh ciphertext, so its delivered-receipt won't
 match the stored fingerprint (stays Sent).
-**LAN transport (first non-Tor carrier)** — `src/transport/lan.rs`. Messages are
-E2E signed+encrypted independent of carrier, so the LAN just moves the same
-`ChatMessage` wire lines over local TCP (fast, no internet). Discovery is signed
-UDP-broadcast beacons (`LanBeacon`, self-signed by the identity's Ed25519 key —
-a LAN attacker can't claim a contact's identity; `verify()` + skew check); a
-`DiscoveredPeers`/`PEERS` registry maps contact Ed25519 → fresh LAN `SocketAddr`
-(90s TTL). `serve()` (when enabled) starts `spawn_listener` (feeding the same
-inbound `Envelope` channel via `TorTransport::inbound_sender`, so LAN+Tor share one
-`handle_inbound`) + `spawn_discovery` (accepts beacons only from known contacts).
-`send_in_conversation` has a LAN fast-path before the Tor loop: if
-`lan_peer_addr(contact)` resolves, send over LAN, else fall through to Tor. **Opt-in
-— off by default** (a beacon advertises identity on the LAN): `lan_enabled` setting,
-CLI `lan [--set on|off] [--json]`, FFI `get/set_lan_enabled`, GUI "LAN discovery"
-toggle. Tests: beacon sign/verify/tamper, stale-beacon rejection, peer freshness, a
-localhost end-to-end `send_line`→listener delivery of a real ChatMessage, and
-`lan_enabled_default_off_and_peer_lookup_drives_send_choice`.
-NEXT for LAN: two-peer real-network e2e; Android needs a WifiManager multicast lock
-(Kotlin) for UDP broadcast to work; LAN presence could also feed the receipt-derived
-presence UI. Group sends do not use the LAN fast-path yet (1:1 only).
-⚠️ **Privacy caveat (one localized fix, not a rewrite):** the v1 discovery *beacon*
-**broadcasts our Ed25519 pubkey in the clear** — unlike Briar, which never
-broadcasts identity (contacts exchange addresses as transport properties; every
-connection is wrapped in the unlinkable Bramble Transport Protocol; peers run a
-bidirectional sync). **The LAN transport itself is kept** — carrier (`send_line`,
-`spawn_listener`), serve/send wiring, `PEERS`, the `lan_enabled` setting, and the
-CLI/FFI/GUI toggle all carry forward. Only the beacon *payload* changes: Part A1
-adds contact-to-contact transport-property address exchange and **repurposes** the
-beacon to advertise a rotating per-contact token instead of the raw pubkey (same
-sign/verify + UDP loop). The full roadmap to bring WiFi + Bluetooth in line with
-Briar (transport-property exchange, BTP-lite link wrapping, BSP-lite sync,
-pluggable transport registry, a real Bluetooth carrier) **and** a later
-Beeper-style multi-network bridge / shared-inbox layer is in
-[`docs/plans/2026-07-14-briar-like-transports-and-bridges.md`](docs/plans/2026-07-14-briar-like-transports-and-bridges.md)
-— it evolves the existing transport work, it does not throw it away.
+**LAN transport A1+A2 complete (address exchange + BTP-lite wrapping)**:
+signed and encrypted `transport_props` messages share reachable `IP:port` values
+only with accepted contacts. Values persist in
+`contact_transport_props(contact, transport, value, updated_at)` and feed
+`PEERS`/`lan_peer_addr`; failed or missing LAN addresses fall back to Tor. The
+serve loop refreshes properties when its reachable address or accepted-contact
+set changes. The opt-in UDP helper broadcasts only 16-byte rotating per-contact
+HKDF tokens derived from static X25519 DH material, never a raw identity key.
+
+`src/transport/btp.rs` now wraps every LAN TCP stream with a separately labeled
+static-X25519/HKDF transport root, canonical direction keys, 30-second period
+keys, per-stream 16-byte tags, ChaCha20-Poly1305 encrypted headers/bodies, random
+128-bit stream salts, bucket padding, strict 4 MiB bounds, persistent counters,
+a masked stream counter, sliding replay window, and transactional replay rejection. The random salt
+prevents nonce/key reuse if a profile rollback repeats a counter. Receivers
+authenticate the fixed header before reading the exact body and return a keyed
+carrier ACK only after core dispatch; missing ACKs continue route fallback. LAN
+plaintext downgrade attempts are rejected. Outbound BTP
+connections are serialized per profile and reserve counters only after TCP connect;
+the listener bounds reads, deadlines, and concurrent streams. The static
+transport root does not provide metadata forward secrecy after later static-key
+compromise; inner Double Ratchet content retains its own properties where used.
+
+Tests cover address exchange/fallback, beacon privacy/tamper/staleness, BTP key
+agreement/direction/tag separation, encrypted framing/padding/bounds/tampering,
+counter persistence/replays, plaintext rejection, and real localhost delivery.
+**A3 BSP-lite and A5 route registry are complete.** Durable retry rows have
+stable 128-bit sync IDs; `sync_inventory`/`sync_request`/`sync_item`/`sync_ack`
+typed messages exchange pending unexpired items bidirectionally and deduplicate
+them through `sync_seen_items`. Sync payloads use a dedicated static-v2
+`sync_chat` inner type so a repeated request after ACK loss cannot advance only
+one side of the Double Ratchet. Inventory size is capped at 256 IDs.
+
+`src/transport/registry.rs` provides deterministic named route registration,
+reachability filtering, and preference ordering. Both normal and typed sends
+iterate LAN first and retain Tor as the terminal fallback; inbound carriers
+still converge on the single core dispatch.
+
+**A4 Android Bluetooth is complete in code.** It is opt-in and off by default.
+Rust owns the stable per-profile RFCOMM UUID, encrypted `bluetooth` transport
+property, BTP/BSP state, route selection, and inbound dispatch. Kotlin is a thin
+opaque-frame adapter over a private Unix socket, using classic RFCOMM and paired
+device address/name resolution. Every dial, write, inbound frame, ACK, cancel,
+and close names an immutable RFCOMM session; in-flight dials are cancellable,
+bridge request timeouts do not wedge later sends, and bounded per-role executors
+prevent unrelated sessions from stealing sockets or ACKs. Android requests only
+the paired-device `BLUETOOTH_CONNECT` permission when enabled. The same
+random-salted BTP framing, replay checks, padding, and keyed carrier ACK used by
+LAN wrap Bluetooth frames. No-radio tests carry a real signed/encrypted message
+and verify timeout recovery. A physical two-device paired RFCOMM smoke test still
+requires Android hardware.
+
+`./run-tests.sh fast` passed after A4/A5 (121 lib tests, 114 binary tests, desktop
+CLI contract, 28 Flutter tests); `cargo clippy --all-targets -- -D warnings` is
+clean. The release APK builds with package `com.evalalan.sideband`, label
+`Sideband`, and arm64-v8a/armeabi-v7a/x86_64 native libraries.
+
+NEXT: physical paired-Android Bluetooth smoke test. Android still needs a
+`WifiManager` multicast lock for the optional UDP helper. Group sends do not use
+non-Tor fast paths yet (1:1 only). Full plan:
+[`docs/plans/2026-07-14-briar-like-transports-and-bridges.md`](docs/plans/2026-07-14-briar-like-transports-and-bridges.md).
 
 **Open / backlog (roughly prioritized):**
 1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).

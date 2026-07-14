@@ -196,9 +196,20 @@ ThemeData _buildTheme(ThemeDef t) => ThemeData(
           letterSpacing: 0.1,
           fontFamilyFallback: const ['SidebandEmoji'],
         ),
-        bodyLarge: TextStyle(color: t.text, fontSize: 14, height: 1.4, fontFamilyFallback: const ['SidebandEmoji']),
-        bodyMedium: TextStyle(color: t.text, fontSize: 13, height: 1.4, fontFamilyFallback: const ['SidebandEmoji']),
-        bodySmall: TextStyle(color: t.textDim, fontSize: 11, fontFamilyFallback: const ['SidebandEmoji']),
+        bodyLarge: TextStyle(
+            color: t.text,
+            fontSize: 14,
+            height: 1.4,
+            fontFamilyFallback: const ['SidebandEmoji']),
+        bodyMedium: TextStyle(
+            color: t.text,
+            fontSize: 13,
+            height: 1.4,
+            fontFamilyFallback: const ['SidebandEmoji']),
+        bodySmall: TextStyle(
+            color: t.textDim,
+            fontSize: 11,
+            fontFamilyFallback: const ['SidebandEmoji']),
       ),
     );
 
@@ -496,8 +507,7 @@ class AttachmentInfo {
 /// Returns the hash/key token, or null if the line is not recognized.
 String? parseTransferHash(String line) {
   final trimmed = line.trim();
-  final match =
-      RegExp(r'^(?:outbound|incoming)\s+(\S+)').firstMatch(trimmed);
+  final match = RegExp(r'^(?:outbound|incoming)\s+(\S+)').firstMatch(trimmed);
   if (match == null) return null;
   final hash = match.group(1);
   if (hash == null || hash.isEmpty) return null;
@@ -1152,7 +1162,8 @@ class _Cli {
   Future<int> getConversationExpiry(
       {required String kind, required String id}) async {
     final flag = kind == 'group' ? '--group' : '--contact';
-    final raw = await _run(['expiry', '--profile', profile, flag, id, '--json']);
+    final raw =
+        await _run(['expiry', '--profile', profile, flag, id, '--json']);
     final decoded = jsonDecode(raw);
     if (decoded is Map && decoded['ttl_ms'] is num) {
       return (decoded['ttl_ms'] as num).toInt();
@@ -1221,8 +1232,14 @@ class _Cli {
   }
 
   Future<void> setLanEnabled(bool enabled) async {
-    await _run(
-        ['lan', '--profile', profile, '--set', enabled ? 'true' : 'false', '--json']);
+    await _run([
+      'lan',
+      '--profile',
+      profile,
+      '--set',
+      enabled ? 'true' : 'false',
+      '--json'
+    ]);
   }
 }
 
@@ -1289,10 +1306,13 @@ class _MobileApi {
                     ffi.Pointer<Utf8>)>('sideband_api_get_conversation_expiry'),
         _setConversationExpiry = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
-                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Int64),
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
-                    ffi.Pointer<Utf8>, int)>('sideband_api_set_conversation_expiry'),
+                    ffi.Pointer<Utf8>, ffi.Int64),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>,
+                    ffi.Pointer<Utf8>,
+                    int)>('sideband_api_set_conversation_expiry'),
         _getRetryWindow = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
@@ -1301,8 +1321,8 @@ class _MobileApi {
         _setRetryWindow = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Int64),
-                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-                    int)>('sideband_api_set_retry_window'),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, int)>('sideband_api_set_retry_window'),
         _getReadReceipts = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
@@ -1311,8 +1331,8 @@ class _MobileApi {
         _setReadReceipts = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
-                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-                    bool)>('sideband_api_set_read_receipts'),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, bool)>('sideband_api_set_read_receipts'),
         _getLanEnabled = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
@@ -1321,8 +1341,29 @@ class _MobileApi {
         _setLanEnabled = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, bool)>('sideband_api_set_lan_enabled'),
+        _getBluetoothEnabled = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>)>('sideband_api_get_bluetooth_enabled'),
+        _setBluetoothEnabled = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-                    bool)>('sideband_api_set_lan_enabled'),
+                    bool)>('sideband_api_set_bluetooth_enabled'),
+        _getBluetoothBridgeConfig = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+                    ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>(
+                'sideband_api_get_bluetooth_bridge_config'),
+        _setBluetoothLocalDevice = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                    ffi.Pointer<Utf8> Function(
+                        ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+                    ffi.Pointer<Utf8> Function(
+                        ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)>(
+                'sideband_api_set_bluetooth_local_device'),
         _markConversationRead = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(
@@ -1361,12 +1402,10 @@ class _MobileApi {
                     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
                     ffi.Pointer<Utf8>)>('sideband_api_block_contact'),
-        _initRatchet = ffi.DynamicLibrary.open('libsideband.so')
-            .lookupFunction<
-                ffi.Pointer<Utf8> Function(
-                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
-                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-                    ffi.Pointer<Utf8>)>('sideband_api_init_ratchet'),
+        _initRatchet = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>)>('sideband_api_init_ratchet'),
         _unblockContact = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(
@@ -1430,6 +1469,12 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setReadReceipts;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getLanEnabled;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setLanEnabled;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getBluetoothEnabled;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool)
+      _setBluetoothEnabled;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getBluetoothBridgeConfig;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _setBluetoothLocalDevice;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
       _markConversationRead;
   final ffi.Pointer<Utf8> Function(
@@ -1674,9 +1719,7 @@ class _MobileApi {
   }
 
   Future<void> send(
-      {required String to,
-      required String message,
-      int expiresMs = -1}) async {
+      {required String to, required String message, int expiresMs = -1}) async {
     final profile = (await profilePath()).toNativeUtf8();
     final cto = to.toNativeUtf8();
     final cmessage = message.toNativeUtf8();
@@ -1774,6 +1817,44 @@ class _MobileApi {
       _decode<Object?>(_setLanEnabled(profile, enabled));
     } finally {
       calloc.free(profile);
+    }
+  }
+
+  Future<bool> getBluetoothEnabled() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      return _decode<bool>(_getBluetoothEnabled(profile));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<void> setBluetoothEnabled(bool enabled) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      _decode<Object?>(_setBluetoothEnabled(profile, enabled));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<Map<String, dynamic>> getBluetoothBridgeConfig() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      return _decode<Map<String, dynamic>>(_getBluetoothBridgeConfig(profile));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<void> setBluetoothLocalDevice(String device) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cdevice = device.toNativeUtf8();
+    try {
+      _decode<Object?>(_setBluetoothLocalDevice(profile, cdevice));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cdevice);
     }
   }
 
@@ -2250,6 +2331,9 @@ class _ChatScreenState extends State<_ChatScreen>
   // Whether LAN discovery + delivery is enabled (persisted; default off — a LAN
   // beacon advertises this identity on the local network). Loaded in Settings.
   bool _lanEnabled = false;
+  // Android-only RFCOMM carrier. Persisted in the Rust profile and opt-in.
+  bool _bluetoothEnabled = false;
+  bool _bluetoothSettingBusy = false;
   // Highest inbound timestamp (ms) we've already sent a mark-read receipt for,
   // per contact, so the 6s poll doesn't spam a receipt on every refresh.
   final _lastReadSentMs = <String, int>{};
@@ -2293,6 +2377,7 @@ class _ChatScreenState extends State<_ChatScreen>
   AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
   bool _foregroundServiceRunning = false;
   bool _notificationPermissionRequested = false;
+  bool _bluetoothBridgeRunning = false;
   bool get _appResumed => _lifecycleState == AppLifecycleState.resumed;
 
   String _formatBytes(int bytes) {
@@ -2341,7 +2426,11 @@ class _ChatScreenState extends State<_ChatScreen>
 
   String _previewText(ChatMsg m) {
     if (m.out) {
-      final prefix = m.sending ? '⏳ ' : m.failed ? '⚠ ' : '✓ ';
+      final prefix = m.sending
+          ? '⏳ '
+          : m.failed
+              ? '⚠ '
+              : '✓ ';
       return '$prefix${m.text}';
     }
     return m.text;
@@ -2531,6 +2620,7 @@ class _ChatScreenState extends State<_ChatScreen>
       // listener on the result).
       unawaited(_startForegroundService());
       unawaited(_requestNotificationPermission());
+      unawaited(_startBluetoothBridge());
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -2576,6 +2666,7 @@ class _ChatScreenState extends State<_ChatScreen>
     _poll?.cancel();
     _notificationTimer?.cancel();
     _listener?.kill(ProcessSignal.sigterm);
+    unawaited(_stopBluetoothBridge());
     unawaited(_stopForegroundService());
     _input.dispose();
     _scroll.dispose();
@@ -2596,6 +2687,61 @@ class _ChatScreenState extends State<_ChatScreen>
   }
 
   // ── Android foreground service + notifications ────────────────────────────
+
+  // ── Android Bluetooth carrier bridge ──────────────────────────────────────
+
+  Future<bool> _startBluetoothBridge() async {
+    if (!Platform.isAndroid) return false;
+    if (_bluetoothBridgeRunning) return true;
+    final mobile = _mobile;
+    if (mobile == null) return false;
+    try {
+      final config = await mobile.getBluetoothBridgeConfig();
+      if (config['enabled'] != true) return false;
+      final granted = await _nativeChannel
+              .invokeMethod<bool>('requestBluetoothPermissions') ??
+          false;
+      if (!granted || !mounted) {
+        if (mounted) setState(() => _error = 'Bluetooth permission denied');
+        return false;
+      }
+      final device =
+          await _nativeChannel.invokeMethod<String>('bluetoothLocalDevice');
+      if (device == null || device.isEmpty) {
+        if (mounted) {
+          setState(() => _error = 'Bluetooth is unavailable or disabled');
+        }
+        return false;
+      }
+      await mobile.setBluetoothLocalDevice(device);
+      if (!mounted) return false;
+      await _nativeChannel.invokeMethod<void>('startBluetoothBridge', {
+        'socketPath': config['socket_path'] as String,
+        'serviceUuid': config['service_uuid'] as String,
+      });
+      if (!mounted) {
+        await _nativeChannel.invokeMethod<void>('stopBluetoothBridge');
+        return false;
+      }
+      _bluetoothBridgeRunning = true;
+      return true;
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = 'Bluetooth bridge could not start: $e');
+      }
+      return false;
+    }
+  }
+
+  Future<void> _stopBluetoothBridge() async {
+    if (!Platform.isAndroid || !_bluetoothBridgeRunning) return;
+    try {
+      await _nativeChannel.invokeMethod<void>('stopBluetoothBridge');
+    } catch (_) {
+      // Best effort during widget/activity teardown.
+    }
+    _bluetoothBridgeRunning = false;
+  }
 
   Future<void> _startForegroundService() async {
     if (!Platform.isAndroid || _foregroundServiceRunning) return;
@@ -3102,6 +3248,35 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  Future<void> _setBluetoothEnabled(bool enabled) async {
+    final mobile = _mobile;
+    if (!_canUseMobileBackend || mobile == null || _bluetoothSettingBusy) {
+      return;
+    }
+    if (mounted) setState(() => _bluetoothSettingBusy = true);
+    try {
+      await mobile.setBluetoothEnabled(enabled);
+      if (enabled) {
+        if (!await _startBluetoothBridge()) {
+          await mobile.setBluetoothEnabled(false);
+          throw StateError('Bluetooth carrier is not available');
+        }
+      } else {
+        await _stopBluetoothBridge();
+      }
+      if (mounted) setState(() => _bluetoothEnabled = enabled);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _bluetoothEnabled = !enabled;
+          _error = 'could not set Bluetooth delivery: $e';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _bluetoothSettingBusy = false);
+    }
+  }
+
   /// Tell the backend we've read `contact`'s messages up to `upToMs`. No-op if
   /// read receipts are disabled or the timestamp hasn't advanced.
   Future<void> _markConversationRead(String contact, int upToMs) async {
@@ -3113,8 +3288,8 @@ class _ChatScreenState extends State<_ChatScreen>
       } else {
         final l = _listener;
         if (l == null) return;
-        l.stdin.writeln(
-            jsonEncode({'cmd': 'mark_read', 'to': contact, 'up_to_ms': upToMs}));
+        l.stdin.writeln(jsonEncode(
+            {'cmd': 'mark_read', 'to': contact, 'up_to_ms': upToMs}));
         await l.stdin.flush();
       }
       _lastReadSentMs[contact] = upToMs;
@@ -3220,8 +3395,8 @@ class _ChatScreenState extends State<_ChatScreen>
                 ),
                 const SizedBox(height: 16),
                 Text('Default for this ${isGroup ? 'group' : 'chat'}',
-                    style: TextStyle(
-                        color: _t.text, fontWeight: FontWeight.w600)),
+                    style:
+                        TextStyle(color: _t.text, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 8),
                 chips(
                   selected: _convExpiryMs,
@@ -3229,8 +3404,8 @@ class _ChatScreenState extends State<_ChatScreen>
                 ),
                 const SizedBox(height: 20),
                 Text('Just the next message',
-                    style: TextStyle(
-                        color: _t.text, fontWeight: FontWeight.w600)),
+                    style:
+                        TextStyle(color: _t.text, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 8),
                 chips(
                   includeDefault: true,
@@ -3592,7 +3767,8 @@ class _ChatScreenState extends State<_ChatScreen>
     return _canUseMobileBackend && _mobile != null
         ? _historyVisibleForMobile(contact,
             group: group, knownContacts: knownContacts)
-        : _historyVisibleFor(contact, group: group, knownContacts: knownContacts);
+        : _historyVisibleFor(contact,
+            group: group, knownContacts: knownContacts);
   }
 
   Future<_History> _historyVisibleForMobile(
@@ -3853,8 +4029,7 @@ class _ChatScreenState extends State<_ChatScreen>
         if (g != null) {
           await _sendViaListener(group: g.id, message: t, expiresMs: expiresMs);
         } else {
-          await _sendViaListener(
-              to: c!.name, message: t, expiresMs: expiresMs);
+          await _sendViaListener(to: c!.name, message: t, expiresMs: expiresMs);
         }
         // A per-message override applies to a single send only.
         if (_msgExpireOverrideMs != null) {
@@ -4013,7 +4188,8 @@ class _ChatScreenState extends State<_ChatScreen>
           }
           final newGroupTitle = raw.split(RegExp(r'\s+')).skip(2).join(' ');
           final group = _canUseMobileBackend && _mobile != null
-              ? await _mobile!.renameGroup(groupId: parts[1], title: newGroupTitle)
+              ? await _mobile!
+                  .renameGroup(groupId: parts[1], title: newGroupTitle)
               : await _cli.renameGroup(group: parts[1], title: newGroupTitle);
           await _load();
           _showInfo('Group renamed', group.details);
@@ -4023,7 +4199,8 @@ class _ChatScreenState extends State<_ChatScreen>
             throw Exception('usage: /group-add <id-or-title> <member>');
           }
           final added = _canUseMobileBackend && _mobile != null
-              ? await _mobile!.addGroupMember(groupId: parts[1], member: parts[2])
+              ? await _mobile!
+                  .addGroupMember(groupId: parts[1], member: parts[2])
               : await _cli.addGroupMember(group: parts[1], member: parts[2]);
           await _load();
           _showInfo('Member added', added.details);
@@ -4325,8 +4502,8 @@ class _ChatScreenState extends State<_ChatScreen>
                           return ListView.separated(
                             shrinkWrap: true,
                             itemCount: transfers.length,
-                            separatorBuilder: (_, __) => Divider(
-                                height: 12, color: _t.border),
+                            separatorBuilder: (_, __) =>
+                                Divider(height: 12, color: _t.border),
                             itemBuilder: (context, i) {
                               final line = transfers[i];
                               final hash = parseTransferHash(line);
@@ -4512,8 +4689,8 @@ class _ChatScreenState extends State<_ChatScreen>
                             child: SingleChildScrollView(
                               child: SelectableText(
                                 details,
-                                style: TextStyle(
-                                    color: _t.textDim, fontSize: 10),
+                                style:
+                                    TextStyle(color: _t.textDim, fontSize: 10),
                                 textAlign: TextAlign.left,
                               ),
                             ),
@@ -5159,7 +5336,8 @@ class _ChatScreenState extends State<_ChatScreen>
           ),
         ),
         const PopupMenuDivider(),
-        const PopupMenuItem(value: 'accept', child: Text('Add pending contact')),
+        const PopupMenuItem(
+            value: 'accept', child: Text('Add pending contact')),
         const PopupMenuItem(value: 'block', child: Text('Block contact')),
         const PopupMenuItem(value: 'unblock', child: Text('Unblock contact')),
         const PopupMenuDivider(),
@@ -5469,16 +5647,19 @@ class _ChatScreenState extends State<_ChatScreen>
       message: 'Restores from the backup file you picked.',
     );
     if (pass == null) return;
-    if (!await _confirm('Replace this device?',
+    if (!await _confirm(
+        'Replace this device?',
         'Importing OVERWRITES this device\'s current identity and all messages '
-        'with the backup. This cannot be undone. Continue?')) {
+            'with the backup. This cannot be undone. Continue?')) {
       return;
     }
     try {
       if (_canUseMobileBackend && _mobile != null) {
-        await _mobile!.importProfile(inPath: path, passphrase: pass, overwrite: true);
+        await _mobile!
+            .importProfile(inPath: path, passphrase: pass, overwrite: true);
       } else {
-        await _cli.importProfile(inPath: path, passphrase: pass, overwrite: true);
+        await _cli.importProfile(
+            inPath: path, passphrase: pass, overwrite: true);
       }
       if (mounted) {
         _showInfo('Imported',
@@ -5511,6 +5692,12 @@ class _ChatScreenState extends State<_ChatScreen>
           : await _cli.getLanEnabled();
       if (mounted) setState(() => _lanEnabled = enabled);
     } catch (_) {}
+    if (_canUseMobileBackend && _mobile != null) {
+      try {
+        final enabled = await _mobile!.getBluetoothEnabled();
+        if (mounted) setState(() => _bluetoothEnabled = enabled);
+      } catch (_) {}
+    }
     if (!mounted) return;
     await showDialog<void>(
       context: context,
@@ -5603,6 +5790,23 @@ class _ChatScreenState extends State<_ChatScreen>
                       unawaited(_setLanEnabled(value));
                     },
                   ),
+                  if (_canUseMobileBackend)
+                    SwitchListTile(
+                      secondary: const Icon(Icons.bluetooth),
+                      title: const Text('Bluetooth delivery'),
+                      subtitle: const Text(
+                          'Reach paired contacts without internet. Shares a device hint '
+                          'only with accepted contacts.'),
+                      value: _bluetoothEnabled,
+                      onChanged: _bluetoothSettingBusy
+                          ? null
+                          : (value) async {
+                              if (_bluetoothSettingBusy) return;
+                              setDialogState(() => _bluetoothEnabled = value);
+                              await _setBluetoothEnabled(value);
+                              if (context.mounted) setDialogState(() {});
+                            },
+                    ),
                   ListTile(
                     leading: const Icon(Icons.schedule_send_outlined),
                     title: const Text('Offline message retry'),
@@ -5727,8 +5931,8 @@ class _ChatScreenState extends State<_ChatScreen>
                     ListTile(
                       leading: const Icon(Icons.swap_vert),
                       title: const Text('File transfers'),
-                      subtitle:
-                          const Text('Resume or cancel in-flight file transfers'),
+                      subtitle: const Text(
+                          'Resume or cancel in-flight file transfers'),
                       onTap: () {
                         Navigator.pop(dialogContext);
                         unawaited(_showTransfersSheet());
@@ -6090,8 +6294,8 @@ class _ChatScreenState extends State<_ChatScreen>
                                 selected: _selGroup?.id == g.id,
                                 onTap: () async {
                                   try {
-                                    final h =
-                                        await _historyDispatch(null, group: g.id);
+                                    final h = await _historyDispatch(null,
+                                        group: g.id);
                                     if (!mounted) return;
                                     setState(() {
                                       _sel = null;
@@ -6152,8 +6356,8 @@ class _ChatScreenState extends State<_ChatScreen>
                                   if (lastMsg != null)
                                     Text(
                                       _hm(lastMsg.ts),
-                                          style: TextStyle(
-                                              fontSize: 10, color: _t.textDim),
+                                      style: TextStyle(
+                                          fontSize: 10, color: _t.textDim),
                                     ),
                                   const SizedBox(width: 6),
                                   Tooltip(
@@ -6501,7 +6705,8 @@ class _ChatScreenState extends State<_ChatScreen>
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       child: Row(
         children: [
-          const Icon(Icons.schedule_send_outlined, size: 16, color: Color(0xFFFFC857)),
+          const Icon(Icons.schedule_send_outlined,
+              size: 16, color: Color(0xFFFFC857)),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
@@ -7038,8 +7243,8 @@ class _ChatScreenState extends State<_ChatScreen>
     // predate read receipts.
     final wasRead = m.read || _wasRead(m);
     if (m.status == 'delivered' || m.read || wasRead) {
-      return Icon(Icons.done_all, size: 13,
-          color: wasRead ? _t.primary : _t.primary.withAlpha(140));
+      return Icon(Icons.done_all,
+          size: 13, color: wasRead ? _t.primary : _t.primary.withAlpha(140));
     }
     return Icon(Icons.done, size: 13, color: _t.primary.withAlpha(160));
   }
@@ -7050,7 +7255,9 @@ class _ChatScreenState extends State<_ChatScreen>
     if (contact.isEmpty) return false;
     // Check if we have any inbound message from this contact after this one
     for (final m in _msgs) {
-      if (m.direction == 'in' && m.contact == contact && m.tsMs > sentMsg.tsMs) {
+      if (m.direction == 'in' &&
+          m.contact == contact &&
+          m.tsMs > sentMsg.tsMs) {
         return true;
       }
     }

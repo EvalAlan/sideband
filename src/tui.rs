@@ -1335,8 +1335,9 @@ pub async fn run_tui(profile: &Path) -> Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                let tor = crate::transport::tor::TorTransport::new(None, tor);
-                match tor.send_message(&profile, &onion, &message, &contact).await {
+                match crate::send(&profile, &onion, &message, &contact, None, tor, false, None)
+                    .await
+                {
                     Ok(()) => {
                         let _ = tui_tx
                             .send(TuiEvent::OutboundMessage {

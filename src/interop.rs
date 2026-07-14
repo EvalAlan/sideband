@@ -16,13 +16,15 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use crate::handler::{handle_receipt, handle_text_message, parse_inbound_line};
+use crate::handler::{
+    handle_receipt, handle_text_message, handle_transport_props, parse_inbound_line,
+};
 use crate::{
-    build_outbound_message, contact_add, get_conversation_ttl, init_profile_with_name,
-    init_ratchet_for_contact, load_contacts, load_history, load_signing_key, load_x25519_public,
-    message_replay_fingerprint, resolve_message_expiry, set_conversation_ttl,
-    set_message_fingerprint, store_message_for_conversation, DeliveryStatus, ReceiptPayload,
-    TuiEvent,
+    build_outbound_message, contact_add, enqueue_retry, get_conversation_ttl,
+    init_profile_with_name, init_ratchet_for_contact, load_contacts, load_history,
+    load_signing_key, load_x25519_public, message_replay_fingerprint, resolve_message_expiry,
+    retry_queue_len, set_conversation_ttl, set_message_fingerprint, store_message_for_conversation,
+    DeliveryStatus, ReceiptPayload, TransportProp, TransportPropsPayload, TuiEvent,
 };
 
 // Valid v3 onion addresses (checksum-correct) for harness peers. They are never
@@ -82,6 +84,56 @@ impl Peer {
             build_outbound_message(&self.profile, to_name, "msg", text, &self.onion, None).unwrap();
         serde_json::to_string(&msg).unwrap()
     }
+}
+
+/// A1: transport addresses travel as an authenticated typed message, without
+/// Tor or LAN discovery. Receiving one persists and resolves the sender address.
+#[tokio::test]
+async fn transport_property_exchange_resolves_lan_address_without_radio() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+
+    let payload = TransportPropsPayload {
+        kind: "transport_props".into(),
+        properties: vec![TransportProp {
+            transport: "lan".into(),
+            value: "192.168.50.7:4242".into(),
+        }],
+    };
+    let mut msg = build_outbound_message(
+        alice.profile(),
+        "bob",
+        "transport_props",
+        &serde_json::to_string(&payload).unwrap(),
+        ALICE_ONION,
+        None,
+    )
+    .unwrap();
+    let contacts = load_contacts(bob.profile()).unwrap();
+    handle_transport_props(bob.profile(), &contacts, &mut msg)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        crate::lan_peer_addr(bob.profile(), "alice"),
+        Some("192.168.50.7:4242".parse().unwrap())
+    );
+    assert_eq!(
+        crate::get_contact_transport_prop(bob.profile(), "alice", "lan")
+            .unwrap()
+            .as_deref(),
+        Some("192.168.50.7:4242")
+    );
+}
+
+#[test]
+fn contact_without_transport_property_falls_back_from_lan() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    bob.add_contact(&alice, "alice");
+    assert_eq!(crate::lan_peer_addr(bob.profile(), "alice"), None);
 }
 
 /// Deliver a wire `line` into `to`'s inbound pipeline (decrypt → verify →
@@ -600,6 +652,63 @@ fn discover_group_excludes_self() {
         "the sender is a real member"
     );
     assert!(contacts.contains_key("Alan"), "other members are added");
+}
+
+/// BSP inventory/request/item/ack converges a durable outbox without Tor,
+/// and replayed item IDs do not create duplicate history rows.
+#[tokio::test]
+async fn bsp_sync_converges_and_deduplicates_replayed_items_without_radio() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+
+    for body in ["sync one", "sync two"] {
+        enqueue_retry(alice.profile(), "bob", BOB_ONION, body, "offline", None, 0).unwrap();
+    }
+
+    let inventory = crate::sync::pending_inventory(alice.profile(), "bob", true).unwrap();
+    let alice_pubkey = B64.encode(
+        load_signing_key(alice.profile())
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    );
+    let request =
+        crate::sync::missing_from_inventory(bob.profile(), &alice_pubkey, &inventory).unwrap();
+    assert_eq!(request.ids.len(), 2);
+
+    for id in &request.ids {
+        let queued = crate::sync::queued_item(alice.profile(), "bob", id)
+            .unwrap()
+            .unwrap();
+        assert!(crate::sync::mark_received(bob.profile(), &alice_pubkey, id).unwrap());
+        let inner = build_outbound_message(
+            alice.profile(),
+            "bob",
+            "sync_chat",
+            &queued.message,
+            ALICE_ONION,
+            None,
+        )
+        .unwrap();
+        assert_eq!(inner.v, 2, "BSP retry items must not advance the ratchet");
+        let line = serde_json::to_string(&inner).unwrap();
+        assert_eq!(deliver(&bob, &line).await.len(), 1);
+
+        assert!(!crate::sync::mark_received(bob.profile(), &alice_pubkey, id).unwrap());
+        assert!(crate::sync::ack_outbound(alice.profile(), "bob", id).unwrap());
+    }
+
+    assert_eq!(retry_queue_len(alice.profile()).unwrap(), 0);
+    let history = load_history(bob.profile(), Some("alice"), 50).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| message.body.starts_with("sync "))
+            .count(),
+        2
+    );
 }
 
 /// A v3 double-ratchet message (after /ratchet) must decrypt and verify on the

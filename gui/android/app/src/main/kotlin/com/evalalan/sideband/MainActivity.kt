@@ -1,6 +1,7 @@
 package com.evalalan.sideband
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -15,6 +16,7 @@ import androidx.core.content.FileProvider
 import java.io.File
 import java.io.IOException
 import java.net.URLConnection
+import java.util.UUID
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -25,11 +27,16 @@ class MainActivity : FlutterActivity() {
         // Distinct from mobile_scanner's MobileScannerPermissions.REQUEST_CODE (0x0786 / 1926)
         // so onRequestPermissionsResult dispatch never collides with the camera-permission flow.
         private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 24680
+        private const val BLUETOOTH_PERMISSION_REQUEST_CODE = 24681
 
         const val MESSAGES_CHANNEL_ID = "sideband_messages_channel"
+        // Process-owned: the foreground service can keep the Rust listener alive
+        // while Flutter recreates its Activity.
+        private var bluetoothBridge: BluetoothBridge? = null
     }
 
     private var pendingNotificationPermissionResult: MethodChannel.Result? = null
+    private var pendingBluetoothPermissionResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -87,6 +94,38 @@ class MainActivity : FlutterActivity() {
                     "requestNotificationPermission" -> {
                         requestNotificationPermission(result)
                     }
+
+                    "requestBluetoothPermissions" -> requestBluetoothPermissions(result)
+
+                    "startBluetoothBridge" -> {
+                        val socketPath = call.argument<String>("socketPath")?.trim().orEmpty()
+                        val uuidText = call.argument<String>("serviceUuid")?.trim().orEmpty()
+                        try {
+                            val uuid = UUID.fromString(uuidText)
+                            requirePrivateSocketPath(socketPath)
+                            if (bluetoothBridge?.matches(socketPath, uuid) == true) {
+                                result.success(null)
+                                return@setMethodCallHandler
+                            }
+                            bluetoothBridge?.close()
+                            bluetoothBridge = BluetoothBridge(this, socketPath, uuid).also { it.start() }
+                            result.success(null)
+                        } catch (_: IllegalArgumentException) {
+                            result.error("invalid_bluetooth_bridge", "invalid bridge configuration", null)
+                        } catch (_: SecurityException) {
+                            result.error("bluetooth_permission_denied", "Bluetooth permission denied", null)
+                        } catch (_: Exception) {
+                            result.error("start_bluetooth_bridge_failed", "Bluetooth bridge could not start", null)
+                        }
+                    }
+
+                    "stopBluetoothBridge" -> {
+                        bluetoothBridge?.close()
+                        bluetoothBridge = null
+                        result.success(null)
+                    }
+
+                    "bluetoothLocalDevice" -> result.success(bluetoothLocalDevice())
 
                     "showMessageNotification" -> {
                         val title = call.argument<String>("title") ?: "Sideband"
@@ -309,6 +348,56 @@ class MainActivity : FlutterActivity() {
         )
     }
 
+    private fun requestBluetoothPermissions(result: MethodChannel.Result) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            result.success(true)
+            return
+        }
+        val permissions = arrayOf(Manifest.permission.BLUETOOTH_CONNECT)
+        if (permissions.all {
+                ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+            }) {
+            result.success(true)
+            return
+        }
+        if (pendingBluetoothPermissionResult != null) {
+            result.error("request_in_progress", "a Bluetooth permission request is already pending", null)
+            return
+        }
+        pendingBluetoothPermissionResult = result
+        ActivityCompat.requestPermissions(this, permissions, BLUETOOTH_PERMISSION_REQUEST_CODE)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun bluetoothLocalDevice(): String? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return null
+        return try {
+            val adapter = BluetoothAdapter.getDefaultAdapter() ?: return null
+            val address = adapter.address
+                ?.takeUnless { it.isBlank() || it == "02:00:00:00:00:00" }
+            if (address != null) return address
+            adapter.name?.trim()
+                ?.takeIf {
+                    it.isNotEmpty() && it.length <= 100 && it.all { ch -> !ch.isISOControl() }
+                }
+                ?.let { "name:$it" }
+        } catch (_: SecurityException) {
+            null
+        }
+    }
+
+    private fun requirePrivateSocketPath(path: String) {
+        if (path.isBlank()) throw IllegalArgumentException("empty socket path")
+        val socket = File(path).canonicalFile
+        val privateRoot = filesDir.canonicalFile
+        if (!isInsideAllowedRoot(socket, privateRoot)) {
+            throw SecurityException("bridge socket must be in private app storage")
+        }
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -326,6 +415,19 @@ class MainActivity : FlutterActivity() {
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
             pendingNotificationPermissionResult?.success(granted)
             pendingNotificationPermissionResult = null
+        } else if (requestCode == BLUETOOTH_PERMISSION_REQUEST_CODE) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+            pendingBluetoothPermissionResult?.success(granted)
+            pendingBluetoothPermissionResult = null
         }
+    }
+
+    override fun onDestroy() {
+        pendingBluetoothPermissionResult?.error("activity_destroyed", "activity destroyed", null)
+        pendingBluetoothPermissionResult = null
+        pendingNotificationPermissionResult?.error("activity_destroyed", "activity destroyed", null)
+        pendingNotificationPermissionResult = null
+        super.onDestroy()
     }
 }

@@ -86,7 +86,7 @@ retry queue, the per-contact ratchet/static keys, and `seen_messages` dedup.
 Ordered so each phase is independently shippable and de-risks the next. Keep Tor
 as the always-available fallback throughout.
 
-### A1. Transport properties + contact-to-contact address exchange *(the highest-priority privacy fix — evolves the existing LAN transport, does not replace it)*
+### A1. [x] Transport properties + contact-to-contact address exchange *(the highest-priority privacy fix — evolves the existing LAN transport, does not replace it)*
 
 **We keep the LAN transport we already built** — the TCP carrier (`send_line`,
 `spawn_listener`, bounded reader, `lan_line_to_envelope`), the serve + send-path
@@ -116,19 +116,37 @@ today (the beacon broadcasts our Ed25519 pubkey in the clear).
   tests carry forward; the beacon is upgraded and the two beacon-payload unit
   tests are rewritten for the token form.
 
-### A2. BTP-lite: wrap non-Tor connections
+### A2. [x] BTP-lite: wrap non-Tor connections
 - A link-layer wrapper for LAN (and later BT) connections, keyed by a per-contact
   **transport root** (derive from the existing static shared key or ratchet root
   via HKDF with a distinct label; do **not** reuse message keys):
-  - Time-period key rotation (forward secrecy).
+  - Time-period key rotation. True metadata forward secrecy needs the dedicated
+    transport-root ratchet noted below.
   - Per-stream **pseudo-random 16-byte tag**; recipient pre-computes expected tags
     per contact to recognize/attribute an inbound stream with no plaintext header.
-  - Authenticated-encrypted frames, **optional padding**, no timeouts/handshakes.
-- Result: Sideband LAN/BT traffic is unrecognizable and unlinkable to a passive
-  local observer — the property Briar gets from BTP.
+  - Authenticated-encrypted frames, **optional padding**, and no plaintext
+    protocol handshake. Operational connect/read deadlines still bound resources.
+- Implemented for LAN in `src/transport/btp.rs`: a separately labeled static
+  X25519/HKDF transport root, canonical direction keys, 30-second period keys,
+  per-stream random 128-bit salts and 16-byte tags, ChaCha20-Poly1305 encrypted
+  headers/bodies, random bucket padding, strict 4 MiB bounds, persistent counters,
+  a sliding 64-stream receive window, and transactional replay rejection. The
+  random salt prevents key/nonce reuse after a profile rollback repeats a counter.
+  Receivers authenticate the fixed header before reading the exact padded body;
+  successful dispatch returns a separately keyed carrier ACK. Missing or invalid
+  ACKs fail the carrier so route selection continues to Tor. Unknown tags,
+  plaintext downgrade attempts, failed authentication, replays, oversized
+  streams, and excess concurrent streams are dropped without a protocol reply.
+- Result: Sideband LAN traffic is unrecognizable and unlinkable to a passive
+  local observer within the limits below. Bluetooth gets the same wrapper in A4.
+- Limitation: the current transport root is derived from static X25519 material.
+  Period rotation limits live tag/key reuse but is not forward secrecy against
+  later compromise of that static key. Inner Double Ratchet message content keeps
+  its own forward-secrecy properties where enabled. A future transport-root
+  ratchet can improve BTP metadata confidentiality without reusing message keys.
 - Tor already provides its own stream security; BTP-lite applies to LAN/BT.
 
-### A3. Sync model (BSP-lite)
+### A3. [x] Sync model (BSP-lite)
 - On an established LAN/BT (and optionally Tor) connection, run a **bidirectional
   sync**: exchange all *pending/undelivered* messages both directions, dedup by
   the existing replay fingerprint / a message id. Delay-tolerant.
@@ -136,7 +154,16 @@ today (the beacon broadcasts our Ed25519 pubkey in the clear).
   next sync with that contact over any carrier) and sets up the future
   store-and-forward **mailbox/mesh** (multi-hop via `Envelope.hop_count/ttl`).
 
-### A4. Bluetooth transport (the hard carrier)
+Implemented as encrypted typed `sync_inventory`, `sync_request`, `sync_item`,
+and `sync_ack` controls backed by stable 128-bit IDs on `retry_queue` and a
+durable `sync_seen_items` dedup table. Verified contact activity starts one
+bidirectional exchange using a reply bit, without inventory ping-pong. Requested
+inner messages use dedicated static-v2 `sync_chat` envelopes so replaying a
+request after ACK loss cannot advance only one side of the Double Ratchet.
+Inventories are capped at 256 IDs; expiry and the existing retry-age policy
+remain authoritative.
+
+### A4. [x] Bluetooth transport (the hard carrier)
 - Model on Briar: advertise an RFCOMM server socket under a **per-device UUID**
   (shared via A1 transport properties); connect to a contact's **MAC + UUID**.
 - **Android:** Kotlin BT APIs (classic RFCOMM first; BLE is harder — MTU,
@@ -145,12 +172,32 @@ today (the beacon broadcasts our Ed25519 pubkey in the clear).
 - **Desktop (Linux):** optional, via a Rust BT stack (e.g. `bluer`/BlueZ).
 - Carries BTP-lite frames + BSP-lite sync, same as LAN.
 
-### A5. Pluggable transport registry
+Implemented on Android as an opt-in classic-RFCOMM carrier. Rust owns the
+per-profile service UUID, encrypted contact property, BTP framing/replay state,
+route preference, and core dispatch. Kotlin is a thin adapter behind a private
+Unix-domain socket: it accepts/dials paired devices, length-prefixes opaque BTP
+frames, and never receives plaintext chat content. Modern Android's hidden local
+MAC falls back to an encrypted `name:` device hint resolved only against bonded
+devices. Android 12+ permissions are requested only when enabled; the setting is
+off by default and takes effect when the listener restarts.
+
+Bluetooth uses the same random-salted BTP keys, padded authenticated frames,
+sliding replay window, and keyed carrier ACK as LAN. A fake platform bridge test
+carries a real signed/encrypted `ChatMessage` without radio hardware. Linux
+Bluetooth remains optional future work.
+
+### A5. [x] Pluggable transport registry
 - Formalize the `Transport` trait into a registry the core iterates: inbound is
   merged from all active transports into one `handle_inbound` dispatch (already
   true for LAN today); outbound tries transports by **preference/reachability**
   (LAN/BT when a fresh address is known, else Tor). Replaces the current
   Tor-direct + LAN-fast-path special case.
+
+Implemented as a deterministic, reachability-filtered registry with replaceable
+named candidates. Both ordinary and typed-message outbound paths now iterate
+the same LAN-first/Tor-terminal route list; inbound carriers continue to merge
+into the single core dispatch. Bluetooth registers through the same route type
+in A4.
 
 ### A6. (Optional) BRP-style remote rendezvous
 - Add contacts remotely without copying a link, by deriving pseudo-random Tor
@@ -229,8 +276,8 @@ aggregates all Matrix rooms).
   tier.
 
 ## Open questions
-- BTP-lite: derive transport keys from the existing ratchet root, or a separate
-  transport-key-agreement? (Briar has a dedicated transport key manager.)
+- BTP-lite follow-up: replace the separately labeled static-X25519 transport root
+  with a dedicated ratcheting transport key manager for metadata forward secrecy.
 - Sync scope: sync *all* undelivered, or a windowed/most-recent set? Interaction
   with disappearing messages (don't sync already-expired).
 - Bridges: mautrix-via-Matrix (breadth, heavier) vs native connectors (control,
