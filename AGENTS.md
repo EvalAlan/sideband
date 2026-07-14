@@ -183,6 +183,21 @@ preview). Tests: `expiring_message_is_signed_honored_and_swept`,
 `send_side_expiry_resolves_default_override_and_survives_retry`,
 `enqueue_retry_preserves_absolute_expiry`, plus duration-parse / resolution /
 tri-state units.
+**Persistent offline outbox** — an undelivered message keeps retrying until
+delivered or older than a configurable window (default 24h) instead of being
+dropped after 5 attempts. Give-up is age-based in the `serve` loop (`retry_update`
+just backs off — 1m/5m/15m then every 30m — and keeps the row); the window lives
+in a new `app_settings` key/value table (`get/set_retry_max_age_ms`, generic
+`get/set_setting`). Hearing a verified message from a contact wakes all their
+queued retries (`retry_wake_contact`). Duplicate-history fix: retries no longer
+store a new outbound row per attempt — the original send stores one (Failed) whose
+id rides the `retry_queue` (`message_row_id`), and a delivered retry flips it
+Failed→Sent (`mark_message_sent`); `store_message_for_conversation[_expiring]` now
+return the row id, and the mobile no-listener path stores its row too. CLI
+`retry-window [--set <dur>] [--json]`; FFI `sideband_api_get/set_retry_window`;
+GUI Settings → "Offline message retry" picker (persisted). Tests:
+`retry_update_keeps_row_across_many_failures`, `retry_max_age_defaults_and_persists`,
+`mark_message_sent_flips_failed_to_sent`.
 
 **Open / backlog (roughly prioritized):**
 1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
@@ -190,8 +205,13 @@ tri-state units.
 3. Group per-message expiry override on the **mobile** FFI (contact overrides work
    on both backends; groups currently honor only the per-conversation default on
    Android — desktop group sends already carry an override via the control channel).
-4. `FLAG_SECURE` / GUI toggles are session-scoped (matches the other in-memory
-   settings). If any of them should persist across restarts, add a settings store.
+4. `FLAG_SECURE` + notification/tray GUI toggles are still session-scoped. A
+   persisted settings store now exists (`app_settings` table + `get/set_setting`,
+   used by the retry window) — these toggles could move onto it cheaply.
 5. After an in-app import, the running listener still holds the old identity —
    the UI just tells the user to restart. A cleaner flow would reload the profile
    (restart the listener) in place.
+6. **Store-and-forward relay/mailbox** (true async delivery even when the sender
+   is offline when the recipient returns) — deferred by design; the current outbox
+   is sender-held. Needs a relay protocol + a privacy-model discussion (relays
+   learn who↔who + timing). See the "next protocol features / Briar" discussion.
