@@ -23,6 +23,8 @@ import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -69,6 +71,13 @@ internal class BluetoothBridge(
         private const val MAX_COMMAND_BYTES = 6 * 1024 * 1024
         private const val RECONNECT_DELAY_MS = 500L
         private const val MAX_SESSIONS = 8
+        // Bound a blocking RFCOMM connect() so one unreachable/stalling peer can't
+        // wedge outbound dials (BluetoothSocket has no connect timeout of its own).
+        private const val DIAL_CONNECT_TIMEOUT_MS = 15_000L
+        // Close an inbound RFCOMM session that sends no complete frame for this
+        // long, so peers that connect then stall can't hold the fixed ioExecutor.
+        private const val SESSION_IDLE_TIMEOUT_MS = 120_000L
+        private const val WATCHDOG_INTERVAL_MS = 5_000L
     }
 
     private val appContext = context.applicationContext
@@ -78,9 +87,13 @@ internal class BluetoothBridge(
     private val dialExecutor = Executors.newSingleThreadExecutor()
     private val ioExecutor = Executors.newFixedThreadPool(MAX_SESSIONS)
     private val writeExecutor = Executors.newSingleThreadExecutor()
+    private val watchdog = Executors.newSingleThreadScheduledExecutor()
     private val localWriteLock = Any()
     private val sessionLock = Any()
     private val sessions = mutableMapOf<String, BluetoothSocket>()
+    // sessionId -> wall-clock deadline (ms); a session past its deadline is closed
+    // by the watchdog and the deadline is refreshed on each complete inbound frame.
+    private val sessionDeadlines = mutableMapOf<String, Long>()
     private val inFlightDials = mutableMapOf<Long, BluetoothSocket>()
     private val nextInboundSession = AtomicLong(1)
 
@@ -105,6 +118,29 @@ internal class BluetoothBridge(
         }
         acceptExecutor.execute(::acceptLoop)
         localExecutor.execute(::localSocketLoop)
+        watchdog.scheduleWithFixedDelay(
+            ::sweepIdleSessions,
+            WATCHDOG_INTERVAL_MS,
+            WATCHDOG_INTERVAL_MS,
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    /** Close inbound sessions that have not delivered a complete frame in time. */
+    private fun sweepIdleSessions() {
+        val now = System.currentTimeMillis()
+        val stale = synchronized(sessionLock) {
+            sessionDeadlines.filterValues { it <= now }.keys.mapNotNull { id ->
+                sessions[id]?.let { id to it }
+            }
+        }
+        stale.forEach { (id, socket) ->
+            socket.closeQuietly()
+            synchronized(sessionLock) {
+                if (sessions[id] === socket) sessions.remove(id)
+                sessionDeadlines.remove(id)
+            }
+        }
     }
 
     fun matches(path: String, uuid: UUID): Boolean =
@@ -172,6 +208,7 @@ internal class BluetoothBridge(
         }
         dialExecutor.execute {
             var socket: BluetoothSocket? = null
+            var timeout: ScheduledFuture<*>? = null
             try {
                 requireBluetoothPermission()
                 val adapter = BluetoothAdapter.getDefaultAdapter()
@@ -179,7 +216,15 @@ internal class BluetoothBridge(
                 val device: BluetoothDevice = resolveDevice(adapter, address)
                 socket = device.createRfcommSocketToServiceRecord(uuid)
                 synchronized(sessionLock) { inFlightDials[id] = socket }
+                // Watchdog: closing the socket makes a stuck connect() throw, so a
+                // stalled/unreachable peer can't block the dial executor forever.
+                timeout = watchdog.schedule(
+                    { synchronized(sessionLock) { inFlightDials[id] }?.closeQuietly() },
+                    DIAL_CONNECT_TIMEOUT_MS,
+                    TimeUnit.MILLISECONDS,
+                )
                 socket.connect()
+                timeout.cancel(false)
                 synchronized(sessionLock) { inFlightDials.remove(id) }
                 if (!running.get() || !installRfcommSocket(sessionId, socket)) {
                     socket.closeQuietly()
@@ -194,6 +239,7 @@ internal class BluetoothBridge(
                 // Never reflect an exception containing a remote MAC back to Rust/UI.
                 sendResult(id, false, "Bluetooth connection failed")
             } finally {
+                timeout?.cancel(false)
                 synchronized(sessionLock) { inFlightDials.remove(id) }
                 socket?.closeQuietly()
             }
@@ -290,6 +336,7 @@ internal class BluetoothBridge(
                 return false
             }
             sessions[sessionId] = socket
+            sessionDeadlines[sessionId] = System.currentTimeMillis() + SESSION_IDLE_TIMEOUT_MS
         }
         ioExecutor.execute { readRfcommFrames(sessionId, socket) }
         return true
@@ -299,6 +346,12 @@ internal class BluetoothBridge(
         try {
             while (running.get() && synchronized(sessionLock) { sessions[sessionId] === socket }) {
                 val wire = RfcommFrameCodec.read(socket.inputStream)
+                synchronized(sessionLock) {
+                    if (sessions[sessionId] === socket) {
+                        sessionDeadlines[sessionId] =
+                            System.currentTimeMillis() + SESSION_IDLE_TIMEOUT_MS
+                    }
+                }
                 sendLocal(
                     JSONObject()
                         .put("type", "inbound")
@@ -312,6 +365,7 @@ internal class BluetoothBridge(
             socket.closeQuietly()
             synchronized(sessionLock) {
                 if (sessions[sessionId] === socket) sessions.remove(sessionId)
+                sessionDeadlines.remove(sessionId)
             }
         }
     }
@@ -357,12 +411,14 @@ internal class BluetoothBridge(
         val sockets = synchronized(sessionLock) {
             val all = sessions.values.toList() + inFlightDials.values.toList()
             sessions.clear()
+            sessionDeadlines.clear()
             inFlightDials.clear()
             all
         }
         sockets.forEach { it.closeQuietly() }
         localSocket?.closeQuietly()
         localSocket = null
+        watchdog.shutdownNow()
         localExecutor.shutdownNow()
         acceptExecutor.shutdownNow()
         dialExecutor.shutdownNow()

@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::ChatMessage;
 
 const MAX_SYNC_IDS: usize = 256;
+/// Dedup rows older than this are pruned; BSP only needs recent history to
+/// suppress duplicate delivery, so retention is bounded like `seen_messages`.
+const SYNC_SEEN_RETENTION_DAYS: i64 = 30;
+/// Hard cap on retained dedup rows, pruned oldest-first.
+const SYNC_SEEN_MAX_ROWS: i64 = 100_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SyncInventoryPayload {
@@ -126,10 +131,27 @@ pub(crate) fn mark_received(profile: &Path, peer_ed25519: &str, id: &str) -> Res
         bail!("invalid sync item id");
     }
     let conn = crate::init_db(profile)?;
-    Ok(conn.execute(
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO sync_seen_items(peer_ed25519, sync_id) VALUES (?1, ?2)",
         params![peer_ed25519, id],
-    )? == 1)
+    )? == 1;
+    if inserted {
+        // Bound the dedup table by age then by absolute count (oldest first) so a
+        // long-lived or chatty contact cannot grow it without limit.
+        let _ = conn.execute(
+            "DELETE FROM sync_seen_items WHERE seen_at < datetime('now', ?1)",
+            params![format!("-{SYNC_SEEN_RETENTION_DAYS} days")],
+        );
+        let _ = conn.execute(
+            "DELETE FROM sync_seen_items WHERE rowid IN (
+                 SELECT rowid FROM sync_seen_items
+                 ORDER BY seen_at DESC, rowid DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![SYNC_SEEN_MAX_ROWS],
+        );
+    }
+    Ok(inserted)
 }
 
 pub(crate) fn unmark_received(profile: &Path, peer_ed25519: &str, id: &str) -> Result<()> {

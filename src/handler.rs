@@ -387,6 +387,16 @@ pub(crate) async fn handle_text_message(
     tor_client: Option<TorClientArc>,
 ) -> Result<()> {
     let decrypt_result = decrypt_and_verify(msg, profile, contacts);
+    // A replay (e.g. a duplicate carrier delivery after a lost ack) is expected,
+    // not an error to surface — drop it silently instead of storing a
+    // "[decryption failed]" row in the conversation.
+    if decrypt_result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.downcast_ref::<crate::ReplayedMessage>().is_some())
+    {
+        return Ok(());
+    }
     let decrypt_error = decrypt_result.as_ref().err().map(|e| e.to_string());
     let (plaintext, verified) = decrypt_result.unwrap_or_else(|e| {
         tracing::error!(error=%e, "decrypt/verify failed");

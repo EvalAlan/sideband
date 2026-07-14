@@ -211,11 +211,21 @@ pub static PEERS: LazyLock<DiscoveredPeers> = LazyLock::new(DiscoveredPeers::def
 static OUTBOUND_BTP_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Above this many cached per-peer send locks, evict the idle ones (Arc held
+/// only by the map) so a long-lived multi-profile daemon can't grow the map
+/// without bound. Locks currently held by an in-flight send are retained.
+const MAX_OUTBOUND_LOCKS: usize = 512;
+
 fn outbound_btp_lock(profile: &std::path::Path, peer: &str) -> Arc<tokio::sync::Mutex<()>> {
     let key = format!("{}\0{peer}", profile.display());
-    OUTBOUND_BTP_LOCKS
+    let mut locks = OUTBOUND_BTP_LOCKS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if locks.len() > MAX_OUTBOUND_LOCKS {
+        // strong_count == 1 means only the map holds it (no active send).
+        locks.retain(|k, lock| k == &key || Arc::strong_count(lock) > 1);
+    }
+    locks
         .entry(key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -326,7 +336,10 @@ pub async fn spawn_listener(
             let (stream, peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
+                    // Back off so a persistent accept error (e.g. fd exhaustion)
+                    // can't spin this loop at 100% CPU.
                     tracing::warn!(error=%e, "lan listener accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             };
@@ -339,8 +352,11 @@ pub async fn spawn_listener(
                 let _stream_slot = stream_slot;
                 let mut stream = stream;
                 let mut wire = vec![0u8; crate::transport::btp::PREFIX_AND_HEADER_LEN];
+                // A legitimate peer sends the fixed prefix+header immediately, so
+                // keep this short: it bounds how long an idle/stalling connection
+                // can hold one of the limited stream slots.
                 if !matches!(
-                    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut wire))
+                    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut wire))
                         .await,
                     Ok(Ok(_))
                 ) {
@@ -439,9 +455,13 @@ pub async fn spawn_discovery(
         }
     });
 
-    // Listener.
+    // Listener. Expected per-contact tokens are cached per period so a flood of
+    // unauthenticated beacons costs an O(1) map lookup, not an HKDF-per-contact
+    // sweep. The signed timestamp binds `period` to within BEACON_MAX_SKEW_MS of
+    // now, so the cache holds only a handful of periods, each derived once.
     tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
+        let mut token_cache: HashMap<u64, HashMap<String, LanBeaconContact>> = HashMap::new();
         loop {
             let (n, src) = match socket.recv_from(&mut buf).await {
                 Ok(v) => v,
@@ -460,25 +480,32 @@ pub async fn spawn_discovery(
             {
                 continue;
             }
-            let mut matched = None;
-            for contact in contacts() {
-                let Ok(expected) = contact_token(&contact.shared_secret, beacon.period) else {
-                    continue;
-                };
-                if beacon.token_b64 != B64.encode(expected) {
-                    continue;
+            // Drop cached periods that can no longer be valid, then derive this
+            // period's token→contact map once (cheap lookup for every later packet
+            // in the same period).
+            let now_period = beacon_period(now);
+            let max_periods = (BEACON_MAX_SKEW_MS / BEACON_PERIOD_MS) as u64 + 2;
+            token_cache.retain(|p, _| now_period.abs_diff(*p) <= max_periods);
+            let period_tokens = token_cache.entry(beacon.period).or_insert_with(|| {
+                let mut map = HashMap::new();
+                for contact in contacts() {
+                    if let Ok(token) = contact_token(&contact.shared_secret, beacon.period) {
+                        map.insert(B64.encode(token), contact);
+                    }
                 }
-                let Some(verifying_key) = contact.verifying_key() else {
-                    continue;
-                };
-                if beacon.is_valid_now(&verifying_key) {
-                    matched = Some(contact.ed25519_b64);
-                    break;
-                }
+                map
+            });
+            let Some(contact) = period_tokens.get(&beacon.token_b64).cloned() else {
+                continue;
+            };
+            let Some(verifying_key) = contact.verifying_key() else {
+                continue;
+            };
+            if !beacon.is_valid_now(&verifying_key) {
+                continue;
             }
-            let Some(contact_id) = matched else { continue };
             let addr = SocketAddr::new(src.ip(), beacon.tcp_port);
-            PEERS.note(&contact_id, addr, now);
+            PEERS.note(&contact.ed25519_b64, addr, now);
             tracing::info!("lan: discovered an authenticated contact token");
         }
     });

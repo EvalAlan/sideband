@@ -26,7 +26,11 @@ pub(crate) const HEADER_CIPHERTEXT_LEN: usize = HEADER_PLAINTEXT_LEN + 16;
 pub(crate) const PREFIX_AND_HEADER_LEN: usize = PREFIX_LEN + HEADER_CIPHERTEXT_LEN;
 pub(crate) const MAX_STREAM_CONTENT: usize = 4 * 1024 * 1024;
 pub(crate) const PERIOD_SECS: u64 = 30;
-pub(crate) const PERIOD_SKEW: u64 = 2;
+/// Clock-skew tolerance for stream-period matching: the receiver scans
+/// `current_period ± PERIOD_SKEW`, so peers whose clocks differ by up to
+/// `PERIOD_SECS * PERIOD_SKEW` seconds (≈2 min) still connect over LAN/BT. Wider
+/// than this and unsynced phones silently fall back to Tor with no error.
+pub(crate) const PERIOD_SKEW: u64 = 4;
 pub(crate) const STREAM_WINDOW: u64 = 64;
 
 const VERSION: u8 = 1;

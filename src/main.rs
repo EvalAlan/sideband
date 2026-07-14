@@ -5532,6 +5532,19 @@ fn resolve_x25519_pubkey(profile: &Path, contact_name: &str) -> Result<X25519Pub
     Ok(X25519PublicKey::from(arr))
 }
 
+/// Marker error: a verified message whose ciphertext fingerprint was already
+/// seen. Callers should drop it silently rather than surface a decrypt failure.
+#[derive(Debug)]
+pub(crate) struct ReplayedMessage;
+
+impl std::fmt::Display for ReplayedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "replayed message rejected (already seen)")
+    }
+}
+
+impl std::error::Error for ReplayedMessage {}
+
 /// Decrypt a v2 inbound message and verify the Ed25519 signature.
 /// v1 messages (no enc_body) pass through with plaintext verification.
 pub(crate) fn decrypt_and_verify(
@@ -5660,7 +5673,10 @@ pub(crate) fn decrypt_and_verify(
     if verified {
         let fingerprint = message_replay_fingerprint(msg);
         if !record_seen_message(our_profile, &fingerprint)? {
-            return Err(anyhow!("replayed message rejected (already seen)"));
+            // Typed so the inbound handler drops it silently instead of storing a
+            // "[decryption failed]" row — replays are expected (e.g. a duplicate
+            // carrier delivery after a lost ack), not user-visible errors.
+            return Err(ReplayedMessage.into());
         }
     }
     if verified && known_contact.is_none() {
