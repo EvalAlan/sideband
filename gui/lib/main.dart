@@ -1209,6 +1209,21 @@ class _Cli {
       '--json'
     ]);
   }
+
+  /// Whether LAN discovery + delivery is enabled (default off).
+  Future<bool> getLanEnabled() async {
+    final raw = await _run(['lan', '--profile', profile, '--json']);
+    final decoded = jsonDecode(raw);
+    if (decoded is Map && decoded['enabled'] is bool) {
+      return decoded['enabled'] as bool;
+    }
+    return false;
+  }
+
+  Future<void> setLanEnabled(bool enabled) async {
+    await _run(
+        ['lan', '--profile', profile, '--set', enabled ? 'true' : 'false', '--json']);
+  }
 }
 
 // Native/Dart signatures for the string-returning FFI entry points. Every
@@ -1298,6 +1313,16 @@ class _MobileApi {
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
                     bool)>('sideband_api_set_read_receipts'),
+        _getLanEnabled = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>)>('sideband_api_get_lan_enabled'),
+        _setLanEnabled = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    bool)>('sideband_api_set_lan_enabled'),
         _markConversationRead = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(
@@ -1403,6 +1428,8 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, int) _setRetryWindow;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getReadReceipts;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setReadReceipts;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getLanEnabled;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setLanEnabled;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
       _markConversationRead;
   final ffi.Pointer<Utf8> Function(
@@ -1726,6 +1753,25 @@ class _MobileApi {
     final profile = (await profilePath()).toNativeUtf8();
     try {
       _decode<Object?>(_setReadReceipts(profile, enabled));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  /// Whether LAN discovery + delivery is enabled (default off).
+  Future<bool> getLanEnabled() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      return _decode<bool>(_getLanEnabled(profile));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<void> setLanEnabled(bool enabled) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      _decode<Object?>(_setLanEnabled(profile, enabled));
     } finally {
       calloc.free(profile);
     }
@@ -2201,6 +2247,9 @@ class _ChatScreenState extends State<_ChatScreen>
   // Whether we send read receipts for 1:1 conversations. Persisted in the
   // profile; loaded for real when Settings opens (see `_showSettings`).
   bool _sendReadReceipts = true;
+  // Whether LAN discovery + delivery is enabled (persisted; default off — a LAN
+  // beacon advertises this identity on the local network). Loaded in Settings.
+  bool _lanEnabled = false;
   // Highest inbound timestamp (ms) we've already sent a mark-read receipt for,
   // per contact, so the 6s poll doesn't spam a receipt on every refresh.
   final _lastReadSentMs = <String, int>{};
@@ -3035,6 +3084,21 @@ class _ChatScreenState extends State<_ChatScreen>
       if (mounted) setState(() => _sendReadReceipts = enabled);
     } catch (e) {
       if (mounted) setState(() => _error = 'could not set read receipts: $e');
+    }
+  }
+
+  /// Persist the LAN-discovery preference via the active backend. The change
+  /// takes effect the next time the listener starts.
+  Future<void> _setLanEnabled(bool enabled) async {
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.setLanEnabled(enabled);
+      } else {
+        await _cli.setLanEnabled(enabled);
+      }
+      if (mounted) setState(() => _lanEnabled = enabled);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'could not set LAN discovery: $e');
     }
   }
 
@@ -5440,6 +5504,13 @@ class _ChatScreenState extends State<_ChatScreen>
           : await _cli.getReadReceipts();
       if (mounted) setState(() => _sendReadReceipts = enabled);
     } catch (_) {}
+    // Load the persisted LAN-discovery preference.
+    try {
+      final enabled = (_canUseMobileBackend && _mobile != null)
+          ? await _mobile!.getLanEnabled()
+          : await _cli.getLanEnabled();
+      if (mounted) setState(() => _lanEnabled = enabled);
+    } catch (_) {}
     if (!mounted) return;
     await showDialog<void>(
       context: context,
@@ -5518,6 +5589,18 @@ class _ChatScreenState extends State<_ChatScreen>
                     onChanged: (value) {
                       setDialogState(() {});
                       unawaited(_setReadReceipts(value));
+                    },
+                  ),
+                  SwitchListTile(
+                    secondary: const Icon(Icons.wifi_tethering),
+                    title: const Text('LAN discovery'),
+                    subtitle: const Text(
+                        'Reach contacts on the same network without internet. '
+                        'Broadcasts your presence locally; takes effect on restart.'),
+                    value: _lanEnabled,
+                    onChanged: (value) {
+                      setDialogState(() {});
+                      unawaited(_setLanEnabled(value));
                     },
                   ),
                   ListTile(

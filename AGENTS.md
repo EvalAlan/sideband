@@ -215,6 +215,25 @@ FFI `sideband_api_get/set_read_receipts` + `mark_conversation_read`; serve
 `read_receipt_marks_messages_read_up_to_timestamp`. Known gap: a message delivered
 on a later retry is rebuilt with fresh ciphertext, so its delivered-receipt won't
 match the stored fingerprint (stays Sent).
+**LAN transport (first non-Tor carrier)** — `src/transport/lan.rs`. Messages are
+E2E signed+encrypted independent of carrier, so the LAN just moves the same
+`ChatMessage` wire lines over local TCP (fast, no internet). Discovery is signed
+UDP-broadcast beacons (`LanBeacon`, self-signed by the identity's Ed25519 key —
+a LAN attacker can't claim a contact's identity; `verify()` + skew check); a
+`DiscoveredPeers`/`PEERS` registry maps contact Ed25519 → fresh LAN `SocketAddr`
+(90s TTL). `serve()` (when enabled) starts `spawn_listener` (feeding the same
+inbound `Envelope` channel via `TorTransport::inbound_sender`, so LAN+Tor share one
+`handle_inbound`) + `spawn_discovery` (accepts beacons only from known contacts).
+`send_in_conversation` has a LAN fast-path before the Tor loop: if
+`lan_peer_addr(contact)` resolves, send over LAN, else fall through to Tor. **Opt-in
+— off by default** (a beacon advertises identity on the LAN): `lan_enabled` setting,
+CLI `lan [--set on|off] [--json]`, FFI `get/set_lan_enabled`, GUI "LAN discovery"
+toggle. Tests: beacon sign/verify/tamper, stale-beacon rejection, peer freshness, a
+localhost end-to-end `send_line`→listener delivery of a real ChatMessage, and
+`lan_enabled_default_off_and_peer_lookup_drives_send_choice`.
+NEXT for LAN: two-peer real-network e2e; Android needs a WifiManager multicast lock
+(Kotlin) for UDP broadcast to work; LAN presence could also feed the receipt-derived
+presence UI. Group sends do not use the LAN fast-path yet (1:1 only).
 
 **Open / backlog (roughly prioritized):**
 1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
