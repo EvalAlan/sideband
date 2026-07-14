@@ -272,6 +272,20 @@ CLI contract, 28 Flutter tests); `cargo clippy --all-targets -- -D warnings` is
 clean. The release APK builds with package `com.evalalan.sideband`, label
 `Sideband`, and arm64-v8a/armeabi-v7a/x86_64 native libraries.
 
+**Security review done (2026-07-14).** A high-effort crypto/security review of the
+new carrier layer found **no confidentiality/integrity/replay breaks** — the BTP
+framing (fresh per-frame salt → no nonce reuse), the DB-persisted monotonic send
+counter, the WAL-serialized replay-window claim, and inbound-identity-from-inner-
+message are all sound. The DoS/robustness findings were fixed in `333d117`:
+sync_seen_items pruning, LAN accept-backoff + shorter idle-read + per-period beacon
+token cache + send-lock-map bound, widened `PERIOD_SKEW` (±2 min), silent-drop of
+replays (no more "[decryption failed]" rows), and Bluetooth dial + per-session
+inactivity watchdogs. **Two items deferred (mitigated):** (a) the LAN
+authenticate-then-decode double candidate sweep — now bounded by the 32-slot
+semaphore + 5s prefix read, and refactoring the crypto decode path is higher-risk
+than the marginal gain; (b) the Bluetooth full-line read-before-auth — bounded by
+6 MiB + 8 sessions + the new idle timeout. Both are safe to pick up later.
+
 NEXT: physical paired-Android Bluetooth smoke test. Android still needs a
 `WifiManager` multicast lock for the optional UDP helper. Group sends do not use
 non-Tor fast paths yet (1:1 only). Full plan:
