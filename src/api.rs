@@ -319,6 +319,18 @@ pub fn api_set_read_receipts(profile_path: &str, enabled: bool) -> Result<bool> 
     Ok(true)
 }
 
+/// Whether LAN discovery + delivery is enabled (default off).
+pub fn api_get_lan_enabled(profile_path: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    Ok(crate::lan_enabled(&profile))
+}
+
+pub fn api_set_lan_enabled(profile_path: &str, enabled: bool) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::set_lan_enabled(&profile, enabled)?;
+    Ok(true)
+}
+
 /// Send a read receipt to `to` acknowledging messages up to `up_to_ms`. Routed
 /// through the running listener (needs its Tor client); best-effort, so it is a
 /// no-op when no listener is running.
@@ -829,6 +841,24 @@ pub extern "C" fn sideband_api_set_read_receipts(
 ) -> *mut c_char {
     json_response((|| {
         api_set_read_receipts(cstr_arg(profile_path, "profile_path")?, enabled)
+    })())
+}
+
+/// Whether LAN discovery + delivery is enabled (default off).
+#[no_mangle]
+pub extern "C" fn sideband_api_get_lan_enabled(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_get_lan_enabled(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_set_lan_enabled(
+    profile_path: *const c_char,
+    enabled: bool,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_lan_enabled(cstr_arg(profile_path, "profile_path")?, enabled)
     })())
 }
 

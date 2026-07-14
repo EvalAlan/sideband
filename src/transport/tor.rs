@@ -117,6 +117,12 @@ impl TorTransport {
             .clone()
     }
 
+    /// A sender into the inbound dispatch channel. Other transports (e.g. LAN)
+    /// push received [`Envelope`]s here so all carriers share one handler loop.
+    pub fn inbound_sender(&self) -> mpsc::Sender<Envelope> {
+        self.inbound_tx.clone()
+    }
+
     pub fn raw_line_to_envelope(raw_line: &str) -> Envelope {
         Envelope {
             msg_id: format!("tor-in-{}", chrono::Utc::now().timestamp_millis()),

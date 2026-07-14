@@ -184,6 +184,18 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set LAN discovery + delivery (off by default; broadcasts identity
+    /// on the local network).
+    Lan {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Turn LAN discovery on or off. Omit to just show.
+        #[arg(long)]
+        set: Option<bool>,
+        /// Emit machine-readable JSON ({"enabled": <bool>}) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     Contact {
         #[command(subcommand)]
         action: ContactAction,
@@ -2141,6 +2153,34 @@ pub(crate) fn set_read_receipts_enabled(profile: &Path, enabled: bool) -> Result
     )
 }
 
+const LAN_ENABLED_KEY: &str = "lan_enabled";
+
+/// Whether LAN discovery + delivery is enabled. Default OFF: a LAN beacon
+/// advertises this identity's presence to everyone on the local network, which is
+/// a metadata leak that should be opt-in for a privacy tool.
+pub(crate) fn lan_enabled(profile: &Path) -> bool {
+    matches!(get_setting(profile, LAN_ENABLED_KEY), Ok(Some(s)) if s == "true")
+}
+
+pub(crate) fn set_lan_enabled(profile: &Path, enabled: bool) -> Result<()> {
+    set_setting(
+        profile,
+        LAN_ENABLED_KEY,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// A fresh LAN address for `contact_name`, if that contact is currently
+/// discovered on the local network (used by the send path for a LAN fast-path).
+pub(crate) fn lan_peer_addr(profile: &Path, contact_name: &str) -> Option<std::net::SocketAddr> {
+    let contacts = load_contacts(profile).ok()?;
+    let contact = contacts.get(contact_name)?;
+    if contact.pubkey_b64.is_empty() {
+        return None;
+    }
+    crate::transport::lan::PEERS.lookup(&contact.pubkey_b64)
+}
+
 /// Build and send a signed+encrypted receipt (delivered/read) to a contact.
 pub(crate) async fn send_receipt(
     profile: &Path,
@@ -3315,6 +3355,20 @@ async fn main() -> Result<()> {
                 println!("{{\"enabled\":{enabled}}}");
             } else {
                 println!("read receipts: {}", if enabled { "on" } else { "off" });
+            }
+            Ok(())
+        }
+        CommandKind::Lan { profile, set, json } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if let Some(enabled) = set {
+                set_lan_enabled(&profile, enabled)?;
+            }
+            let enabled = lan_enabled(&profile);
+            if json {
+                println!("{{\"enabled\":{enabled}}}");
+            } else {
+                println!("lan discovery: {}", if enabled { "on" } else { "off" });
             }
             Ok(())
         }
@@ -5238,6 +5292,32 @@ pub(crate) async fn serve(
     let io_transport = Arc::clone(&transport);
     let io_handle = tokio::spawn(async move { io_transport.run_inbound_loop(quit_rx).await });
 
+    // Optional LAN carrier: a local TCP listener feeding the same inbound channel,
+    // plus signed UDP-broadcast discovery. Opt-in (a beacon advertises our identity
+    // on the local network). Failures here never affect the Tor path.
+    if lan_enabled(profile) {
+        match crate::transport::lan::spawn_listener(transport.inbound_sender()).await {
+            Ok((lan_port, _lan_handle)) => {
+                if let Ok(key) = load_signing_key(profile) {
+                    let profile_for_lan = profile.to_path_buf();
+                    let accept = move |ed: &str| {
+                        load_contacts(&profile_for_lan)
+                            .map(|c| c.values().any(|ct| ct.pubkey_b64 == ed))
+                            .unwrap_or(false)
+                    };
+                    if let Err(e) =
+                        crate::transport::lan::spawn_discovery(key, lan_port, accept).await
+                    {
+                        warn!(error=%e, "LAN discovery failed to start");
+                    } else {
+                        info!(lan_port, "LAN carrier enabled");
+                    }
+                }
+            }
+            Err(e) => warn!(error=%e, "LAN listener failed to start"),
+        }
+    }
+
     // Main dispatch loop: pull envelopes from the channel and handle them.
     // This is the only place that calls handle_inbound — transport is agnostic.
     let transfer_state = transport.transfer_state();
@@ -5974,15 +6054,34 @@ pub(crate) async fn send_in_conversation(
         msg
     };
 
-    // Retry loop: Tor circuits to HS can take time to establish, especially
-    // when the remote HS has just been created (descriptor propagation 1-3min).
-    // Use generous timeouts; failing fast just creates false negatives.
-    let max_attempts = 3;
     let mut status = DeliveryStatus::Failed;
     let mut last_error: Option<String> = None;
     let payload = format!("{}\n", serde_json::to_string(&msg)?);
 
+    // LAN fast-path: if this contact is currently discovered on the local network
+    // and LAN is enabled, deliver over LAN (fast, no internet). The wire bytes are
+    // identical end-to-end-encrypted; a LAN failure just falls through to Tor.
+    if lan_enabled(profile) {
+        if let Some(addr) = lan_peer_addr(profile, contact_hint) {
+            match crate::transport::lan::send_line(addr, &payload).await {
+                Ok(()) => {
+                    info!(%addr, to=%contact_hint, "message delivered over LAN");
+                    status = DeliveryStatus::Sent;
+                }
+                Err(e) => warn!(%addr, error=%e, "LAN delivery failed; falling back to Tor"),
+            }
+        }
+    }
+
+    // Retry loop: Tor circuits to HS can take time to establish, especially
+    // when the remote HS has just been created (descriptor propagation 1-3min).
+    // Use generous timeouts; failing fast just creates false negatives.
+    let max_attempts = 3;
+
     for attempt in 1..=max_attempts {
+        if status == DeliveryStatus::Sent {
+            break; // already delivered over LAN
+        }
         if attempt > 1 {
             warn!(attempt, "retrying send after circuit delay");
             sleep(Duration::from_secs(10)).await;
@@ -7877,6 +7976,39 @@ fn retry_max_age_defaults_and_persists() {
     assert_eq!(get_setting(profile, "nope").unwrap(), None);
     set_setting(profile, "k", "v").unwrap();
     assert_eq!(get_setting(profile, "k").unwrap().as_deref(), Some("v"));
+}
+
+#[test]
+fn lan_enabled_default_off_and_peer_lookup_drives_send_choice() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    init_profile_with_name(profile, "me").unwrap();
+    // LAN is opt-in.
+    assert!(!lan_enabled(profile), "LAN discovery must default off");
+    set_lan_enabled(profile, true).unwrap();
+    assert!(lan_enabled(profile));
+
+    // Add a contact and advertise it as discovered on the LAN.
+    let ed = "fLo7TRtqCxE2wtjTvNvUJjRDBewhYV7bkW3P/F/451w=";
+    let x = "K4+eWfSYw8TtmsViirLxsNs7zAWzKQ/YtJtQFVcncUk=";
+    let onion = "qdnx34k2b3fzp3umv7ryvzxtbzjluzkvuvqixvuooy43b5n6lddaspid.onion";
+    contact_add(profile, "rocky", onion, ed, x).unwrap();
+    // Unknown-on-LAN contact → no LAN address, send path would use Tor.
+    assert_eq!(lan_peer_addr(profile, "rocky"), None);
+
+    let addr: std::net::SocketAddr = "192.168.1.9:7777".parse().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    crate::transport::lan::PEERS.note(ed, addr, now);
+    assert_eq!(
+        lan_peer_addr(profile, "rocky"),
+        Some(addr),
+        "a discovered contact must resolve to its LAN address"
+    );
+    // A contact we don't have returns None regardless of discovery.
+    assert_eq!(lan_peer_addr(profile, "nobody"), None);
 }
 
 #[test]
