@@ -457,6 +457,7 @@ class ChatMsg {
   bool get failed => status == 'failed';
   bool get sending => status == 'sending';
   bool get delivered => status == 'delivered';
+  bool get read => status == 'read';
 }
 
 class _History {
@@ -1134,6 +1135,8 @@ class _Cli {
         return 'delivered';
       case 2:
         return 'failed';
+      case 3:
+        return 'read';
       default:
         return '?';
     }
@@ -1182,6 +1185,27 @@ class _Cli {
       profile,
       '--set',
       '${maxAgeMs}ms',
+      '--json'
+    ]);
+  }
+
+  /// Whether outbound read receipts are sent for 1:1 conversations.
+  Future<bool> getReadReceipts() async {
+    final raw = await _run(['read-receipts', '--profile', profile, '--json']);
+    final decoded = jsonDecode(raw);
+    if (decoded is Map && decoded['enabled'] is bool) {
+      return decoded['enabled'] as bool;
+    }
+    return true;
+  }
+
+  Future<void> setReadReceipts(bool enabled) async {
+    await _run([
+      'read-receipts',
+      '--profile',
+      profile,
+      '--set',
+      enabled ? 'true' : 'false',
       '--json'
     ]);
   }
@@ -1264,6 +1288,22 @@ class _MobileApi {
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Int64),
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
                     int)>('sideband_api_set_retry_window'),
+        _getReadReceipts = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>)>('sideband_api_get_read_receipts'),
+        _setReadReceipts = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    bool)>('sideband_api_set_read_receipts'),
+        _markConversationRead = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Int64),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+                    int)>('sideband_api_mark_conversation_read'),
         _sendFile = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(
                 ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
@@ -1361,6 +1401,10 @@ class _MobileApi {
       _setConversationExpiry;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getRetryWindow;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, int) _setRetryWindow;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getReadReceipts;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setReadReceipts;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int)
+      _markConversationRead;
   final ffi.Pointer<Utf8> Function(
       ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _sendFile;
   final ffi.Pointer<Utf8> Function(
@@ -1665,6 +1709,37 @@ class _MobileApi {
       _decode<Object?>(_setRetryWindow(profile, maxAgeMs));
     } finally {
       calloc.free(profile);
+    }
+  }
+
+  /// Whether outbound read receipts are sent for 1:1 conversations.
+  Future<bool> getReadReceipts() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      return _decode<bool>(_getReadReceipts(profile));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<void> setReadReceipts(bool enabled) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      _decode<Object?>(_setReadReceipts(profile, enabled));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  /// Tell the core we've read all inbound messages up to `upToMs` for `to`.
+  Future<void> markConversationRead(String to, int upToMs) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cto = to.toNativeUtf8();
+    try {
+      _decode<Object?>(_markConversationRead(profile, cto, upToMs));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cto);
     }
   }
 
@@ -2123,6 +2198,12 @@ class _ChatScreenState extends State<_ChatScreen>
   // Offline-retry window (ms): how long an undelivered message keeps retrying.
   // Persisted in the profile, so this survives restarts (default 1 day).
   int _retryWindowMs = 24 * 60 * 60 * 1000;
+  // Whether we send read receipts for 1:1 conversations. Persisted in the
+  // profile; loaded for real when Settings opens (see `_showSettings`).
+  bool _sendReadReceipts = true;
+  // Highest inbound timestamp (ms) we've already sent a mark-read receipt for,
+  // per contact, so the 6s poll doesn't spam a receipt on every refresh.
+  final _lastReadSentMs = <String, int>{};
   List<ChatMsg> _msgs = [];
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
@@ -2365,6 +2446,10 @@ class _ChatScreenState extends State<_ChatScreen>
         _listenerStatus = 'mobile backend ready';
         _loading = false;
       });
+      // Read receipts are 1:1 only; a group conversation must not trigger one.
+      if (selected != null && selectedGroup == null) {
+        unawaited(_markConversationRead(selected.name, _maxInboundTs(_msgs)));
+      }
       return true;
     } catch (e) {
       if (!mounted) return false;
@@ -2939,6 +3024,39 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  /// Persist the read-receipts preference via the active backend.
+  Future<void> _setReadReceipts(bool enabled) async {
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.setReadReceipts(enabled);
+      } else {
+        await _cli.setReadReceipts(enabled);
+      }
+      if (mounted) setState(() => _sendReadReceipts = enabled);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'could not set read receipts: $e');
+    }
+  }
+
+  /// Tell the backend we've read `contact`'s messages up to `upToMs`. No-op if
+  /// read receipts are disabled or the timestamp hasn't advanced.
+  Future<void> _markConversationRead(String contact, int upToMs) async {
+    if (upToMs <= 0 || !_sendReadReceipts) return;
+    if ((_lastReadSentMs[contact] ?? 0) >= upToMs) return;
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.markConversationRead(contact, upToMs);
+      } else {
+        final l = _listener;
+        if (l == null) return;
+        l.stdin.writeln(
+            jsonEncode({'cmd': 'mark_read', 'to': contact, 'up_to_ms': upToMs}));
+        await l.stdin.flush();
+      }
+      _lastReadSentMs[contact] = upToMs;
+    } catch (_) {}
+  }
+
   /// Dialog to pick the offline-retry window. Returns the chosen ms, or null.
   Future<int?> _pickRetryWindow() async {
     return showDialog<int>(
@@ -3233,6 +3351,10 @@ class _ChatScreenState extends State<_ChatScreen>
         _loading = false;
       });
       _scrollToBottom();
+      // Read receipts are 1:1 only; a group conversation must not trigger one.
+      if (s != null && sg == null) {
+        unawaited(_markConversationRead(s.name, _maxInboundTs(_msgs)));
+      }
     } catch (e) {
       setState(() {
         _error = '$e';
@@ -3375,10 +3497,24 @@ class _ChatScreenState extends State<_ChatScreen>
         _msgs = _mergePending(h.msgs);
       });
       _scrollToBottom();
+      // Read receipts are 1:1 only; a group conversation must not trigger one.
+      if (s != null && sg == null) {
+        final maxInboundTs = _maxInboundTs(_msgs);
+        unawaited(_markConversationRead(s.name, maxInboundTs));
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = '$e');
     }
+  }
+
+  /// Highest `tsMs` among inbound messages in `msgs` (0 if none).
+  int _maxInboundTs(List<ChatMsg> msgs) {
+    var maxTs = 0;
+    for (final m in msgs) {
+      if (m.direction == 'in' && m.tsMs > maxTs) maxTs = m.tsMs;
+    }
+    return maxTs;
   }
 
   /// Load visible history via the correct backend: FFI on Android, CLI on
@@ -5297,6 +5433,13 @@ class _ChatScreenState extends State<_ChatScreen>
           : await _cli.getRetryWindow();
       if (ms > 0 && mounted) setState(() => _retryWindowMs = ms);
     } catch (_) {}
+    // Load the persisted read-receipts preference so the switch shows the real value.
+    try {
+      final enabled = (_canUseMobileBackend && _mobile != null)
+          ? await _mobile!.getReadReceipts()
+          : await _cli.getReadReceipts();
+      if (mounted) setState(() => _sendReadReceipts = enabled);
+    } catch (_) {}
     if (!mounted) return;
     await showDialog<void>(
       context: context,
@@ -5366,6 +5509,17 @@ class _ChatScreenState extends State<_ChatScreen>
                         unawaited(_applyFlagSecure(value));
                       },
                     ),
+                  SwitchListTile(
+                    secondary: const Icon(Icons.done_all),
+                    title: const Text('Send read receipts'),
+                    subtitle: const Text(
+                        "Let contacts see when you've read their messages"),
+                    value: _sendReadReceipts,
+                    onChanged: (value) {
+                      setDialogState(() {});
+                      unawaited(_setReadReceipts(value));
+                    },
+                  ),
                   ListTile(
                     leading: const Icon(Icons.schedule_send_outlined),
                     title: const Text('Offline message retry'),
@@ -6796,9 +6950,11 @@ class _ChatScreenState extends State<_ChatScreen>
     if (m.failed) {
       return Icon(Icons.error_outline, size: 12, color: _t.errorFg);
     }
-    // Determine if our message was likely read: any later inbound from same contact
-    final wasRead = _wasRead(m);
-    if (m.status == 'delivered' || wasRead) {
+    // Real read receipt (status 3) takes precedence; fall back to the old
+    // heuristic (any later inbound from the same contact) for backends that
+    // predate read receipts.
+    final wasRead = m.read || _wasRead(m);
+    if (m.status == 'delivered' || m.read || wasRead) {
       return Icon(Icons.done_all, size: 13,
           color: wasRead ? _t.primary : _t.primary.withAlpha(140));
     }

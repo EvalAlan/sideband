@@ -198,10 +198,31 @@ return the row id, and the mobile no-listener path stores its row too. CLI
 GUI Settings → "Offline message retry" picker (persisted). Tests:
 `retry_update_keeps_row_across_many_failures`, `retry_max_age_defaults_and_persists`,
 `mark_message_sent_flips_failed_to_sent`.
+**Delivery + read receipts + presence (core; GUI in progress)** — signed+encrypted
+`ReceiptPayload` typed message. A receipt references a message by its
+`message_replay_fingerprint` (both peers derive it from the ciphertext), so NO new
+signed `ChatMessage` field is added (old clients keep verifying). Outbound 1:1 rows
+store `msg_fingerprint`; a verified inbound message auto-sends a `delivered` receipt
+(fire-and-forget, needs the Tor client threaded through `handle_inbound` →
+`handle_text_message(_, tor_client: Option)`). `handle_receipt` verifies then
+`mark_delivered_by_fingerprint` (Sent/Failed→Delivered) or `mark_read_up_to`
+(contact msgs ≤ up_to_ms → Read). `DeliveryStatus::Read = 3`. Read receipts gated by
+a per-profile toggle (`read_receipts_enabled`, default on). Presence is derived: a
+returned receipt proves reachability. CLI `read-receipts [--set on|off] [--json]`;
+FFI `sideband_api_get/set_read_receipts` + `mark_conversation_read`; serve
+`mark_read` control command; `MobileSendPayload::ReadReceipt`. Tests:
+`delivery_receipt_marks_sender_message_delivered`,
+`read_receipt_marks_messages_read_up_to_timestamp`. Known gap: a message delivered
+on a later retry is rebuilt with fresh ciphertext, so its delivered-receipt won't
+match the stored fingerprint (stays Sent).
 
 **Open / backlog (roughly prioritized):**
 1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
-2. Desktop file-transfer UI (currently TUI-only). Light theme. Read receipts.
+2. Desktop file-transfer UI (currently TUI-only). Light theme.
+7. Active presence beacons (vs. the current receipt/activity-derived presence) —
+   deferred: periodic per-contact Tor dials are costly and leak a connection pattern.
+8. Delivery receipts for retried (offline-then-delivered) messages — see the
+   fingerprint gap above; would need the retry to rewrite the row's fingerprint.
 3. Group per-message expiry override on the **mobile** FFI (contact overrides work
    on both backends; groups currently honor only the per-conversation default on
    Android — desktop group sends already carry an override via the control channel).

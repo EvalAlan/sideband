@@ -418,6 +418,7 @@ pub fn api_list_messages(
             body: r.body,
             timestamp_ms: r.timestamp_ms,
             status: match r.status {
+                3 => "read".to_string(),
                 2 => "failed".to_string(),
                 1 => "delivered".to_string(),
                 _ => "sent".to_string(),
@@ -470,6 +471,7 @@ pub fn api_list_group_messages(
             body: r.body,
             timestamp_ms: r.timestamp_ms,
             status: match r.status {
+                3 => "read".to_string(),
                 2 => "failed".to_string(),
                 1 => "delivered".to_string(),
                 _ => "sent".to_string(),
