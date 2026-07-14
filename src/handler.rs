@@ -124,6 +124,14 @@ pub(crate) async fn handle_text_message(
 
     if verified {
         tracing::info!(recv=true, v=%msg.v, "message received and verified");
+        // Hearing from a contact proves they are reachable right now — flush any
+        // messages we have queued for them instead of waiting out the backoff.
+        match crate::retry_wake_contact(profile, &contact_name) {
+            Ok(n) if n > 0 => {
+                tracing::info!(contact = %contact_name, woke = n, "retry: peer online, flushing queue")
+            }
+            _ => {}
+        }
     } else {
         tracing::warn!(from=%msg.from, "signature verification FAILED");
     }

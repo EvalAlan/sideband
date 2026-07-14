@@ -162,6 +162,17 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set how long undelivered messages keep retrying before giving up.
+    RetryWindow {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// New window: a duration (1h, 6h, 1d, 7d). Omit to just show.
+        #[arg(long)]
+        set: Option<String>,
+        /// Emit machine-readable JSON ({"max_age_ms": <n>}) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     Contact {
         #[command(subcommand)]
         action: ContactAction,
@@ -1505,6 +1516,23 @@ fn init_db(profile: &Path) -> Result<Connection> {
         "expires_at_ms",
         "ALTER TABLE retry_queue ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0",
     )?;
+    // Link a queued retry back to its outbound history row so a delivered retry
+    // updates that row's status instead of storing a duplicate (0 = unknown).
+    ensure_column(
+        &conn,
+        "retry_queue",
+        "message_row_id",
+        "ALTER TABLE retry_queue ADD COLUMN message_row_id INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Generic key/value app settings (persisted per profile). Used for the
+    // offline-retry window and other core-visible preferences.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS app_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS seen_messages (
             envelope_hash TEXT PRIMARY KEY,
@@ -1749,6 +1777,7 @@ pub(crate) fn store_message(
         "contact",
         contact,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1762,7 +1791,7 @@ pub(crate) fn store_message_for_conversation(
     status: DeliveryStatus,
     conversation_kind: &str,
     conversation_id: &str,
-) -> Result<()> {
+) -> Result<i64> {
     store_message_for_conversation_expiring(
         profile,
         direction,
@@ -1792,7 +1821,7 @@ pub(crate) fn store_message_for_conversation_expiring(
     conversation_kind: &str,
     conversation_id: &str,
     expires_at_ms: Option<u128>,
-) -> Result<()> {
+) -> Result<i64> {
     let conn = init_db(profile)?;
     conn.execute(
         "INSERT INTO messages (direction, contact, onion, body, timestamp_ms, status, conversation_kind, conversation_id, expires_at_ms)
@@ -1809,7 +1838,7 @@ pub(crate) fn store_message_for_conversation_expiring(
             expires_at_ms.map(|v| v as i64).unwrap_or(0),
         ],
     )?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
 /// Delete messages whose absolute expiry has passed. Returns the count removed.
@@ -1914,6 +1943,46 @@ pub(crate) fn override_ttl_from_i64(v: Option<i64>) -> Option<Option<u128>> {
 /// Enqueue a failed outbound message for retry. Returns the queue ID.
 /// `expires_at_ms` is the message's absolute expiry (ms, `None` = never); it is
 /// preserved so a retried message keeps its original deadline.
+/// Read a persisted app setting, or `None` if unset.
+pub(crate) fn get_setting(profile: &Path, key: &str) -> Result<Option<String>> {
+    let conn = init_db(profile)?;
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value)
+}
+
+/// Persist an app setting (upsert).
+pub(crate) fn set_setting(profile: &Path, key: &str, value: &str) -> Result<()> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Default offline-retry window: keep retrying an undelivered message for a day.
+pub(crate) const DEFAULT_RETRY_MAX_AGE_MS: u128 = 24 * 60 * 60 * 1000;
+const RETRY_MAX_AGE_KEY: &str = "retry_max_age_ms";
+
+/// How long an undelivered message keeps retrying before it is given up on.
+pub(crate) fn get_retry_max_age_ms(profile: &Path) -> u128 {
+    match get_setting(profile, RETRY_MAX_AGE_KEY) {
+        Ok(Some(s)) => s.parse::<u128>().unwrap_or(DEFAULT_RETRY_MAX_AGE_MS),
+        _ => DEFAULT_RETRY_MAX_AGE_MS,
+    }
+}
+
+pub(crate) fn set_retry_max_age_ms(profile: &Path, ms: u128) -> Result<()> {
+    set_setting(profile, RETRY_MAX_AGE_KEY, &ms.to_string())
+}
+
 pub(crate) fn enqueue_retry(
     profile: &Path,
     contact: &str,
@@ -1921,20 +1990,47 @@ pub(crate) fn enqueue_retry(
     message: &str,
     error: &str,
     expires_at_ms: Option<u128>,
+    message_row_id: i64,
 ) -> Result<i64> {
     let conn = init_db(profile)?;
     conn.execute(
-        "INSERT INTO retry_queue (contact, onion, message, attempts, next_retry_at, last_error, expires_at_ms)
-         VALUES (?1, ?2, ?3, 1, datetime('now', '+30 seconds'), ?4, ?5)",
+        "INSERT INTO retry_queue (contact, onion, message, attempts, next_retry_at, last_error, expires_at_ms, message_row_id)
+         VALUES (?1, ?2, ?3, 1, datetime('now', '+30 seconds'), ?4, ?5, ?6)",
         params![
             contact,
             onion,
             message,
             error,
             expires_at_ms.map(|v| v as i64).unwrap_or(0),
+            message_row_id,
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Reschedule all of a contact's queued retries for immediate delivery. Called
+/// when we hear from that contact (proof they are reachable) so a store-and-
+/// forward message flushes promptly instead of waiting out its backoff.
+pub(crate) fn retry_wake_contact(profile: &Path, contact: &str) -> Result<usize> {
+    let conn = init_db(profile)?;
+    let n = conn.execute(
+        "UPDATE retry_queue SET next_retry_at = datetime('now') WHERE contact = ?1",
+        params![contact],
+    )?;
+    Ok(n)
+}
+
+/// Mark an outbound history row delivered (Failed → Sent) after a retry lands.
+pub(crate) fn mark_message_sent(profile: &Path, message_row_id: i64) -> Result<()> {
+    if message_row_id <= 0 {
+        return Ok(());
+    }
+    let conn = init_db(profile)?;
+    conn.execute(
+        "UPDATE messages SET status = ?1 WHERE id = ?2",
+        params![DeliveryStatus::Sent.as_i64(), message_row_id],
+    )?;
+    Ok(())
 }
 
 /// How many messages are currently queued for retry.
@@ -1952,13 +2048,19 @@ pub(crate) struct RetryItem {
     pub message: String,
     /// Absolute expiry (ms since epoch); 0 = never.
     pub expires_at_ms: i64,
+    /// Outbound history row this message was stored as (0 = unknown).
+    pub message_row_id: i64,
+    /// Age of the queued message in ms (now - created_at).
+    pub age_ms: i64,
 }
 
 /// Get all due retry items (next_retry_at <= now).
 pub(crate) fn retry_due(profile: &Path) -> Result<Vec<RetryItem>> {
     let conn = init_db(profile)?;
     let mut stmt = conn.prepare(
-        "SELECT id, contact, onion, message, expires_at_ms FROM retry_queue
+        "SELECT id, contact, onion, message, expires_at_ms, message_row_id,
+                CAST((julianday('now') - julianday(created_at)) * 86400000 AS INTEGER) AS age_ms
+         FROM retry_queue
          WHERE next_retry_at <= datetime('now')
          ORDER BY created_at ASC LIMIT 5",
     )?;
@@ -1969,13 +2071,17 @@ pub(crate) fn retry_due(profile: &Path) -> Result<Vec<RetryItem>> {
             onion: row.get(2)?,
             message: row.get(3)?,
             expires_at_ms: row.get(4)?,
+            message_row_id: row.get(5)?,
+            age_ms: row.get(6)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("retry_due query: {e}"))
 }
 
-/// Update a retry item after an attempt: increment attempts, set next backoff, or remove if maxed.
+/// Update a retry item after a failed attempt: increment attempts and set the
+/// next backoff. Give-up is age-based (owned by the serve loop, which knows the
+/// configured window) — a success deletes the row via `retry_update(_, true, _)`.
 pub(crate) fn retry_update(
     profile: &Path,
     id: i64,
@@ -1987,23 +2093,17 @@ pub(crate) fn retry_update(
         conn.execute("DELETE FROM retry_queue WHERE id = ?1", params![id])?;
         return Ok(());
     }
-    // Exponential backoff: 30s, 2min, 10min, 30min, then give up after 5 attempts.
+    // Progressive backoff that ramps up then holds at 30 min, so an offline peer
+    // is retried roughly twice an hour for the whole retention window rather than
+    // being dropped after a handful of attempts.
     let mut stmt = conn.prepare("SELECT attempts FROM retry_queue WHERE id = ?1")?;
     let attempts: i32 = stmt.query_row(params![id], |row| row.get(0))?;
     drop(stmt);
-    if attempts >= 5 {
-        warn!(
-            id,
-            attempts, "retry queue: max attempts reached, dropping message"
-        );
-        conn.execute("DELETE FROM retry_queue WHERE id = ?1", params![id])?;
-        return Ok(());
-    }
     let backoff_secs = match attempts {
-        1 => 120,
-        2 => 600,
-        3 => 1800,
-        _ => 3600,
+        1 => 60,   // +1m
+        2 => 300,  // +5m
+        3 => 900,  // +15m
+        _ => 1800, // then every 30m
     };
     conn.execute(
         "UPDATE retry_queue SET attempts = attempts + 1, next_retry_at = datetime('now', ?1), last_error = ?2 WHERE id = ?3",
@@ -3019,6 +3119,27 @@ async fn main() -> Result<()> {
                     Some(t) => println!("disappearing messages: on ({})", format_duration_ms(t)),
                     None => println!("disappearing messages: off"),
                 }
+            }
+            Ok(())
+        }
+        CommandKind::RetryWindow { profile, set, json } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if let Some(s) = set {
+                match parse_expire_duration(&s)? {
+                    Some(ms) => set_retry_max_age_ms(&profile, ms)?,
+                    None => {
+                        return Err(anyhow!(
+                            "retry window must be a positive duration (e.g. 1h, 1d)"
+                        ))
+                    }
+                }
+            }
+            let ms = get_retry_max_age_ms(&profile);
+            if json {
+                println!("{{\"max_age_ms\":{ms}}}");
+            } else {
+                println!("offline retry window: {}", format_duration_ms(ms));
             }
             Ok(())
         }
@@ -5296,6 +5417,7 @@ pub(crate) async fn serve(
                         Ok(_) => {}
                         Err(e) => warn!(error=%e, "expired-message sweep failed"),
                     }
+                    let max_age_ms = get_retry_max_age_ms(&profile) as i64;
                     match retry_due(&profile) {
                         Ok(items) if items.is_empty() => {}
                         Ok(items) => {
@@ -5306,9 +5428,19 @@ pub(crate) async fn serve(
                                     onion,
                                     message,
                                     expires_at_ms,
+                                    message_row_id,
+                                    age_ms,
                                 } = item;
-                                // Drop messages that expired while queued instead of
-                                // delivering them past their deadline.
+                                // Give up on a message that has been undeliverable
+                                // for longer than the configured retry window; it
+                                // stays marked Failed in history.
+                                if age_ms >= max_age_ms {
+                                    warn!(id, contact = %contact, age_ms, "retry: window elapsed, giving up");
+                                    let _ = retry_update(&profile, id, true, None);
+                                    continue;
+                                }
+                                // Drop messages that expired (disappearing timer)
+                                // while queued instead of delivering them late.
                                 let now = now_ms_i64().unwrap_or(i64::MAX);
                                 if expires_at_ms > 0 && expires_at_ms <= now {
                                     info!(id, contact = %contact, "retry: dropping expired message");
@@ -5329,6 +5461,8 @@ pub(crate) async fn serve(
                                 {
                                     Ok(()) => {
                                         info!(id, contact = %contact, "retry: success");
+                                        // Flip the original outbound row Failed → Sent.
+                                        let _ = mark_message_sent(&profile, message_row_id);
                                         let _ = retry_update(&profile, id, true, None);
                                     }
                                     Err(e) => {
@@ -5546,7 +5680,10 @@ pub(crate) async fn send_retry(
         false,
         "contact",
         contact_hint,
-        true,
+        // A retry must NOT store another outbound row — the original send already
+        // stored one (as Failed); a delivered retry updates that row via
+        // mark_message_sent. Storing here would duplicate the message per attempt.
+        false,
         true,
         expires_at_ms,
     )
@@ -5707,8 +5844,9 @@ pub(crate) async fn send_in_conversation(
         .filter(|payload| payload.kind == "group_message")
         .map(|payload| payload.body)
         .unwrap_or_else(|| message.to_string());
+    let mut stored_row_id: i64 = 0;
     if store_outbound_history {
-        if let Err(e) = store_message_for_conversation_expiring(
+        match store_message_for_conversation_expiring(
             profile,
             "out",
             contact_hint,
@@ -5720,7 +5858,8 @@ pub(crate) async fn send_in_conversation(
             conversation_id,
             expires_at_ms,
         ) {
-            error!(error=%e, "failed to store outbound message");
+            Ok(id) => stored_row_id = id,
+            Err(e) => error!(error=%e, "failed to store outbound message"),
         }
     }
 
@@ -5732,7 +5871,15 @@ pub(crate) async fn send_in_conversation(
         // success — nothing to enqueue
     } else if conversation_kind == "contact" && !is_retry {
         let err_text = last_error.as_deref().unwrap_or("unknown");
-        match enqueue_retry(profile, contact_hint, to, message, err_text, expires_at_ms) {
+        match enqueue_retry(
+            profile,
+            contact_hint,
+            to,
+            message,
+            err_text,
+            expires_at_ms,
+            stored_row_id,
+        ) {
             Ok(qid) => info!(qid, contact = %contact_hint, "enqueued for retry"),
             Err(e) => warn!(error=%e, "failed to enqueue retry"),
         }
@@ -7479,7 +7626,7 @@ fn failed_retries_do_not_duplicate_queue_row() {
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path();
 
-    let id = enqueue_retry(profile, "alice", "alice.onion", "hello", "timeout", None).unwrap();
+    let id = enqueue_retry(profile, "alice", "alice.onion", "hello", "timeout", None, 0).unwrap();
     assert_eq!(retry_queue_len(profile).unwrap(), 1);
 
     // Simulate several failed retry attempts (what the retry loop does).
@@ -7498,20 +7645,62 @@ fn failed_retries_do_not_duplicate_queue_row() {
 }
 
 #[test]
-fn retry_update_drops_after_max_attempts() {
+fn retry_update_keeps_row_across_many_failures() {
+    // Give-up is now age-based (owned by the serve loop), not attempt-count based:
+    // failed attempts back off but keep the row so an offline peer keeps getting
+    // retried for the whole configured window. A success clears it.
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path();
-    let id = enqueue_retry(profile, "bob", "bob.onion", "hi", "err", None).unwrap();
-    // attempts starts at 1; each failing update increments until the row is
-    // dropped at the max. Stop once the queue is empty (the retry loop only
-    // updates rows that are still present/due).
-    for _ in 0..5 {
-        if retry_queue_len(profile).unwrap() == 0 {
-            break;
-        }
+    let id = enqueue_retry(profile, "bob", "bob.onion", "hi", "err", None, 0).unwrap();
+    for _ in 0..10 {
         retry_update(profile, id, false, Some("nope")).unwrap();
+        assert_eq!(
+            retry_queue_len(profile).unwrap(),
+            1,
+            "a failed retry must not drop the row on its own"
+        );
     }
+    retry_update(profile, id, true, None).unwrap();
     assert_eq!(retry_queue_len(profile).unwrap(), 0);
+}
+
+#[test]
+fn retry_max_age_defaults_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    // Default is 24h until set.
+    assert_eq!(get_retry_max_age_ms(profile), DEFAULT_RETRY_MAX_AGE_MS);
+    set_retry_max_age_ms(profile, 3 * 24 * 60 * 60 * 1000).unwrap();
+    assert_eq!(get_retry_max_age_ms(profile), 3 * 24 * 60 * 60 * 1000);
+    // Generic settings round-trip too.
+    assert_eq!(get_setting(profile, "nope").unwrap(), None);
+    set_setting(profile, "k", "v").unwrap();
+    assert_eq!(get_setting(profile, "k").unwrap().as_deref(), Some("v"));
+}
+
+#[test]
+fn mark_message_sent_flips_failed_to_sent() {
+    // A delivered retry must update the original outbound row rather than leave a
+    // duplicate — store one Failed row, mark it sent, and confirm status flips.
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path();
+    let row = store_message_for_conversation(
+        profile,
+        "out",
+        "bob",
+        "bob.onion",
+        "hi",
+        1_000,
+        DeliveryStatus::Failed,
+        "contact",
+        "bob",
+    )
+    .unwrap();
+    mark_message_sent(profile, row).unwrap();
+    let hist = load_history(profile, Some("bob"), 50).unwrap();
+    let msg = hist.iter().find(|m| m.body == "hi").unwrap();
+    assert_eq!(msg.status, DeliveryStatus::Sent.as_i64());
+    assert_eq!(hist.iter().filter(|m| m.body == "hi").count(), 1);
 }
 
 #[test]
@@ -7528,19 +7717,21 @@ fn enqueue_retry_preserves_absolute_expiry() {
         "boom",
         "offline",
         Some(deadline),
+        42,
     )
     .unwrap();
     let conn = init_db(profile).unwrap();
-    let stored: i64 = conn
+    let (stored, row_id): (i64, i64) = conn
         .query_row(
-            "SELECT expires_at_ms FROM retry_queue WHERE id = ?1",
+            "SELECT expires_at_ms, message_row_id FROM retry_queue WHERE id = ?1",
             params![id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert_eq!(stored, deadline as i64);
+    assert_eq!(row_id, 42, "the outbound history row id must round-trip");
     // A non-expiring queued message stores 0 (never).
-    let id2 = enqueue_retry(profile, "bob", "bob.onion", "hi", "offline", None).unwrap();
+    let id2 = enqueue_retry(profile, "bob", "bob.onion", "hi", "offline", None, 0).unwrap();
     let stored2: i64 = conn
         .query_row(
             "SELECT expires_at_ms FROM retry_queue WHERE id = ?1",

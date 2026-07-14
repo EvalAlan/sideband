@@ -225,14 +225,31 @@ pub async fn api_send_message(
         return Ok(());
     }
 
-    // No listener: never bootstrap Tor on the caller's thread. Persist to the
-    // retry queue so the message is delivered when the listener next runs, and
-    // return immediately. Resolve the message's absolute expiry now so it keeps
-    // its deadline while queued.
+    // No listener: never bootstrap Tor on the caller's thread. Store the outbound
+    // message (as Failed so it shows in history immediately) and persist it to the
+    // retry queue so it delivers when the listener next runs. Resolve the absolute
+    // expiry now so it keeps its deadline while queued.
     let onion = crate::resolve_to(&profile, to)?;
     let override_ttl = crate::override_ttl_from_i64(expires_ms);
     let expires_at_ms =
         crate::resolve_message_expiry(&profile, "contact", to, override_ttl).unwrap_or(None);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let row_id = crate::store_message_for_conversation_expiring(
+        &profile,
+        "out",
+        to,
+        &onion,
+        body,
+        ts,
+        crate::DeliveryStatus::Failed,
+        "contact",
+        to,
+        expires_at_ms,
+    )
+    .unwrap_or(0);
     crate::enqueue_retry(
         &profile,
         to,
@@ -240,6 +257,7 @@ pub async fn api_send_message(
         body,
         "queued: no listener running",
         expires_at_ms,
+        row_id,
     )?;
     Ok(())
 }
@@ -266,6 +284,23 @@ pub fn api_set_conversation_expiry(
         None
     };
     crate::set_conversation_ttl(&profile, kind, id, ttl)?;
+    Ok(true)
+}
+
+/// Read the offline-retry window (ms) — how long an undelivered message keeps
+/// retrying before it is given up on.
+pub fn api_get_retry_window(profile_path: &str) -> Result<i64> {
+    let profile = expand_profile(profile_path);
+    Ok(crate::get_retry_max_age_ms(&profile) as i64)
+}
+
+/// Set the offline-retry window (ms). Values <= 0 are ignored (kept as-is).
+pub fn api_set_retry_window(profile_path: &str, max_age_ms: i64) -> Result<bool> {
+    if max_age_ms <= 0 {
+        return Err(anyhow!("retry window must be positive"));
+    }
+    let profile = expand_profile(profile_path);
+    crate::set_retry_max_age_ms(&profile, max_age_ms as u128)?;
     Ok(true)
 }
 
@@ -710,6 +745,25 @@ pub extern "C" fn sideband_api_set_conversation_expiry(
             cstr_arg(id, "id")?,
             ttl_ms,
         )
+    })())
+}
+
+/// Read the offline-retry window in ms.
+#[no_mangle]
+pub extern "C" fn sideband_api_get_retry_window(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_get_retry_window(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+/// Set the offline-retry window in ms (must be positive).
+#[no_mangle]
+pub extern "C" fn sideband_api_set_retry_window(
+    profile_path: *const c_char,
+    max_age_ms: i64,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_retry_window(cstr_arg(profile_path, "profile_path")?, max_age_ms)
     })())
 }
 
@@ -1396,7 +1450,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().to_str().unwrap();
         assert_eq!(api_retry_status(profile).unwrap(), 0);
-        crate::enqueue_retry(dir.path(), "alice", "alice.onion", "hi", "err", None).unwrap();
+        crate::enqueue_retry(dir.path(), "alice", "alice.onion", "hi", "err", None, 0).unwrap();
         assert_eq!(api_retry_status(profile).unwrap(), 1);
     }
 
