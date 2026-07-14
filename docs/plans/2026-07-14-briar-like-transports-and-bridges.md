@@ -67,7 +67,7 @@ plus (c) a sync model rather than one-shot sends.
 
 | Aspect | Sideband today | Briar | Gap |
 |---|---|---|---|
-| LAN discovery | **Broadcasts a signed beacon containing our Ed25519 pubkey in the clear** to the whole LAN | Exchanges IP:port with contacts as transport properties; no broadcast | **Big** — we leak stable identity/presence to the local network |
+| LAN discovery | **Beacon broadcasts our Ed25519 pubkey in the clear** to the whole LAN (carrier + wiring are fine; only the discovery *payload* leaks) | Exchanges IP:port with contacts as transport properties; no broadcast | **Big but localized** — fix by A1 (address-exchange + repurpose the beacon to a rotating token); the transport itself is kept |
 | LAN connection | E2E-encrypted `ChatMessage` over **plain TCP** | BTP-wrapped (tags, no headers, padding, FS) | **Big** — our LAN traffic is recognizable + linkable by size/timing |
 | Send model | Dial peer, send one message (LAN fast-path, else Tor) | Bidirectional sync of all pending per connection | Medium — we have an offline outbox but no per-connection sync |
 | Bluetooth | none | RFCOMM via MAC+UUID transport properties | Missing carrier |
@@ -86,23 +86,35 @@ retry queue, the per-contact ratchet/static keys, and `seen_messages` dedup.
 Ordered so each phase is independently shippable and de-risks the next. Keep Tor
 as the always-available fallback throughout.
 
-### A1. Transport properties + contact-to-contact address exchange *(replaces the LAN pubkey broadcast — highest-priority privacy fix)*
+### A1. Transport properties + contact-to-contact address exchange *(the highest-priority privacy fix — evolves the existing LAN transport, does not replace it)*
+
+**We keep the LAN transport we already built** — the TCP carrier (`send_line`,
+`spawn_listener`, bounded reader, `lan_line_to_envelope`), the serve + send-path
+wiring (LAN-first, Tor fallback), the `DiscoveredPeers`/`PEERS` registry, the
+`lan_enabled` setting, and the CLI/FFI/GUI toggle. This phase changes exactly one
+thing: **how a contact's LAN address is learned** — the only real privacy leak
+today (the beacon broadcasts our Ed25519 pubkey in the clear).
+
 - New signed typed message `transport_props` (same pattern as receipts): a peer
   shares its current reachable addresses **only with its contacts**, over any
   existing connection (Tor/LAN), and refreshes on change.
   - LAN: last-known LAN `IP:port(s)`.
   - Bluetooth (A4): MAC + per-device UUID.
 - Persist per contact in a `contact_transport_props(contact, transport, value,
-  updated_at)` table.
-- Send path resolves a contact's LAN address from **their shared property**, not
-  from a broadcast registry.
-- **Remove/deprecate** the open `LanBeacon` pubkey broadcast. Replace default LAN
-  discovery with address-exchange. *(Optional, off by default:* a privacy-
-  preserving local discovery that broadcasts only a **per-contact rotating token**
-  — a truncated PRF over the pair's shared secret + time period — so only a
-  contact recognizes it and no identity is exposed; useful for dynamic-IP LANs.
-  This is strictly better than today's pubkey beacon and mirrors Briar's
-  "pseudo-random details known to both peers.")
+  updated_at)` table. The **existing `PEERS` registry stays** — it's now populated
+  from shared transport properties (and, when the token beacon below is on, from
+  discovery) instead of from identity broadcasts. `lan_peer_addr` and the send
+  fast-path are unchanged apart from that source.
+- **Repurpose (don't delete) the `LanBeacon` beacon.** Keep its sign/verify
+  machinery and the UDP loop; change only the *payload* so it advertises a
+  **rotating per-contact token** (a truncated PRF over the pair's shared secret +
+  time period) instead of the raw pubkey. Only a contact can recognize the token,
+  so no identity is exposed — this mirrors Briar's "pseudo-random details known to
+  both peers" and is strictly more private than v1. Address-exchange (above) is
+  the primary path; the token beacon becomes an opt-in helper for dynamic-IP LANs.
+  Net: nothing built in v1 is thrown away — the carrier + wiring + settings + TCP
+  tests carry forward; the beacon is upgraded and the two beacon-payload unit
+  tests are rewritten for the token form.
 
 ### A2. BTP-lite: wrap non-Tor connections
 - A link-layer wrapper for LAN (and later BT) connections, keyed by a per-contact

@@ -234,17 +234,21 @@ localhost end-to-end `send_line`→listener delivery of a real ChatMessage, and
 NEXT for LAN: two-peer real-network e2e; Android needs a WifiManager multicast lock
 (Kotlin) for UDP broadcast to work; LAN presence could also feed the receipt-derived
 presence UI. Group sends do not use the LAN fast-path yet (1:1 only).
-⚠️ **Privacy caveat (to be reworked):** this v1 LAN discovery **broadcasts our
-Ed25519 pubkey in the clear** to the whole network — unlike Briar, which never
+⚠️ **Privacy caveat (one localized fix, not a rewrite):** the v1 discovery *beacon*
+**broadcasts our Ed25519 pubkey in the clear** — unlike Briar, which never
 broadcasts identity (contacts exchange addresses as transport properties; every
-connection is wrapped in the unlinkable Bramble Transport Protocol; and peers run a
-bidirectional sync). The plan to bring WiFi + Bluetooth in line with Briar
-(transport-property address exchange, BTP-lite link wrapping, BSP-lite sync,
-pluggable transport registry, a real Bluetooth carrier) **and** a later Beeper-style
-multi-network bridge / shared-inbox layer is in
-[`docs/plans/2026-07-14-briar-like-transports-and-bridges.md`](docs/plans/2026-07-14-briar-like-transports-and-bridges.md).
-That plan is the intended next major track; the current `src/transport/lan.rs`
-beacon is a prototype its Part A will replace.
+connection is wrapped in the unlinkable Bramble Transport Protocol; peers run a
+bidirectional sync). **The LAN transport itself is kept** — carrier (`send_line`,
+`spawn_listener`), serve/send wiring, `PEERS`, the `lan_enabled` setting, and the
+CLI/FFI/GUI toggle all carry forward. Only the beacon *payload* changes: Part A1
+adds contact-to-contact transport-property address exchange and **repurposes** the
+beacon to advertise a rotating per-contact token instead of the raw pubkey (same
+sign/verify + UDP loop). The full roadmap to bring WiFi + Bluetooth in line with
+Briar (transport-property exchange, BTP-lite link wrapping, BSP-lite sync,
+pluggable transport registry, a real Bluetooth carrier) **and** a later
+Beeper-style multi-network bridge / shared-inbox layer is in
+[`docs/plans/2026-07-14-briar-like-transports-and-bridges.md`](docs/plans/2026-07-14-briar-like-transports-and-bridges.md)
+— it evolves the existing transport work, it does not throw it away.
 
 **Open / backlog (roughly prioritized):**
 1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
