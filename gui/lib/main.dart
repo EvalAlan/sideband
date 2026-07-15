@@ -2365,10 +2365,18 @@ class _ChatScreenState extends State<_ChatScreen>
   String? _pendingAttachmentName;
   int _pendingAttachmentSize = 0;
 
-  // presence + typing + activity
+  // presence + activity. A contact is "online" only within `_onlineWindow` of the
+  // last time we actually *observed* a new inbound message from them (stamped with
+  // our wall clock in `_checkUnread`), never a permanent latch. `_lastSeen` keeps
+  // the last message's own timestamp for the "last seen … ago" label.
+  static const Duration _onlineWindow = Duration(seconds: 90);
   final Map<String, DateTime> _lastSeen = {};
-  final Map<String, bool> _online = {};
+  final Map<String, DateTime> _lastPresence = {};
   final Map<String, ChatMsg> _lastMsg = {};
+  // Outbound message ids already counted as a delivery/read receipt, so a receipt
+  // observed after startup stamps presence exactly once (seeded at load so
+  // pre-existing delivered messages don't falsely mark a contact online).
+  final Set<int> _receiptSeen = {};
 
   // retry queue
   int _retryQueued = 0;
@@ -2391,17 +2399,31 @@ class _ChatScreenState extends State<_ChatScreen>
   void _recordActivity(List<ChatMsg> msgs) {
     for (final m in msgs) {
       if (m.direction == 'in' && m.contact.isNotEmpty) {
-        _lastSeen[m.contact] = m.ts;
-        _online[m.contact] = true;
+        final prev = _lastSeen[m.contact];
+        if (prev == null || m.ts.isAfter(prev)) _lastSeen[m.contact] = m.ts;
         _lastMsg[m.contact] = m;
       } else if (m.direction == 'out' && m.contact.isNotEmpty) {
         _lastMsg[m.contact] = m;
+        // A delivery/read receipt arriving now is live proof the contact was just
+        // reachable. Only the first observation of each receipt stamps presence.
+        if ((m.status == 'delivered' || m.status == 'read') &&
+            _receiptSeen.add(m.id)) {
+          _lastPresence[m.contact] = DateTime.now();
+        }
       }
     }
   }
 
+  /// True only if we observed a live inbound message from `contact` within the
+  /// online window. There is no active heartbeat, so this is honest evidence of
+  /// recent reachability rather than a sticky flag.
+  bool _isOnline(String contact) {
+    final seen = _lastPresence[contact];
+    return seen != null && DateTime.now().difference(seen) < _onlineWindow;
+  }
+
   String _presenceLabel(String contactName) {
-    final isOnline = _online[contactName] == true;
+    final isOnline = _isOnline(contactName);
     final lastSeen = _lastSeen[contactName];
     if (isOnline) return 'online';
     if (lastSeen == null) return 'last seen unknown';
@@ -2414,7 +2436,7 @@ class _ChatScreenState extends State<_ChatScreen>
   }
 
   Widget _presenceDot(String contactName) {
-    final isOnline = _online[contactName] == true;
+    final isOnline = _isOnline(contactName);
     final color = isOnline ? const Color(0xFF3FB950) : _t.textDim;
     return Container(
       width: 8,
@@ -3799,6 +3821,9 @@ class _ChatScreenState extends State<_ChatScreen>
       for (final m in global.msgs) {
         if (m.direction != 'in') continue;
         if (_refreshSeenIds.contains(m.id)) continue;
+        // A newly-observed inbound message (not present at seed time) is live
+        // evidence the sender is reachable right now — the presence signal.
+        if (m.contact.isNotEmpty) _lastPresence[m.contact] = DateTime.now();
         final belongsHere = (currentGroup != null && m.group == currentGroup) ||
             (currentGroup == null &&
                 currentContact != null &&
@@ -6392,7 +6417,7 @@ class _ChatScreenState extends State<_ChatScreen>
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
                                           fontSize: 10,
-                                          color: _online[c.name] == true
+                                          color: _isOnline(c.name)
                                               ? _t.primary
                                               : _t.textDim)),
                                 ],
@@ -6796,7 +6821,7 @@ class _ChatScreenState extends State<_ChatScreen>
                               fontSize: 10.5,
                               color: c == null
                                   ? _t.primary
-                                  : (_online[c.name] == true
+                                  : (_isOnline(c.name)
                                       ? _t.primary
                                       : _securityColor(c)))),
                     ],
@@ -7584,6 +7609,13 @@ class _ChatScreenState extends State<_ChatScreen>
 
   void _seedSeenIds(_History h) {
     _refreshSeenIds.addAll(h.msgs.map((m) => m.id));
+    // Treat already-delivered/read outbound messages as prior evidence so only
+    // receipts observed *after* startup count toward live presence.
+    for (final m in h.msgs) {
+      if (m.direction == 'out' && (m.status == 'delivered' || m.status == 'read')) {
+        _receiptSeen.add(m.id);
+      }
+    }
   }
 
   // ── unread indicator ──────────────────────────────────────────────────────
