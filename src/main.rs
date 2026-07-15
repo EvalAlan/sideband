@@ -197,6 +197,18 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set this profile's status message (shared with contacts via
+    /// presence; only visible to them when presence sharing is on).
+    Status {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// New status text. Omit to just show; pass "" to clear.
+        #[arg(long)]
+        set: Option<String>,
+        /// Emit machine-readable JSON ({"status": "<text>"}) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show or set LAN discovery + delivery (off by default; broadcasts identity
     /// on the local network).
     Lan {
@@ -1517,6 +1529,7 @@ pub(crate) async fn send_presence_to_contact(
         state: state.to_string(),
         ttl_ms: PRESENCE_TTL_MS,
         seq,
+        status: get_status(profile),
     };
     let json = serde_json::to_string(&payload)?;
     send_over_local_carrier(profile, to_onion, contact_name, "presence", &json).await
@@ -1541,6 +1554,49 @@ pub(crate) async fn broadcast_presence(profile: &Path) -> Result<usize> {
         }
     }
     Ok(sent)
+}
+
+/// Broadcast presence (with the current status) to every accepted contact over
+/// the *full* carrier path including Tor, so a status change reaches contacts we
+/// can't reach on LAN/BT. Each send runs concurrently and is best-effort. Only
+/// used on change (not the periodic heartbeat), and only when sharing is on.
+pub(crate) fn broadcast_presence_all(
+    profile: &Path,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> usize {
+    if !share_presence_enabled(profile) {
+        return 0;
+    }
+    let Ok(contacts) = load_contacts(profile) else {
+        return 0;
+    };
+    let seq = now_ms_i64().unwrap_or(0).max(0) as u64;
+    let payload = PresencePayload {
+        kind: "presence".to_string(),
+        state: "online".to_string(),
+        ttl_ms: PRESENCE_TTL_MS,
+        seq,
+        status: get_status(profile),
+    };
+    let Ok(json) = serde_json::to_string(&payload) else {
+        return 0;
+    };
+    let mut spawned = 0usize;
+    for contact in contacts.values() {
+        if contact.pending || contact.blocked || contact.onion.is_empty() {
+            continue;
+        }
+        let profile = profile.to_path_buf();
+        let tc = tor_client.clone();
+        let json = json.clone();
+        let name = contact.name.clone();
+        let onion = contact.onion.clone();
+        tokio::spawn(async move {
+            let _ = send_typed_message(&profile, &onion, &name, "presence", &json, tc).await;
+        });
+        spawned += 1;
+    }
+    spawned
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1597,7 +1653,14 @@ pub(crate) struct PresencePayload {
     pub state: String, // "online" | "away"
     pub ttl_ms: u64,
     pub seq: u64,
+    /// Optional user-set status message shared with the heartbeat (e.g. "Busy").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
 }
+
+/// Max length of a status message accepted from a contact (bytes), so a peer
+/// can't push an oversized string into our UI/DB.
+pub(crate) const MAX_STATUS_LEN: usize = 140;
 
 /// How long a received presence heartbeat stays valid without a refresh.
 pub(crate) const PRESENCE_TTL_MS: u64 = 150_000;
@@ -1855,6 +1918,14 @@ fn init_db(profile: &Path) -> Result<Connection> {
             seq            INTEGER NOT NULL
         )",
         [],
+    )?;
+    // Last-known status message a contact shared. Persists past presence expiry
+    // (it's a profile attribute, not tied to being online right now).
+    ensure_column(
+        &conn,
+        "contact_presence",
+        "status",
+        "ALTER TABLE contact_presence ADD COLUMN status TEXT NOT NULL DEFAULT ''",
     )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS conversation_expiry (
@@ -2408,25 +2479,71 @@ pub(crate) fn set_share_presence_enabled(profile: &Path, enabled: bool) -> Resul
     )
 }
 
+const STATUS_KEY: &str = "status_text";
+
+/// This profile's own status message ("" if unset).
+pub(crate) fn get_status(profile: &Path) -> String {
+    get_setting(profile, STATUS_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Set this profile's status message (trimmed and clamped to `MAX_STATUS_LEN`).
+pub(crate) fn set_status(profile: &Path, status: &str) -> Result<()> {
+    let mut trimmed = status.trim().to_string();
+    if trimmed.len() > MAX_STATUS_LEN {
+        trimmed.truncate(MAX_STATUS_LEN);
+    }
+    set_setting(profile, STATUS_KEY, &trimmed)
+}
+
 /// Record an inbound presence heartbeat: upsert only if `seq` is newer than the
 /// last one seen from this peer, stamping `valid_until_ms` from our own clock.
+/// `status` is stored alongside and persists past the presence TTL.
 pub(crate) fn note_contact_presence(
     profile: &Path,
     peer_ed25519: &str,
     state: &str,
     valid_until_ms: u128,
     seq: u64,
+    status: &str,
 ) -> Result<()> {
+    let status = status.chars().take(MAX_STATUS_LEN).collect::<String>();
     let conn = init_db(profile)?;
     conn.execute(
-        "INSERT INTO contact_presence(peer_ed25519, state, valid_until_ms, seq)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO contact_presence(peer_ed25519, state, valid_until_ms, seq, status)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(peer_ed25519) DO UPDATE SET
-             state=excluded.state, valid_until_ms=excluded.valid_until_ms, seq=excluded.seq
+             state=excluded.state, valid_until_ms=excluded.valid_until_ms,
+             seq=excluded.seq, status=excluded.status
          WHERE excluded.seq > contact_presence.seq",
-        params![peer_ed25519, state, valid_until_ms as i64, seq as i64],
+        params![
+            peer_ed25519,
+            state,
+            valid_until_ms as i64,
+            seq as i64,
+            status
+        ],
     )?;
     Ok(())
+}
+
+/// The last status message a contact shared ("" if none). Persists past presence
+/// expiry — it is a profile attribute, not tied to being online.
+pub(crate) fn get_contact_status(profile: &Path, peer_ed25519: &str) -> String {
+    let Ok(conn) = init_db(profile) else {
+        return String::new();
+    };
+    conn.query_row(
+        "SELECT status FROM contact_presence WHERE peer_ed25519 = ?1",
+        params![peer_ed25519],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
 /// Current presence of a contact by Ed25519 pubkey: "online" / "away" while the
@@ -4135,6 +4252,25 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        CommandKind::Status { profile, set, json } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if let Some(text) = set {
+                set_status(&profile, &text)?;
+            }
+            let status = get_status(&profile);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({ "status": status }))?
+                );
+            } else if status.is_empty() {
+                println!("(no status set)");
+            } else {
+                println!("status: {status}");
+            }
+            Ok(())
+        }
         CommandKind::Lan { profile, set, json } => {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
@@ -5166,6 +5302,7 @@ fn contact_list(profile: &Path, json: bool) -> Result<()> {
             pending: bool,
             blocked: bool,
             presence: String,
+            status: String,
         }
 
         let mut rows: Vec<_> = contacts
@@ -5178,6 +5315,7 @@ fn contact_list(profile: &Path, json: bool) -> Result<()> {
                 pending: c.pending,
                 blocked: c.blocked,
                 presence: get_contact_presence(profile, &c.pubkey_b64),
+                status: get_contact_status(profile, &c.pubkey_b64),
             })
             .collect();
         rows.sort_by(|a, b| a.name.cmp(b.name));
@@ -6149,6 +6287,7 @@ pub(crate) async fn serve(
     let mut last_lan_props_revision = String::new();
     let mut next_lan_props_check = std::time::Instant::now();
     let mut next_presence_heartbeat = std::time::Instant::now();
+    let mut last_presence_revision = String::new();
     loop {
         while let Ok(cmd) = control_rx.try_recv() {
             let profile = profile.to_path_buf();
@@ -6614,6 +6753,27 @@ pub(crate) async fn serve(
                         }
                     }
                 });
+            }
+        }
+
+        // When the status message or presence-sharing setting changes, push
+        // presence to all contacts over the full carrier path (Tor included) once,
+        // so a new status reaches contacts we can't reach on LAN/BT.
+        let presence_revision = format!(
+            "{}\n{}",
+            share_presence_enabled(profile),
+            get_status(profile)
+        );
+        if presence_revision != last_presence_revision {
+            let first = last_presence_revision.is_empty();
+            last_presence_revision = presence_revision;
+            // Skip the initial revision at startup (the periodic heartbeat + any
+            // real change cover it) to avoid a Tor fan-out on every launch.
+            if !first {
+                let n = broadcast_presence_all(profile, Arc::clone(&tor_client));
+                if n > 0 {
+                    tracing::debug!(sent = n, "presence: status change broadcast");
+                }
             }
         }
 

@@ -338,6 +338,7 @@ class Contact {
     this.pending = false,
     this.blocked = false,
     this.presence = '',
+    this.status = '',
   });
   final String name;
   final String onion;
@@ -349,6 +350,8 @@ class Contact {
   // Authoritative live presence from the core: "online"/"away"/"offline", or ""
   // if this contact does not share presence (fall back to the activity heuristic).
   final String presence;
+  // The contact's last-known status message ("" if none).
+  final String status;
 
   String get initial => name.isNotEmpty ? name[0].toUpperCase() : '?';
 
@@ -1022,6 +1025,7 @@ class _Cli {
         pending: item['pending'] == true,
         blocked: item['blocked'] == true,
         presence: item['presence'] as String? ?? '',
+        status: item['status'] as String? ?? '',
       ));
     }
     parsed.sort((a, b) => a.name.compareTo(b.name));
@@ -1247,6 +1251,20 @@ class _Cli {
     ]);
   }
 
+  /// This profile's own status message.
+  Future<String> getStatus() async {
+    final raw = await _run(['status', '--profile', profile, '--json']);
+    final decoded = jsonDecode(raw);
+    if (decoded is Map && decoded['status'] is String) {
+      return decoded['status'] as String;
+    }
+    return '';
+  }
+
+  Future<void> setStatus(String status) async {
+    await _run(['status', '--profile', profile, '--set', status, '--json']);
+  }
+
   /// Whether LAN discovery + delivery is enabled (default off).
   Future<bool> getLanEnabled() async {
     final raw = await _run(['lan', '--profile', profile, '--json']);
@@ -1369,6 +1387,14 @@ class _MobileApi {
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
                 ffi.Pointer<Utf8> Function(
                     ffi.Pointer<Utf8>, bool)>('sideband_api_set_share_presence'),
+        _getStatus = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(
+                ffi.Pointer<Utf8>)>('sideband_api_get_status'),
+        _setStatus = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>),
+            ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                ffi.Pointer<Utf8>)>('sideband_api_set_status'),
         _getLanEnabled = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
@@ -1505,6 +1531,8 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setReadReceipts;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getSharePresence;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setSharePresence;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getStatus;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _setStatus;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getLanEnabled;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setLanEnabled;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getBluetoothEnabled;
@@ -1671,6 +1699,7 @@ class _MobileApi {
         pending: item['pending'] == true,
         blocked: item['blocked'] == true,
         presence: item['presence'] as String? ?? '',
+        status: item['status'] as String? ?? '',
       ));
     }
     contacts.sort((a, b) => a.name.compareTo(b.name));
@@ -1856,6 +1885,27 @@ class _MobileApi {
       _decode<Object?>(_setSharePresence(profile, enabled));
     } finally {
       calloc.free(profile);
+    }
+  }
+
+  /// This profile's own status message.
+  Future<String> getStatus() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      return _decode<String>(_getStatus(profile));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<void> setStatus(String status) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final cstatus = status.toNativeUtf8();
+    try {
+      _decode<Object?>(_setStatus(profile, cstatus));
+    } finally {
+      calloc.free(profile);
+      calloc.free(cstatus);
     }
   }
 
@@ -2389,6 +2439,8 @@ class _ChatScreenState extends State<_ChatScreen>
   // Whether we broadcast live presence to contacts (persisted; default off —
   // tells contacts when you're online). Loaded when Settings opens.
   bool _sharePresence = false;
+  // Our own status message (persisted; shared with contacts via presence).
+  String _myStatus = '';
   // Whether LAN discovery + delivery is enabled (persisted; default off — a LAN
   // beacon advertises this identity on the local network). Loaded in Settings.
   bool _lanEnabled = false;
@@ -3337,6 +3389,54 @@ class _ChatScreenState extends State<_ChatScreen>
     } catch (e) {
       if (mounted) setState(() => _error = 'could not set presence sharing: $e');
     }
+  }
+
+  /// Persist our own status message via the active backend. The serve process
+  /// broadcasts the change to contacts over every carrier (Tor included).
+  Future<void> _setMyStatus(String status) async {
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.setStatus(status);
+      } else {
+        await _cli.setStatus(status);
+      }
+      if (mounted) setState(() => _myStatus = status.trim());
+    } catch (e) {
+      if (mounted) setState(() => _error = 'could not set status: $e');
+    }
+  }
+
+  /// Prompt for a status message and persist it.
+  Future<void> _editMyStatus() async {
+    final controller = TextEditingController(text: _myStatus);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _t.surface,
+        title: Text('Set status', style: TextStyle(color: _t.text)),
+        content: TextField(
+          controller: controller,
+          maxLength: 140,
+          autofocus: true,
+          style: TextStyle(color: _t.text),
+          decoration: const InputDecoration(
+            hintText: 'e.g. 🎉 Celebrating, Busy, At work…',
+          ),
+          onSubmitted: (v) => Navigator.pop(ctx, v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, ''),
+            child: const Text('Clear'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (result != null) await _setMyStatus(result);
   }
 
   /// Persist the LAN-discovery preference via the active backend. The change
@@ -5801,6 +5901,13 @@ class _ChatScreenState extends State<_ChatScreen>
           : await _cli.getSharePresence();
       if (mounted) setState(() => _sharePresence = enabled);
     } catch (_) {}
+    // Load our own status message.
+    try {
+      final status = (_canUseMobileBackend && _mobile != null)
+          ? await _mobile!.getStatus()
+          : await _cli.getStatus();
+      if (mounted) setState(() => _myStatus = status);
+    } catch (_) {}
     // Load the persisted LAN-discovery preference.
     try {
       final enabled = (_canUseMobileBackend && _mobile != null)
@@ -5883,6 +5990,17 @@ class _ChatScreenState extends State<_ChatScreen>
                         unawaited(_applyFlagSecure(value));
                       },
                     ),
+                  ListTile(
+                    leading: const Icon(Icons.mood_outlined),
+                    title: const Text('Status'),
+                    subtitle: Text(_myStatus.isEmpty
+                        ? 'Set a status message for your contacts'
+                        : _myStatus),
+                    onTap: () async {
+                      await _editMyStatus();
+                      setDialogState(() {});
+                    },
+                  ),
                   SwitchListTile(
                     secondary: const Icon(Icons.done_all),
                     title: const Text('Send read receipts'),
@@ -6859,8 +6977,13 @@ class _ChatScreenState extends State<_ChatScreen>
     final title = c?.name ?? g!.sidebarLabel;
     final isNarrow = MediaQuery.of(context).size.width < 720;
     final presenceText = c != null ? _presenceLabel(c.name) : '';
+    final statusText = c?.status ?? '';
+    final headerParts = <String>[
+      if (presenceText.isNotEmpty) presenceText,
+      if (statusText.isNotEmpty) statusText,
+    ];
     final subtitle = c != null
-        ? (presenceText.isNotEmpty ? presenceText : c.securityLabel)
+        ? (headerParts.isNotEmpty ? headerParts.join(' • ') : c.securityLabel)
         : 'Group fan-out to ${g!.memberSummary}';
     return Container(
       color: _t.surface,

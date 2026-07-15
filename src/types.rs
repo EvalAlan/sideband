@@ -19,6 +19,10 @@ pub struct ApiContact {
     /// valid, "offline" once it expires, or "" if they never shared presence.
     #[serde(default)]
     pub presence: String,
+    /// The contact's last-known status message ("" if none). Persists past
+    /// presence expiry.
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

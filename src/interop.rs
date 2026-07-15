@@ -21,12 +21,12 @@ use crate::handler::{
     parse_inbound_line,
 };
 use crate::{
-    build_outbound_message, contact_add, enqueue_retry, get_contact_presence, get_conversation_ttl,
-    init_profile_with_name, init_ratchet_for_contact, load_contacts, load_history,
-    load_signing_key, load_x25519_public, message_replay_fingerprint, resolve_message_expiry,
-    retry_queue_len, set_conversation_ttl, set_message_fingerprint, store_message_for_conversation,
-    DeliveryStatus, PresencePayload, ReceiptPayload, TransportProp, TransportPropsPayload,
-    TuiEvent,
+    build_outbound_message, contact_add, enqueue_retry, get_contact_presence, get_contact_status,
+    get_conversation_ttl, init_profile_with_name, init_ratchet_for_contact, load_contacts,
+    load_history, load_signing_key, load_x25519_public, message_replay_fingerprint,
+    resolve_message_expiry, retry_queue_len, set_conversation_ttl, set_message_fingerprint,
+    store_message_for_conversation, DeliveryStatus, PresencePayload, ReceiptPayload, TransportProp,
+    TransportPropsPayload, TuiEvent,
 };
 
 // Valid v3 onion addresses (checksum-correct) for harness peers. They are never
@@ -560,12 +560,13 @@ async fn presence_heartbeat_marks_online_honors_ttl_and_seq() {
     bob.add_contact(&alice, "alice");
     let alice_ed = alice.ed25519_b64();
 
-    let deliver = |state: &str, ttl_ms: u64, seq: u64| {
+    let deliver = |state: &str, ttl_ms: u64, seq: u64, status: &str| {
         let payload = PresencePayload {
             kind: "presence".into(),
             state: state.into(),
             ttl_ms,
             seq,
+            status: status.into(),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let mut msg = build_outbound_message(
@@ -581,20 +582,24 @@ async fn presence_heartbeat_marks_online_honors_ttl_and_seq() {
         handle_presence(bob.profile(), &contacts, &mut msg).unwrap();
     };
 
-    deliver("online", 150_000, 10);
+    deliver("online", 150_000, 10, "Celebrating");
     assert_eq!(get_contact_presence(bob.profile(), &alice_ed), "online");
+    assert_eq!(get_contact_status(bob.profile(), &alice_ed), "Celebrating");
 
-    // A lower-seq "away" is stale and ignored.
-    deliver("away", 150_000, 5);
+    // A lower-seq "away" is stale and ignored (status unchanged too).
+    deliver("away", 150_000, 5, "stale");
     assert_eq!(get_contact_presence(bob.profile(), &alice_ed), "online");
+    assert_eq!(get_contact_status(bob.profile(), &alice_ed), "Celebrating");
 
     // A newer-seq "away" takes effect.
-    deliver("away", 150_000, 11);
+    deliver("away", 150_000, 11, "brb");
     assert_eq!(get_contact_presence(bob.profile(), &alice_ed), "away");
 
-    // A newer heartbeat with a 0 TTL is already expired → offline.
-    deliver("online", 0, 12);
+    // A newer heartbeat with a 0 TTL is already expired → offline, but the
+    // last-known status persists past presence expiry.
+    deliver("online", 0, 12, "on vacation");
     assert_eq!(get_contact_presence(bob.profile(), &alice_ed), "offline");
+    assert_eq!(get_contact_status(bob.profile(), &alice_ed), "on vacation");
 }
 
 /// Presence from a peer who is NOT an accepted contact must be dropped, not
@@ -612,6 +617,7 @@ async fn presence_from_non_contact_is_dropped() {
         state: "online".into(),
         ttl_ms: 150_000,
         seq: 1,
+        status: String::new(),
     };
     let json = serde_json::to_string(&payload).unwrap();
     let mut msg = build_outbound_message(

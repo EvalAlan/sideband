@@ -123,6 +123,7 @@ pub fn api_list_contacts(profile_path: &str) -> Result<Vec<ApiContact>> {
             blocked: c.blocked,
             ratchet_active: crate::ratchet_is_active(&profile, &c.name),
             presence: crate::get_contact_presence(&profile, &c.pubkey_b64),
+            status: crate::get_contact_status(&profile, &c.pubkey_b64),
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -330,6 +331,18 @@ pub fn api_get_share_presence(profile_path: &str) -> Result<bool> {
 pub fn api_set_share_presence(profile_path: &str, enabled: bool) -> Result<bool> {
     let profile = expand_profile(profile_path);
     crate::set_share_presence_enabled(&profile, enabled)?;
+    Ok(true)
+}
+
+/// This profile's own status message ("" if unset).
+pub fn api_get_status(profile_path: &str) -> Result<String> {
+    let profile = expand_profile(profile_path);
+    Ok(crate::get_status(&profile))
+}
+
+pub fn api_set_status(profile_path: &str, status: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::set_status(&profile, status)?;
     Ok(true)
 }
 
@@ -901,6 +914,25 @@ pub extern "C" fn sideband_api_set_share_presence(
     })())
 }
 
+/// This profile's own status message.
+#[no_mangle]
+pub extern "C" fn sideband_api_get_status(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| api_get_status(cstr_arg(profile_path, "profile_path")?))())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_set_status(
+    profile_path: *const c_char,
+    status: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_status(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(status, "status")?,
+        )
+    })())
+}
+
 /// Whether LAN discovery + delivery is enabled (default off).
 #[no_mangle]
 pub extern "C" fn sideband_api_get_lan_enabled(profile_path: *const c_char) -> *mut c_char {
@@ -1011,6 +1043,7 @@ pub extern "C" fn sideband_api_add_contact(
                 blocked: false,
                 ratchet_active: false,
                 presence: String::new(),
+                status: String::new(),
             },
         )
     })())

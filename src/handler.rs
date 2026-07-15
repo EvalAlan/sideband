@@ -417,7 +417,14 @@ pub(crate) fn handle_presence(
     // "online" for an unbounded time. Stamp validity from OUR clock.
     let ttl = payload.ttl_ms.min(crate::PRESENCE_TTL_MS.saturating_mul(4)) as u128;
     let now = crate::now_ms_i64().unwrap_or(0).max(0) as u128;
-    note_contact_presence(profile, &msg.from, state, now + ttl, payload.seq)?;
+    note_contact_presence(
+        profile,
+        &msg.from,
+        state,
+        now + ttl,
+        payload.seq,
+        &payload.status,
+    )?;
     Ok(())
 }
 
