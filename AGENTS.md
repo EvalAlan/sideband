@@ -294,11 +294,13 @@ non-Tor fast paths yet (1:1 only). Full plan:
 **Open / backlog (roughly prioritized):**
 1. `flutter build apk --split-per-abi` option (current APK is a ~134 MB fat APK).
 2. Desktop file-transfer UI (currently TUI-only). Light theme.
-7. Live presence protocol (signed heartbeats) vs. the current activity/receipt-
-   derived `_isOnline` heuristic — **spec'd** as phase A7 in the plan
-   ([`docs/plans/2026-07-14-briar-like-transports-and-bridges.md`](docs/plans/2026-07-14-briar-like-transports-and-bridges.md)):
-   opt-in signed `presence` typed message, LAN/BT direct + Tor piggyback only (no
-   new Tor circuits), receiver-stamped TTL. Not yet implemented.
+7. Live presence protocol (signed heartbeats) — **A7-P1 DONE** (opt-in
+   `share_presence`, `presence` typed message + `handle_presence` +
+   `contact_presence` table, receiver-stamped TTL + seq guard, LAN/BT-only
+   heartbeat via `send_over_local_carrier` — never a Tor circuit; surfaced on the
+   contact list, GUI `_presenceState` prefers it over the heuristic). NEXT (P2):
+   Tor piggyback on outgoing messages, `away`/idle from app lifecycle, explicit
+   "bye" on shutdown. See the A7 spec in the plan.
 8. Delivery receipts for retried (offline-then-delivered) messages — see the
    fingerprint gap above; would need the retry to rewrite the row's fingerprint.
 3. Group per-message expiry override on the **mobile** FFI (contact overrides work
