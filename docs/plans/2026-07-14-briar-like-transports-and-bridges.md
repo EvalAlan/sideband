@@ -204,6 +204,83 @@ in A4.
   rendezvous addresses from a pre-shared secret and polling — Briar's BRP. Lower
   priority; the QR/`/add` flow already works.
 
+### A7. Live presence protocol (signed heartbeats) *(opt-in, default off)*
+
+**Why.** Today "online" is inferred from *observed* activity — a new inbound
+message or a delivery/read receipt within a 90s window (`_isOnline` in
+`gui/lib/main.dart`). That's honest but coarse: a contact who is online but not
+currently sending/reading shows offline. A real presence signal is an explicit,
+signed "I'm here" heartbeat. The hard constraint is **cost + metadata**: naively
+dialing every contact's onion on a timer builds a Tor circuit per contact and
+paints a regular connection pattern. The design below spends *zero new Tor
+circuits* for presence and stays opt-in.
+
+**Wire format.** A new signed + encrypted typed message `presence`, riding the
+exact path receipts use (`build_outbound_message(type="presence")` →
+`send_typed_message`; verified in a `handle_presence` in `handler.rs`). **No new
+signed `ChatMessage` field** (old clients keep verifying):
+```
+PresencePayload {
+  kind: "presence",
+  state: "online" | "away",   // "offline" is implicit: TTL expiry or an explicit bye
+  ttl_ms: u32,                // validity, e.g. 2–3× the heartbeat interval
+  seq:    u64,                // per-sender monotonic; receiver drops stale/reordered
+}
+```
+
+**Sending (a heartbeat scheduler in `serve`, gated on a `share_presence` setting,
+default off, and only while the listener is active):**
+- `state` = `online` when the app is foreground/recently active, `away` when
+  idle/backgrounded. On clean shutdown, best-effort send `away` (a "bye").
+- **Carrier policy — the whole point:**
+  - Contacts reachable on **LAN/BT** (fresh in `lan::PEERS` / an open RFCOMM
+    session): send the heartbeat directly. Local, ~free, no internet — this is
+    where presence is cheap, mirroring Briar's connection-derived presence.
+  - **Tor: never build a circuit just for presence.** Instead (a) *piggyback* —
+    set/refresh presence on any message/receipt you're already sending to that
+    contact; and (b) optionally, for contacts in an *active conversation* (recent
+    two-way traffic), a low-frequency Tor heartbeat only while a circuit is cheap.
+    A contact you never talk to over Tor simply never gets a Tor presence packet.
+- Heartbeat interval while online ≈ 60s (LAN/BT); Tor piggyback is event-driven.
+
+**Receiving (`handle_presence`):**
+- Verify signature + accepted-contact + not blocked; parse; **drop stale by
+  `seq`** (keep highest seen per contact).
+- Stamp `presence[contact] = { state, valid_until: now + ttl_ms }` using the
+  **receiver's** wall clock (immune to sender clock skew).
+- `online` while `now < valid_until && state == online`; `away` if `away`;
+  `offline` once expired. Emit a `TuiEvent`/listener status event so the GUI
+  updates immediately rather than on the next poll.
+
+**State + surfacing.** Keep an in-memory per-contact presence map in the core (a
+`LazyLock` like `lan::PEERS`, no DB needed — presence is ephemeral). Expose via a
+`sideband_api_presence` FFI / a `presence` status event / a CLI `presence` read.
+The GUI uses the authoritative signal when a contact shares presence and **falls
+back to the existing activity/receipt heuristic** (`_isOnline`) otherwise, so
+nothing regresses for contacts with presence off.
+
+**Privacy.** Enabling presence tells your contacts when you're online — a real
+metadata disclosure, so `share_presence` is **opt-in, default off**, E2E
+encrypted, and only to accepted contacts. Keep `away`/idle coarse (don't leak
+fine-grained activity). Surface the trade-off in the settings subtitle, like the
+read-receipts and LAN toggles.
+
+**Edge cases.** Clock skew handled by receiver-stamped `valid_until`. Reordering
+handled by `seq`. Multi-device (future): presence per device, union = online.
+Groups: out of scope initially (1:1 only).
+
+**Testing (no radios, like `src/interop.rs`).** A `presence` message marks a
+contact online with a TTL; expiry → offline; a lower `seq` is ignored; an
+unverified/blocked sender is dropped; a `state:"away"` renders away.
+
+**Phasing.**
+- P1: `presence` typed message + `handle_presence` + core state + GUI wiring, with
+  **LAN/BT direct + Tor piggyback only** (no new Tor circuits) + the opt-in
+  setting. This is the whole user-visible win at minimal cost.
+- P2: low-frequency active Tor heartbeat for in-conversation contacts; `away`/idle
+  states driven by app lifecycle; explicit bye on shutdown.
+- P3: presence as a first-class transport-registry consumer; multi-device.
+
 ### Also fix now (small): Android LAN multicast lock
 - Even for the current beacon, Android needs a `WifiManager` multicast/broadcast
   lock for UDP to work. (Moot if A1 removes the broadcast, but note it.)
