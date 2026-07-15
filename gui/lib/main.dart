@@ -2485,6 +2485,10 @@ class _ChatScreenState extends State<_ChatScreen>
   static const Duration _onlineWindow = Duration(seconds: 90);
   final Map<String, DateTime> _lastSeen = {};
   final Map<String, DateTime> _lastPresence = {};
+  // Most-recently-used emojis (front = newest), persisted to the profile dir so
+  // they survive restarts. Loaded lazily the first time the picker opens.
+  final List<String> _recentEmojis = [];
+  bool _recentsLoaded = false;
   final Map<String, ChatMsg> _lastMsg = {};
   // Outbound message ids already counted as a delivery/read receipt, so a receipt
   // observed after startup stamps presence exactly once (seeded at load so
@@ -7621,6 +7625,163 @@ class _ChatScreenState extends State<_ChatScreen>
     ],
   };
 
+  // Search keywords for the most-looked-up emojis. Emojis without an entry are
+  // still findable by their category name (e.g. "food", "travel").
+  static const Map<String, List<String>> _emojiKeywords = {
+    '😀': ['smile', 'happy', 'grin'],
+    '😁': ['grin', 'smile', 'happy'],
+    '😂': ['laugh', 'lol', 'joy', 'tears', 'funny'],
+    '🤣': ['rofl', 'laugh', 'lol', 'funny'],
+    '😊': ['smile', 'happy', 'blush'],
+    '😇': ['angel', 'innocent', 'halo'],
+    '🙂': ['smile', 'slight'],
+    '😉': ['wink'],
+    '😍': ['love', 'heart', 'eyes', 'crush'],
+    '🥰': ['love', 'hearts', 'adore'],
+    '😘': ['kiss', 'love', 'blow'],
+    '😗': ['kiss'],
+    '😜': ['tongue', 'wink', 'silly'],
+    '😛': ['tongue', 'silly'],
+    '🤪': ['crazy', 'goofy', 'silly'],
+    '🤨': ['skeptical', 'eyebrow', 'suspicious'],
+    '😎': ['cool', 'sunglasses', 'awesome'],
+    '🤓': ['nerd', 'geek', 'glasses'],
+    '🧐': ['monocle', 'inspect', 'thinking'],
+    '😏': ['smirk', 'smug'],
+    '😒': ['unamused', 'meh'],
+    '😞': ['sad', 'disappointed'],
+    '😔': ['sad', 'pensive'],
+    '😢': ['cry', 'sad', 'tear'],
+    '😭': ['cry', 'sob', 'sad', 'bawl'],
+    '😤': ['angry', 'frustrated', 'steam'],
+    '😠': ['angry', 'mad'],
+    '😡': ['angry', 'mad', 'rage', 'red'],
+    '🤬': ['swear', 'curse', 'angry'],
+    '🤯': ['mind', 'blown', 'shock'],
+    '😱': ['scream', 'shock', 'fear'],
+    '😨': ['fear', 'scared'],
+    '😰': ['anxious', 'sweat', 'nervous'],
+    '😳': ['flushed', 'embarrassed', 'shock'],
+    '🥵': ['hot', 'heat', 'sweat'],
+    '🥶': ['cold', 'freeze', 'freezing'],
+    '😴': ['sleep', 'tired', 'zzz'],
+    '😪': ['sleepy', 'tired'],
+    '🤢': ['sick', 'nausea', 'gross'],
+    '🤮': ['vomit', 'sick', 'puke'],
+    '🤧': ['sneeze', 'sick', 'sick'],
+    '😷': ['mask', 'sick', 'ill'],
+    '🤒': ['sick', 'fever', 'ill'],
+    '🤕': ['hurt', 'bandage', 'injured'],
+    '🥳': ['party', 'celebrate', 'birthday'],
+    '🤔': ['think', 'thinking', 'hmm'],
+    '🤗': ['hug', 'hugs'],
+    '🙄': ['eyeroll', 'roll', 'annoyed'],
+    '😬': ['grimace', 'awkward', 'nervous'],
+    '🤥': ['lie', 'liar', 'pinocchio'],
+    '😶': ['blank', 'speechless', 'silent'],
+    '😐': ['neutral', 'meh', 'blank'],
+    '🥺': ['pleading', 'puppy', 'beg', 'cute'],
+    '💀': ['skull', 'dead', 'death'],
+    '👻': ['ghost', 'boo', 'spooky'],
+    '👽': ['alien', 'ufo'],
+    '🤖': ['robot', 'bot'],
+    '💩': ['poop', 'poo', 'crap'],
+    '👍': ['thumbsup', 'yes', 'ok', 'like', 'approve'],
+    '👎': ['thumbsdown', 'no', 'dislike'],
+    '👌': ['ok', 'okay', 'perfect'],
+    '✌️': ['peace', 'victory'],
+    '🤞': ['crossed', 'luck', 'hope'],
+    '🤟': ['loveyou', 'rock'],
+    '🤘': ['rock', 'metal', 'horns'],
+    '👋': ['wave', 'hi', 'hello', 'bye'],
+    '🙏': ['pray', 'thanks', 'please', 'namaste'],
+    '👏': ['clap', 'applause', 'bravo'],
+    '🙌': ['raise', 'hooray', 'celebrate'],
+    '💪': ['muscle', 'strong', 'flex', 'gym'],
+    '✊': ['fist', 'power'],
+    '👊': ['punch', 'fist', 'bump'],
+    '🤝': ['handshake', 'deal', 'agree'],
+    '❤️': ['heart', 'love', 'red'],
+    '🧡': ['heart', 'orange'],
+    '💛': ['heart', 'yellow'],
+    '💚': ['heart', 'green'],
+    '💙': ['heart', 'blue'],
+    '💜': ['heart', 'purple'],
+    '🖤': ['heart', 'black'],
+    '🤍': ['heart', 'white'],
+    '💔': ['heartbreak', 'broken', 'heart', 'sad'],
+    '💕': ['hearts', 'love'],
+    '💯': ['hundred', 'perfect', 'score', '100'],
+    '🔥': ['fire', 'lit', 'hot', 'flame'],
+    '⭐': ['star', 'favorite'],
+    '✨': ['sparkle', 'shiny', 'magic'],
+    '🎉': ['party', 'celebrate', 'tada', 'congrats'],
+    '🎊': ['confetti', 'party', 'celebrate'],
+    '🎂': ['cake', 'birthday'],
+    '🎁': ['gift', 'present', 'birthday'],
+    '👀': ['eyes', 'look', 'watch'],
+    '🐶': ['dog', 'puppy'],
+    '🐱': ['cat', 'kitten'],
+    '🦊': ['fox'],
+    '🐻': ['bear'],
+    '🐼': ['panda'],
+    '🦁': ['lion'],
+    '🐷': ['pig'],
+    '🐸': ['frog'],
+    '🐵': ['monkey'],
+    '🐔': ['chicken'],
+    '🦄': ['unicorn'],
+    '🐝': ['bee', 'honey'],
+    '🦋': ['butterfly'],
+    '🌸': ['flower', 'blossom', 'cherry'],
+    '🌹': ['rose', 'flower'],
+    '🌻': ['sunflower', 'flower'],
+    '🌈': ['rainbow', 'pride'],
+    '☀️': ['sun', 'sunny', 'weather'],
+    '🌙': ['moon', 'night'],
+    '⛄': ['snowman', 'snow', 'winter'],
+    '🍎': ['apple', 'fruit'],
+    '🍕': ['pizza', 'food'],
+    '🍔': ['burger', 'hamburger', 'food'],
+    '🍟': ['fries', 'food'],
+    '🌮': ['taco', 'food'],
+    '🍣': ['sushi', 'food'],
+    '🍦': ['icecream', 'dessert'],
+    '🍩': ['donut', 'doughnut', 'dessert'],
+    '🍪': ['cookie', 'dessert'],
+    '☕': ['coffee', 'tea', 'drink'],
+    '🍺': ['beer', 'drink'],
+    '🍷': ['wine', 'drink'],
+    '⚽': ['soccer', 'football', 'ball'],
+    '🏀': ['basketball', 'ball'],
+    '🏈': ['football', 'ball'],
+    '⚾': ['baseball', 'ball'],
+    '🎾': ['tennis', 'ball'],
+    '🎮': ['game', 'gaming', 'controller'],
+    '🎲': ['dice', 'game'],
+    '🎵': ['music', 'note'],
+    '🎸': ['guitar', 'music'],
+    '🚗': ['car', 'auto'],
+    '✈️': ['plane', 'airplane', 'flight', 'travel'],
+    '🚀': ['rocket', 'launch', 'space'],
+    '🏠': ['house', 'home'],
+    '💻': ['laptop', 'computer'],
+    '📱': ['phone', 'mobile', 'cell'],
+    '💰': ['money', 'cash', 'bag'],
+    '💡': ['idea', 'light', 'bulb'],
+    '🔑': ['key', 'lock', 'password'],
+    '🔒': ['lock', 'secure', 'private'],
+    '✅': ['check', 'yes', 'done', 'ok'],
+    '❌': ['x', 'no', 'wrong', 'cross'],
+    '❓': ['question', 'help'],
+    '❗': ['exclamation', 'warning', 'important'],
+    '⚠️': ['warning', 'caution', 'alert'],
+    '🚩': ['flag', 'report'],
+    '💬': ['chat', 'speech', 'message', 'talk'],
+    '👉': ['point', 'right'],
+    '👈': ['point', 'left'],
+  };
+
   void _insertEmoji(String emoji) {
     final sel = _input.selection;
     final text = _input.text;
@@ -7631,9 +7792,99 @@ class _ChatScreenState extends State<_ChatScreen>
       text: newText,
       selection: TextSelection.collapsed(offset: start + emoji.length),
     );
+    _noteRecentEmoji(emoji);
   }
 
-  void _showEmojiPicker() {
+  File _recentEmojiFile() =>
+      File('${_expandedProfilePath()}/recent_emojis.json');
+
+  Future<void> _loadRecentEmojis() async {
+    if (_recentsLoaded) return;
+    _recentsLoaded = true;
+    try {
+      final f = _recentEmojiFile();
+      if (await f.exists()) {
+        final decoded = jsonDecode(await f.readAsString());
+        if (decoded is List) {
+          _recentEmojis
+            ..clear()
+            ..addAll(decoded.whereType<String>().take(_maxRecentEmojis));
+        }
+      }
+    } catch (_) {
+      // Recents are a convenience; a missing/corrupt file is not an error.
+    }
+  }
+
+  static const int _maxRecentEmojis = 24;
+
+  void _noteRecentEmoji(String emoji) {
+    _recentEmojis.remove(emoji);
+    _recentEmojis.insert(0, emoji);
+    if (_recentEmojis.length > _maxRecentEmojis) {
+      _recentEmojis.removeRange(_maxRecentEmojis, _recentEmojis.length);
+    }
+    unawaited(_saveRecentEmojis());
+  }
+
+  Future<void> _saveRecentEmojis() async {
+    try {
+      final f = _recentEmojiFile();
+      await f.parent.create(recursive: true);
+      await f.writeAsString(jsonEncode(_recentEmojis), flush: true);
+    } catch (_) {
+      // Best-effort persistence.
+    }
+  }
+
+  /// All emojis that match `query` (case-insensitive), searched by keyword and
+  /// by the category name they live under.
+  List<String> _searchEmojis(String query) {
+    final q = query.trim().toLowerCase();
+    if (q.isEmpty) return const [];
+    final seen = <String>{};
+    final out = <String>[];
+    for (final entry in _emojiSections.entries) {
+      final categoryMatch = entry.key.toLowerCase().contains(q);
+      for (final emoji in entry.value) {
+        if (seen.contains(emoji)) continue;
+        final keywords = _emojiKeywords[emoji];
+        final keywordMatch = keywords != null && keywords.any((k) => k.contains(q));
+        if (categoryMatch || keywordMatch) {
+          seen.add(emoji);
+          out.add(emoji);
+        }
+      }
+    }
+    return out;
+  }
+
+  // A single tappable emoji cell. `onTap` lets the picker refresh its Recent
+  // row after an insert.
+  Widget _emojiCell(String emoji, VoidCallback onTap) {
+    return Material(
+      color: _t.surface2,
+      borderRadius: BorderRadius.circular(6),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: onTap,
+        child: SizedBox(
+          width: 36,
+          height: 34,
+          child: Center(
+            child: Text(emoji,
+                style:
+                    const TextStyle(fontSize: 20, fontFamily: 'SidebandEmoji')),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showEmojiPicker() async {
+    await _loadRecentEmojis();
+    if (!mounted) return;
+    final search = TextEditingController();
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: _t.surface,
@@ -7642,98 +7893,157 @@ class _ChatScreenState extends State<_ChatScreen>
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
-        return SafeArea(
-          child: Padding(
-            padding: EdgeInsets.only(
-              bottom: MediaQuery.of(ctx).viewInsets.bottom,
-            ),
-            child: SizedBox(
-              width: 400,
-              height: 340,
+        return StatefulBuilder(
+          builder: (ctx, setSheet) {
+            final query = search.text.trim();
+            // Tapping keeps the picker open (close with ✕) and refreshes the
+            // Recent row.
+            void onTapEmoji(String emoji) {
+              _insertEmoji(emoji);
+              setSheet(() {});
+            }
+
+            Widget body;
+            if (query.isNotEmpty) {
+              final results = _searchEmojis(query);
+              body = results.isEmpty
+                  ? Center(
+                      child: Text('No emoji found',
+                          style: TextStyle(color: _t.textDim, fontSize: 12)))
+                  : ListView(
+                      children: [_searchResultsGrid(results, onTapEmoji)]);
+            } else {
+              body = ListView(children: [
+                if (_recentEmojis.isNotEmpty)
+                  _emojiSectionTap('Recent', _recentEmojis, onTapEmoji),
+                ..._emojiSections.entries
+                    .map((e) => _emojiSectionTap(e.key, e.value, onTapEmoji)),
+              ]);
+            }
+
+            return SafeArea(
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
+                padding:
+                    EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+                child: SizedBox(
+                  width: 400,
+                  height: 380,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Icon(Icons.emoji_emotions_outlined,
-                            size: 16, color: _t.primary),
-                        const SizedBox(width: 6),
-                        Text('Emoji',
-                            style: TextStyle(
-                                color: _t.text,
-                                fontWeight: FontWeight.w700,
-                                fontSize: 12)),
-                        const Spacer(),
-                        IconButton(
-                          icon: const Icon(Icons.close, size: 16),
-                          onPressed: () => Navigator.pop(ctx),
-                          constraints:
-                              const BoxConstraints(minWidth: 28, minHeight: 28),
-                          padding: EdgeInsets.zero,
+                        Row(
+                          children: [
+                            Icon(Icons.emoji_emotions_outlined,
+                                size: 16, color: _t.primary),
+                            const SizedBox(width: 6),
+                            Text('Emoji',
+                                style: TextStyle(
+                                    color: _t.text,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 12)),
+                            const Spacer(),
+                            IconButton(
+                              icon: const Icon(Icons.close, size: 16),
+                              onPressed: () => Navigator.pop(ctx),
+                              constraints: const BoxConstraints(
+                                  minWidth: 28, minHeight: 28),
+                              padding: EdgeInsets.zero,
+                            ),
+                          ],
                         ),
+                        const SizedBox(height: 6),
+                        SizedBox(
+                          height: 34,
+                          child: TextField(
+                            controller: search,
+                            onChanged: (_) => setSheet(() {}),
+                            style: TextStyle(color: _t.text, fontSize: 13),
+                            decoration: InputDecoration(
+                              isDense: true,
+                              filled: true,
+                              fillColor: _t.surface2,
+                              hintText: 'Search emoji',
+                              hintStyle:
+                                  TextStyle(color: _t.textDim, fontSize: 13),
+                              prefixIcon: Icon(Icons.search,
+                                  size: 16, color: _t.textDim),
+                              prefixIconConstraints: const BoxConstraints(
+                                  minWidth: 32, minHeight: 32),
+                              suffixIcon: query.isEmpty
+                                  ? null
+                                  : IconButton(
+                                      icon: const Icon(Icons.clear, size: 14),
+                                      onPressed: () {
+                                        search.clear();
+                                        setSheet(() {});
+                                      },
+                                      constraints: const BoxConstraints(
+                                          minWidth: 28, minHeight: 28),
+                                      padding: EdgeInsets.zero,
+                                    ),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                borderSide: BorderSide.none,
+                              ),
+                              contentPadding: const EdgeInsets.symmetric(
+                                  vertical: 0, horizontal: 8),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Expanded(child: body),
                       ],
                     ),
-                    const SizedBox(height: 4),
-                    Expanded(
-                      child: ListView(
-                        children: _emojiSections.entries.map((entry) {
-                          return Padding(
-                            padding: const EdgeInsets.only(top: 8),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Padding(
-                                  padding:
-                                      const EdgeInsets.only(left: 4, bottom: 4),
-                                  child: Text(entry.key,
-                                      style: TextStyle(
-                                          color: _t.textDim,
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.w700,
-                                          letterSpacing: 0.3)),
-                                ),
-                                Wrap(
-                                  spacing: 4,
-                                  runSpacing: 4,
-                                  children: entry.value.map((emoji) {
-                                    return Material(
-                                      color: _t.surface2,
-                                      borderRadius: BorderRadius.circular(6),
-                                      child: InkWell(
-                                        borderRadius: BorderRadius.circular(6),
-                                        // Keep the picker open so several emojis
-                                        // can be inserted (close with the ✕).
-                                        onTap: () => _insertEmoji(emoji),
-                                        child: SizedBox(
-                                          width: 36,
-                                          height: 34,
-                                          child: Center(
-                                            child: Text(emoji,
-                                                style: const TextStyle(
-                                                    fontSize: 20,
-                                                    fontFamily:
-                                                        'SidebandEmoji')),
-                                          ),
-                                        ),
-                                      ),
-                                    );
-                                  }).toList(growable: false),
-                                ),
-                              ],
-                            ),
-                          );
-                        }).toList(growable: false),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
               ),
-            ),
-          ),
+            );
+          },
         );
       },
+    ).whenComplete(search.dispose);
+  }
+
+  Widget _searchResultsGrid(List<String> emojis, void Function(String) onTap) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Wrap(
+        spacing: 4,
+        runSpacing: 4,
+        children: emojis
+            .map((e) => _emojiCell(e, () => onTap(e)))
+            .toList(growable: false),
+      ),
+    );
+  }
+
+  Widget _emojiSectionTap(
+      String title, List<String> emojis, void Function(String) onTap) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 4, bottom: 4),
+            child: Text(title,
+                style: TextStyle(
+                    color: _t.textDim,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.3)),
+          ),
+          Wrap(
+            spacing: 4,
+            runSpacing: 4,
+            children: emojis
+                .map((e) => _emojiCell(e, () => onTap(e)))
+                .toList(growable: false),
+          ),
+        ],
+      ),
     );
   }
 
