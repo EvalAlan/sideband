@@ -485,6 +485,134 @@ class _History {
   final String bin;
 }
 
+// ── Beeper-style bridges ─────────────────────────────────────────────────────
+
+/// A configured bridge account (a connection to a non-Sideband network).
+class BridgeAccount {
+  const BridgeAccount({
+    required this.id,
+    required this.network,
+    required this.displayName,
+    required this.status,
+    required this.enabled,
+  });
+
+  final String id;
+  final String network;
+  final String displayName;
+  final String status; // disconnected | connecting | connected | error
+  final bool enabled;
+
+  bool get connected => status == 'connected';
+
+  factory BridgeAccount.fromJson(Map<dynamic, dynamic> m) => BridgeAccount(
+        id: m['id']?.toString() ?? '',
+        network: m['network']?.toString() ?? '',
+        displayName: m['display_name']?.toString() ?? '',
+        status: m['status']?.toString() ?? 'disconnected',
+        enabled: m['enabled'] == true,
+      );
+}
+
+/// A bridged conversation (a chat/room/DM on a non-Sideband network). Never a
+/// cryptographic Sideband contact — always shown as *not* end-to-end private.
+class BridgeConversation {
+  const BridgeConversation({
+    required this.id,
+    required this.accountId,
+    required this.network,
+    required this.remoteId,
+    required this.title,
+    required this.avatarRef,
+    required this.kind,
+    required this.lastActivityMs,
+    required this.unread,
+  });
+
+  final String id;
+  final String accountId;
+  final String network;
+  final String remoteId;
+  final String title;
+  final String avatarRef;
+  final String kind;
+  final int lastActivityMs;
+  final int unread;
+
+  factory BridgeConversation.fromJson(Map<dynamic, dynamic> m) =>
+      BridgeConversation(
+        id: m['id']?.toString() ?? '',
+        accountId: m['account_id']?.toString() ?? '',
+        network: m['network']?.toString() ?? '',
+        remoteId: m['remote_id']?.toString() ?? '',
+        title: m['title']?.toString() ?? '',
+        avatarRef: m['avatar_ref']?.toString() ?? '',
+        kind: m['kind']?.toString() ?? 'dm',
+        lastActivityMs: (m['last_activity_ms'] as num?)?.toInt() ?? 0,
+        unread: (m['unread'] as num?)?.toInt() ?? 0,
+      );
+}
+
+/// Parse a bridged message row (from the CLI `bridge history --json`, whose
+/// `status` is an int, or the FFI, whose `status` is already a label) into the
+/// shared ChatMsg model.
+ChatMsg chatMsgFromBridgeJson(Map<dynamic, dynamic> item) {
+  const labels = ['sent', 'delivered', 'failed', 'read'];
+  final s = item['status'];
+  final statusLabel = s is num
+      ? labels[s.toInt().clamp(0, labels.length - 1)]
+      : (s?.toString() ?? 'sent');
+  return ChatMsg(
+    id: (item['id'] as num?)?.toInt() ?? 0,
+    direction: item['direction']?.toString() ?? 'in',
+    status: statusLabel,
+    contact: item['contact']?.toString() ?? '',
+    group: '',
+    text: item['body']?.toString() ?? '',
+    tsMs: (item['timestamp_ms'] as num?)?.toInt() ?? 0,
+  );
+}
+
+/// Visual identity (icon, accent colour, label) for a bridge network id. Uses
+/// Material icons as neutral placeholders — no third-party brand assets.
+class NetworkStyle {
+  const NetworkStyle(this.icon, this.color, this.label);
+  final IconData icon;
+  final Color color;
+  final String label;
+}
+
+NetworkStyle networkStyle(String network) {
+  switch (network) {
+    case 'native':
+    case 'sideband':
+      return const NetworkStyle(Icons.shield_outlined, Color(0xFF6C63FF), 'Sideband');
+    case 'telegram':
+      return const NetworkStyle(Icons.send, Color(0xFF29A9EB), 'Telegram');
+    case 'discord':
+      return const NetworkStyle(Icons.forum, Color(0xFF5865F2), 'Discord');
+    case 'googlechat':
+    case 'gchat':
+      return const NetworkStyle(Icons.chat, Color(0xFF1A73E8), 'Google Chat');
+    case 'messenger':
+    case 'meta':
+      return const NetworkStyle(Icons.chat_bubble, Color(0xFF0084FF), 'Messenger');
+    case 'whatsapp':
+      return const NetworkStyle(Icons.chat_bubble_outline, Color(0xFF25D366), 'WhatsApp');
+    case 'signal':
+      return const NetworkStyle(Icons.lock_outline, Color(0xFF3A76F0), 'Signal');
+    case 'slack':
+      return const NetworkStyle(Icons.tag, Color(0xFF4A154B), 'Slack');
+    case 'matrix':
+      return const NetworkStyle(Icons.hub, Color(0xFF0DBD8B), 'Matrix');
+    case 'demo':
+      return const NetworkStyle(Icons.smart_toy_outlined, Color(0xFFED8936), 'Demo');
+    default:
+      return NetworkStyle(Icons.hub_outlined, const Color(0xFF9AA0A6),
+          network.isEmpty ? 'Bridge' : network);
+  }
+}
+
 class ParsedGroupPayload {
   const ParsedGroupPayload({
     required this.groupId,
@@ -1166,6 +1294,114 @@ class _Cli {
         ['send', '--profile', profile, '--to', to, '--message', message]);
   }
 
+  // ── Beeper-style bridges (desktop: shells out to `sideband bridge …`) ──────
+
+  Future<List<BridgeAccount>> bridgeAccounts() async {
+    final raw = await _run(['bridge', 'list', '--profile', profile, '--json']);
+    if (raw.trim().isEmpty) return [];
+    final decoded = jsonDecode(raw);
+    if (decoded is! List) return [];
+    return decoded
+        .whereType<Map>()
+        .map((m) => BridgeAccount.fromJson(m))
+        .toList();
+  }
+
+  Future<List<BridgeConversation>> bridgeConversations() async {
+    final raw = await _run(
+        ['bridge', 'conversations', '--profile', profile, '--json']);
+    if (raw.trim().isEmpty) return [];
+    final decoded = jsonDecode(raw);
+    if (decoded is! List) return [];
+    return decoded
+        .whereType<Map>()
+        .map((m) => BridgeConversation.fromJson(m))
+        .toList();
+  }
+
+  Future<List<ChatMsg>> bridgeMessages(String conversationId,
+      {int limit = 200}) async {
+    final raw = await _run([
+      'bridge',
+      'history',
+      '--profile',
+      profile,
+      '--conversation',
+      conversationId,
+      '--limit',
+      '$limit',
+      '--json'
+    ]);
+    if (raw.trim().isEmpty) return [];
+    final decoded = jsonDecode(raw);
+    if (decoded is! List) return [];
+    return decoded.whereType<Map>().map(chatMsgFromBridgeJson).toList();
+  }
+
+  Future<void> bridgeSend(String conversationId, String text) async {
+    await _run([
+      'bridge',
+      'send',
+      '--profile',
+      profile,
+      '--conversation',
+      conversationId,
+      '--message',
+      text
+    ]);
+  }
+
+  Future<void> addBridgeAccount({
+    required String id,
+    required String network,
+    required String name,
+    required String config,
+    required bool enable,
+  }) async {
+    final args = [
+      'bridge',
+      'add',
+      '--profile',
+      profile,
+      '--id',
+      id,
+      '--network',
+      network,
+      '--name',
+      name,
+      '--config',
+      config,
+    ];
+    if (enable) args.add('--enable');
+    await _run(args);
+  }
+
+  Future<void> setBridgeEnabled(String id, bool enabled) async {
+    await _run([
+      'bridge',
+      enabled ? 'enable' : 'disable',
+      '--profile',
+      profile,
+      '--id',
+      id
+    ]);
+  }
+
+  Future<void> deleteBridgeAccount(String id) async {
+    await _run(['bridge', 'delete', '--profile', profile, '--id', id]);
+  }
+
+  Future<void> markBridgeRead(String conversationId) async {
+    await _run([
+      'bridge',
+      'read',
+      '--profile',
+      profile,
+      '--conversation',
+      conversationId
+    ]);
+  }
+
   /// Per-conversation default disappearing timer in ms (0 = off). `kind` is
   /// 'contact' or 'group'; `id` is the contact name or group id.
   Future<int> getConversationExpiry(
@@ -1305,6 +1541,21 @@ typedef _NativePtr3Bool = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Bool);
 typedef _Ptr3Bool = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, bool);
+// 2 strings + an int (e.g. list_bridge_messages: profile, conversation, limit).
+typedef _NativePtrPPI = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.UintPtr);
+typedef _PtrPPI = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int);
+// 2 strings + a bool (e.g. set_bridge_enabled: profile, id, enabled).
+typedef _NativePtr2Bool = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Bool);
+typedef _Ptr2Bool = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, bool);
+// 5 strings + a bool (add_bridge_account: profile, id, network, name, config, enabled).
+typedef _NativePtr5Bool = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Bool);
+typedef _Ptr5Bool = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, bool);
 
 class _MobileApi {
   _MobileApi()
@@ -1622,6 +1873,29 @@ class _MobileApi {
   _Ptr2 get _resumeTransfer => _lookup2('sideband_api_resume_transfer');
   _Ptr2 get _cancelTransfer => _lookup2('sideband_api_cancel_transfer');
 
+  // ── Beeper-style bridges (Android: FFI into libsideband.so) ────────────────
+  _Ptr1 get _listBridgeAccounts =>
+      _lookup1('sideband_api_list_bridge_accounts');
+  _Ptr2 get _listBridgeConversations =>
+      _lookup2('sideband_api_list_bridge_conversations');
+  _PtrPPI get _listBridgeMessages => _resolve<_PtrPPI>(
+      'sideband_api_list_bridge_messages',
+      () => _lib.lookupFunction<_NativePtrPPI, _PtrPPI>(
+          'sideband_api_list_bridge_messages'));
+  _Ptr3 get _sendBridgeMessage => _lookup3('sideband_api_send_bridge_message');
+  _Ptr5Bool get _addBridgeAccount => _resolve<_Ptr5Bool>(
+      'sideband_api_add_bridge_account',
+      () => _lib.lookupFunction<_NativePtr5Bool, _Ptr5Bool>(
+          'sideband_api_add_bridge_account'));
+  _Ptr2Bool get _setBridgeEnabled => _resolve<_Ptr2Bool>(
+      'sideband_api_set_bridge_enabled',
+      () => _lib.lookupFunction<_NativePtr2Bool, _Ptr2Bool>(
+          'sideband_api_set_bridge_enabled'));
+  _Ptr2 get _deleteBridgeAccount =>
+      _lookup2('sideband_api_delete_bridge_account');
+  _Ptr2 get _markBridgeRead =>
+      _lookup2('sideband_api_mark_bridge_conversation_read');
+
   String? _profilePath;
 
   Future<String> profilePath() async {
@@ -1675,8 +1949,107 @@ class _MobileApi {
     }
   }
 
+  R _withCString3<R>(
+      String a,
+      String b,
+      String c,
+      ffi.Pointer<Utf8> Function(
+              ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+          call) {
+    final ca = a.toNativeUtf8();
+    final cb = b.toNativeUtf8();
+    final cc = c.toNativeUtf8();
+    try {
+      return _decode<R>(call(ca, cb, cc));
+    } finally {
+      calloc.free(ca);
+      calloc.free(cb);
+      calloc.free(cc);
+    }
+  }
+
   Future<void> initProfile(String displayName) async {
     _withCString2<Object?>(await profilePath(), displayName, _initProfile);
+  }
+
+  // ── Beeper-style bridges (Android) ─────────────────────────────────────────
+
+  Future<List<BridgeAccount>> bridgeAccounts() async {
+    final raw = _withCString1<List<dynamic>>(
+        await profilePath(), _listBridgeAccounts);
+    return raw.whereType<Map>().map((m) => BridgeAccount.fromJson(m)).toList();
+  }
+
+  Future<List<BridgeConversation>> bridgeConversations() async {
+    final raw = _withCString2<List<dynamic>>(
+        await profilePath(), '', _listBridgeConversations);
+    return raw
+        .whereType<Map>()
+        .map((m) => BridgeConversation.fromJson(m))
+        .toList();
+  }
+
+  Future<List<ChatMsg>> bridgeMessages(String conversationId,
+      {int limit = 200}) async {
+    final p = await profilePath();
+    final ca = p.toNativeUtf8();
+    final cb = conversationId.toNativeUtf8();
+    try {
+      final raw =
+          _decode<List<dynamic>>(_listBridgeMessages(ca, cb, limit));
+      return raw.whereType<Map>().map(chatMsgFromBridgeJson).toList();
+    } finally {
+      calloc.free(ca);
+      calloc.free(cb);
+    }
+  }
+
+  Future<void> bridgeSend(String conversationId, String text) async {
+    _withCString3<Object?>(
+        await profilePath(), conversationId, text, _sendBridgeMessage);
+  }
+
+  Future<void> addBridgeAccount({
+    required String id,
+    required String network,
+    required String name,
+    required String config,
+    required bool enable,
+  }) async {
+    final p = (await profilePath()).toNativeUtf8();
+    final ci = id.toNativeUtf8();
+    final cn = network.toNativeUtf8();
+    final cm = name.toNativeUtf8();
+    final cc = config.toNativeUtf8();
+    try {
+      _decode<Object?>(_addBridgeAccount(p, ci, cn, cm, cc, enable));
+    } finally {
+      calloc.free(p);
+      calloc.free(ci);
+      calloc.free(cn);
+      calloc.free(cm);
+      calloc.free(cc);
+    }
+  }
+
+  Future<void> setBridgeEnabled(String id, bool enabled) async {
+    final p = (await profilePath()).toNativeUtf8();
+    final ci = id.toNativeUtf8();
+    try {
+      _decode<Object?>(_setBridgeEnabled(p, ci, enabled));
+    } finally {
+      calloc.free(p);
+      calloc.free(ci);
+    }
+  }
+
+  Future<void> deleteBridgeAccount(String id) async {
+    _withCString2<Object?>(await profilePath(), id, _deleteBridgeAccount);
+  }
+
+  Future<void> markBridgeRead(String conversationId) async {
+    _withCString2<Object?>(
+        await profilePath(), conversationId, _markBridgeRead);
   }
 
   Future<Map<String, dynamic>> status() async {
@@ -2454,6 +2827,15 @@ class _ChatScreenState extends State<_ChatScreen>
   final List<ChatMsg> _pendingMsgs = [];
   Contact? _sel;
   GroupInfo? _selGroup;
+  // Beeper-style bridges. `_selectedNetwork` is the provider-rail filter:
+  // 'all' (unified inbox), 'native' (Sideband only), or a bridge account id.
+  // `_selBridge` is the open bridged conversation (mutually exclusive with
+  // `_sel`/`_selGroup`); `_bridgeMsgs` is its loaded history.
+  List<BridgeAccount> _bridgeAccounts = [];
+  List<BridgeConversation> _bridgeConvos = [];
+  String _selectedNetwork = 'all';
+  BridgeConversation? _selBridge;
+  List<ChatMsg> _bridgeMsgs = [];
   // Disappearing messages. `_convExpiryMs` is the loaded per-conversation default
   // (0 = off). `_msgExpireOverrideMs` is a one-shot per-message override: null =
   // use the default, 0 = off for this message, >0 = TTL ms. `_expiryLoadedFor`
@@ -3893,6 +4275,141 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  // ── Beeper-style bridges (State) ───────────────────────────────────────────
+
+  bool get _mobileBackend => _canUseMobileBackend && _mobile != null;
+
+  /// Refresh bridge accounts + conversations (and the open bridged chat).
+  Future<void> _loadBridges() async {
+    try {
+      final accts = _mobileBackend
+          ? await _mobile!.bridgeAccounts()
+          : await _cli.bridgeAccounts();
+      final convos = _mobileBackend
+          ? await _mobile!.bridgeConversations()
+          : await _cli.bridgeConversations();
+      if (!mounted) return;
+      setState(() {
+        _bridgeAccounts = accts;
+        _bridgeConvos = convos;
+        final sb = _selBridge;
+        if (sb != null) {
+          final idx = convos.indexWhere((x) => x.id == sb.id);
+          if (idx >= 0) _selBridge = convos[idx];
+        }
+        // If the selected network's account went away, fall back to All Chats.
+        if (_selectedNetwork != 'all' &&
+            _selectedNetwork != 'native' &&
+            !accts.any((a) => a.id == _selectedNetwork)) {
+          _selectedNetwork = 'all';
+        }
+      });
+      if (_selBridge != null) await _loadBridgeMessages(_selBridge!);
+    } catch (_) {
+      // Bridges are optional; never let them break the native refresh.
+    }
+  }
+
+  Future<void> _loadBridgeMessages(BridgeConversation conv) async {
+    try {
+      final msgs = _mobileBackend
+          ? await _mobile!.bridgeMessages(conv.id)
+          : await _cli.bridgeMessages(conv.id);
+      if (!mounted) return;
+      setState(() => _bridgeMsgs = msgs);
+      _scrollToBottom();
+    } catch (_) {}
+  }
+
+  Future<void> _openBridgeConversation(BridgeConversation conv) async {
+    setState(() {
+      _sel = null;
+      _selGroup = null;
+      _selBridge = conv;
+      _bridgeMsgs = [];
+    });
+    await _loadBridgeMessages(conv);
+    try {
+      if (_mobileBackend) {
+        await _mobile!.markBridgeRead(conv.id);
+      } else {
+        await _cli.markBridgeRead(conv.id);
+      }
+    } catch (_) {}
+    unawaited(_loadBridges());
+  }
+
+  Future<void> _sendToBridge(String text) async {
+    final conv = _selBridge;
+    final t = text.trim();
+    if (conv == null || t.isEmpty) return;
+    _input.clear();
+    try {
+      if (_mobileBackend) {
+        await _mobile!.bridgeSend(conv.id, t);
+      } else {
+        await _cli.bridgeSend(conv.id, t);
+      }
+      await _loadBridgeMessages(conv);
+    } catch (e) {
+      _snack('Bridge send failed: $e');
+    }
+  }
+
+  Future<void> _createBridgeAccount({
+    required String id,
+    required String network,
+    required String name,
+    required String config,
+    required bool enable,
+  }) async {
+    try {
+      if (_mobileBackend) {
+        await _mobile!.addBridgeAccount(
+            id: id, network: network, name: name, config: config, enable: enable);
+      } else {
+        await _cli.addBridgeAccount(
+            id: id, network: network, name: name, config: config, enable: enable);
+      }
+      _snack('Bridge "$name" added');
+      await _loadBridges();
+    } catch (e) {
+      _snack('Add bridge failed: $e');
+    }
+  }
+
+  Future<void> _toggleBridgeAccount(BridgeAccount a, bool enabled) async {
+    try {
+      if (_mobileBackend) {
+        await _mobile!.setBridgeEnabled(a.id, enabled);
+      } else {
+        await _cli.setBridgeEnabled(a.id, enabled);
+      }
+      await _loadBridges();
+    } catch (e) {
+      _snack('Update bridge failed: $e');
+    }
+  }
+
+  Future<void> _removeBridgeAccount(BridgeAccount a) async {
+    try {
+      if (_mobileBackend) {
+        await _mobile!.deleteBridgeAccount(a.id);
+      } else {
+        await _cli.deleteBridgeAccount(a.id);
+      }
+      if (_selBridge?.accountId == a.id) {
+        setState(() {
+          _selBridge = null;
+          _bridgeMsgs = [];
+        });
+      }
+      await _loadBridges();
+    } catch (e) {
+      _snack('Remove bridge failed: $e');
+    }
+  }
+
   Future<void> _refresh() async {
     try {
       final Future<List<Contact>> cFut;
@@ -3922,6 +4439,7 @@ class _ChatScreenState extends State<_ChatScreen>
       _sel = s;
       _selGroup = sg;
       unawaited(_maybeLoadConversationExpiry());
+      unawaited(_loadBridges());
 
       if (s == null && sg == null) {
         await _checkUnread();
@@ -6287,6 +6805,13 @@ class _ChatScreenState extends State<_ChatScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       key: scaffoldKey,
+      // Mobile (narrow) puts the provider rail behind a networks drawer so the
+      // conversation list keeps the full width.
+      drawer: Drawer(
+        backgroundColor: _t.surface,
+        width: 240,
+        child: SafeArea(child: _railContents(inDrawer: true)),
+      ),
       body: SafeArea(
         child: Column(
           children: [
@@ -6322,20 +6847,27 @@ class _ChatScreenState extends State<_ChatScreen>
                     );
                   }
 
+                  final hasSelection =
+                      _sel != null || _selGroup != null || _selBridge != null;
+                  final chatPane = _selBridge != null
+                      ? _bridgeChat()
+                      : (_sel == null && _selGroup == null
+                          ? _emptyChat()
+                          : _chat());
+
                   if (constraints.maxWidth < 720) {
-                    return _sel == null && _selGroup == null
-                        ? _sidebar()
-                        : _chat();
+                    // Narrow: single pane (list or chat); rail lives in the drawer.
+                    return hasSelection ? chatPane : _sidebar(narrow: true);
                   }
 
+                  // Wide: provider rail | conversation list | chat.
                   return Row(
                     children: [
+                      _providerRail(),
+                      Container(width: 1, color: _t.border),
                       SizedBox(width: 320, child: _sidebar()),
                       Container(width: 1, color: _t.border),
-                      Expanded(
-                          child: _sel == null && _selGroup == null
-                              ? _emptyChat()
-                              : _chat()),
+                      Expanded(child: chatPane),
                     ],
                   );
                 },
@@ -6347,9 +6879,257 @@ class _ChatScreenState extends State<_ChatScreen>
     );
   }
 
+  // ── Beeper-style provider rail / networks drawer ───────────────────────────
+
+  /// The vertical provider rail shown on the desktop (wide) layout.
+  Widget _providerRail() {
+    return Container(
+      width: 64,
+      color: _t.surface2,
+      child: _railContents(inDrawer: false),
+    );
+  }
+
+  /// Shared rail contents: All Chats, Sideband (native), each bridge account,
+  /// an add-bridge button, and settings. Rendered vertically in both the desktop
+  /// rail and the mobile drawer.
+  Widget _railContents({required bool inDrawer}) {
+    Widget item({
+      required String id,
+      required IconData icon,
+      required Color color,
+      required String label,
+      int badge = 0,
+      String? status,
+    }) {
+      final selected = _selectedNetwork == id;
+      final dot = status == 'connected'
+          ? const Color(0xFF34C759)
+          : status == 'error'
+              ? const Color(0xFFFF3B30)
+              : status == 'connecting'
+                  ? const Color(0xFFFFCC00)
+                  : null;
+      final tile = Tooltip(
+        message: label,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: () {
+            setState(() => _selectedNetwork = id);
+            if (inDrawer) Navigator.of(context).maybePop();
+          },
+          child: Container(
+            padding: EdgeInsets.symmetric(
+                horizontal: inDrawer ? 12 : 0, vertical: 6),
+            child: Row(
+              mainAxisAlignment: inDrawer
+                  ? MainAxisAlignment.start
+                  : MainAxisAlignment.center,
+              children: [
+                Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    Container(
+                      width: 44,
+                      height: 44,
+                      decoration: BoxDecoration(
+                        color: selected
+                            ? color.withValues(alpha: 0.22)
+                            : _t.surface,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: selected ? color : _t.border,
+                          width: selected ? 1.5 : 1,
+                        ),
+                      ),
+                      child: Icon(icon, size: 22, color: color),
+                    ),
+                    if (badge > 0)
+                      Positioned(
+                        right: -3,
+                        top: -3,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 5, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFF3B30),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(badge > 99 ? '99+' : '$badge',
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w700)),
+                        ),
+                      ),
+                    if (dot != null)
+                      Positioned(
+                        right: -1,
+                        bottom: -1,
+                        child: Container(
+                          width: 11,
+                          height: 11,
+                          decoration: BoxDecoration(
+                            color: dot,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: _t.surface2, width: 2),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                if (inDrawer) ...[
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: _t.text,
+                            fontSize: 13,
+                            fontWeight: selected
+                                ? FontWeight.w700
+                                : FontWeight.w500)),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      );
+      return Padding(
+        padding: EdgeInsets.symmetric(vertical: inDrawer ? 1 : 3, horizontal: 6),
+        child: tile,
+      );
+    }
+
+    final bridgeUnread = <String, int>{};
+    for (final c in _bridgeConvos) {
+      bridgeUnread[c.accountId] = (bridgeUnread[c.accountId] ?? 0) + c.unread;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (inDrawer)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 12, 6),
+            child: Text('NETWORKS',
+                style: TextStyle(
+                    color: _t.textDim,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.6)),
+          )
+        else
+          const SizedBox(height: 8),
+        Expanded(
+          child: ListView(
+            children: [
+              item(
+                  id: 'all',
+                  icon: Icons.all_inbox,
+                  color: _t.primary,
+                  label: 'All Chats'),
+              item(
+                  id: 'native',
+                  icon: Icons.shield_outlined,
+                  color: const Color(0xFF6C63FF),
+                  label: 'Sideband'),
+              if (_bridgeAccounts.isNotEmpty)
+                Padding(
+                  padding: EdgeInsets.symmetric(
+                      horizontal: inDrawer ? 16 : 12, vertical: 4),
+                  child: Divider(color: _t.border, height: 8),
+                ),
+              for (final a in _bridgeAccounts)
+                item(
+                  id: a.id,
+                  icon: networkStyle(a.network).icon,
+                  color: networkStyle(a.network).color,
+                  label: a.displayName.isEmpty
+                      ? networkStyle(a.network).label
+                      : a.displayName,
+                  badge: bridgeUnread[a.id] ?? 0,
+                  status: a.status,
+                ),
+            ],
+          ),
+        ),
+        Divider(color: _t.border, height: 1),
+        Padding(
+          padding: EdgeInsets.symmetric(vertical: inDrawer ? 2 : 4, horizontal: 6),
+          child: inDrawer
+              ? ListTile(
+                  dense: true,
+                  leading: Icon(Icons.add_link, size: 20, color: _t.primary),
+                  title: Text('Add bridge',
+                      style: TextStyle(color: _t.text, fontSize: 13)),
+                  onTap: () {
+                    Navigator.of(context).maybePop();
+                    _showBridgesScreen();
+                  },
+                )
+              : Tooltip(
+                  message: 'Add bridge',
+                  child: IconButton(
+                    icon: Icon(Icons.add_link, size: 22, color: _t.primary),
+                    onPressed: _showBridgesScreen,
+                  ),
+                ),
+        ),
+        Padding(
+          padding: EdgeInsets.only(bottom: inDrawer ? 6 : 10, top: 2),
+          child: inDrawer
+              ? ListTile(
+                  dense: true,
+                  leading: Icon(Icons.settings, size: 20, color: _t.textDim),
+                  title: Text('Settings',
+                      style: TextStyle(color: _t.text, fontSize: 13)),
+                  onTap: () {
+                    Navigator.of(context).maybePop();
+                    _showSettings();
+                  },
+                )
+              : Center(
+                  child: Tooltip(
+                    message: 'Settings',
+                    child: IconButton(
+                      icon: Icon(Icons.settings, size: 22, color: _t.textDim),
+                      onPressed: _showSettings,
+                    ),
+                  ),
+                ),
+        ),
+      ],
+    );
+  }
+
   // ── sidebar ──────────────────────────────────────────────────────────────
 
-  Widget _sidebar() {
+  /// Title for the conversation list, reflecting the selected provider-rail
+  /// network.
+  String get _sidebarTitle {
+    switch (_selectedNetwork) {
+      case 'all':
+        return 'All Chats';
+      case 'native':
+        return 'Sideband';
+      default:
+        final a = _bridgeAccounts.where((x) => x.id == _selectedNetwork);
+        if (a.isNotEmpty) {
+          return a.first.displayName.isEmpty
+              ? networkStyle(a.first.network).label
+              : a.first.displayName;
+        }
+        return 'Messages';
+    }
+  }
+
+  Widget _sidebar({bool narrow = false}) {
+    // Native contact/group actions only make sense for the Sideband networks.
+    final onBridgeNetwork =
+        _selectedNetwork != 'all' && _selectedNetwork != 'native';
     return Material(
       color: _t.surface,
       child: Column(
@@ -6360,9 +7140,21 @@ class _ChatScreenState extends State<_ChatScreen>
             padding: const EdgeInsets.fromLTRB(16, 14, 14, 10),
             child: Row(
               children: [
+                if (narrow)
+                  SizedBox(
+                    width: 40,
+                    child: IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints.tightFor(
+                          width: 40, height: 44),
+                      icon: const Icon(Icons.menu, size: 22),
+                      onPressed: () => scaffoldKey.currentState?.openDrawer(),
+                      tooltip: 'Networks',
+                    ),
+                  ),
                 Expanded(
                   child: Text(
-                    'Messages',
+                    _sidebarTitle,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -6373,70 +7165,61 @@ class _ChatScreenState extends State<_ChatScreen>
                     ),
                   ),
                 ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.person_add_alt_1, size: 20),
-                    onPressed: _showAddContactDialog,
-                    tooltip: 'Add contact',
-                  ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.group_add, size: 20),
-                    onPressed: _showCreateGroupDialog,
-                    tooltip: 'Create group',
-                  ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: Icon(
-                      _canUseMobileBackend
-                          ? Icons.qr_code_scanner
-                          : Icons.upload_file,
-                      size: 20,
+                if (!onBridgeNetwork) ...[
+                  SizedBox(
+                    width: 44,
+                    child: IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints:
+                          const BoxConstraints.tightFor(width: 44, height: 44),
+                      icon: const Icon(Icons.person_add_alt_1, size: 20),
+                      onPressed: _showAddContactDialog,
+                      tooltip: 'Add contact',
                     ),
-                    onPressed: _canUseMobileBackend
-                        ? _scanContactQr
-                        : _uploadContactQr,
-                    tooltip: _canUseMobileBackend
-                        ? 'Scan contact QR'
-                        : 'Upload QR code image',
                   ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.qr_code, size: 20),
-                    onPressed: _showShareDialog,
-                    tooltip: 'Share contact',
+                  SizedBox(
+                    width: 44,
+                    child: IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints:
+                          const BoxConstraints.tightFor(width: 44, height: 44),
+                      icon: const Icon(Icons.group_add, size: 20),
+                      onPressed: _showCreateGroupDialog,
+                      tooltip: 'Create group',
+                    ),
                   ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.settings, size: 20),
-                    onPressed: _showSettings,
-                    tooltip: 'Settings',
+                  SizedBox(
+                    width: 44,
+                    child: IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints:
+                          const BoxConstraints.tightFor(width: 44, height: 44),
+                      icon: Icon(
+                        _canUseMobileBackend
+                            ? Icons.qr_code_scanner
+                            : Icons.upload_file,
+                        size: 20,
+                      ),
+                      onPressed: _canUseMobileBackend
+                          ? _scanContactQr
+                          : _uploadContactQr,
+                      tooltip: _canUseMobileBackend
+                          ? 'Scan contact QR'
+                          : 'Upload QR code image',
+                    ),
                   ),
-                ),
+                  SizedBox(
+                    width: 44,
+                    child: IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints:
+                          const BoxConstraints.tightFor(width: 44, height: 44),
+                      icon: const Icon(Icons.qr_code, size: 20),
+                      onPressed: _showShareDialog,
+                      tooltip: 'Share contact',
+                    ),
+                  ),
+                ],
                 SizedBox(
                   width: 44,
                   child: IconButton(
@@ -6451,8 +7234,18 @@ class _ChatScreenState extends State<_ChatScreen>
               ],
             ),
           ),
-          // contacts
-          Expanded(
+          // Bridged conversations pinned above native chats in the unified
+          // ("All Chats") view; on a specific bridge network they fill the list.
+          if (onBridgeNetwork)
+            Expanded(child: _bridgeConvoList(accountFilter: _selectedNetwork))
+          else ...[
+            if (_selectedNetwork == 'all' && _bridgeConvos.isNotEmpty)
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 260),
+                child: _bridgeConvoList(accountFilter: null, sectioned: true),
+              ),
+            // contacts
+            Expanded(
             child: _error != null && _contacts.isEmpty
                 ? _sidebarError()
                 : _contacts.isEmpty && _groups.isEmpty
@@ -6751,7 +7544,8 @@ class _ChatScreenState extends State<_ChatScreen>
                           );
                         },
                       ),
-          ),
+            ),
+          ],
           // footer
           Container(
             padding: const EdgeInsets.all(10),
@@ -6803,6 +7597,472 @@ class _ChatScreenState extends State<_ChatScreen>
           ),
         ],
       ),
+    );
+  }
+
+  // ── Beeper-style bridges: conversation list + chat ─────────────────────────
+
+  /// Avatar with a small network badge in the corner (Beeper-style).
+  Widget _bridgeAvatar(BridgeConversation c, {double radius = 17}) {
+    final ns = networkStyle(c.network);
+    final t = c.title.trim();
+    final letter = (t.isNotEmpty ? t[0] : '#').toUpperCase();
+    final badge = radius * 0.85;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        CircleAvatar(
+          radius: radius,
+          backgroundColor: _t.surface2,
+          child: Text(letter,
+              style: TextStyle(
+                  color: _t.text, fontSize: 12, fontWeight: FontWeight.w700)),
+        ),
+        Positioned(
+          bottom: -2,
+          right: -2,
+          child: Container(
+            padding: const EdgeInsets.all(1.5),
+            decoration:
+                BoxDecoration(color: _t.surface, shape: BoxShape.circle),
+            child: Container(
+              width: badge,
+              height: badge,
+              decoration: BoxDecoration(color: ns.color, shape: BoxShape.circle),
+              child: Icon(ns.icon, size: badge * 0.62, color: Colors.white),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _bridgeConvoTile(BridgeConversation c) {
+    final ns = networkStyle(c.network);
+    final selected = _selBridge?.id == c.id;
+    return ListTile(
+      selected: selected,
+      leading: _bridgeAvatar(c),
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(c.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                    color: selected ? _t.primary : _t.text)),
+          ),
+          if (c.lastActivityMs > 0)
+            Text(_hm(DateTime.fromMillisecondsSinceEpoch(c.lastActivityMs)),
+                style: TextStyle(fontSize: 10, color: _t.textDim)),
+          const SizedBox(width: 6),
+          Tooltip(
+            message: 'Bridged via ${ns.label} — not private',
+            child: const Icon(Icons.public, size: 13, color: Color(0xFFE0A100)),
+          ),
+        ],
+      ),
+      subtitle: Text('${ns.label}${c.kind == "group" ? " · group" : ""}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 11, color: _t.textDim)),
+      trailing: c.unread > 0 ? _unreadDot() : null,
+      onTap: () => _openBridgeConversation(c),
+    );
+  }
+
+  Widget _bridgeConvoList({String? accountFilter, bool sectioned = false}) {
+    var convos = _bridgeConvos;
+    if (accountFilter != null) {
+      convos = convos.where((c) => c.accountId == accountFilter).toList();
+    }
+    if (convos.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            accountFilter != null
+                ? 'No conversations yet.\nStart the listener and sign in to this bridge.'
+                : 'No bridged conversations.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: _t.textDim, fontSize: 12, height: 1.6),
+          ),
+        ),
+      );
+    }
+    return ListView(
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      children: [
+        if (sectioned)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
+            child: Text('BRIDGED',
+                style: TextStyle(
+                    color: _t.textDim,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.5)),
+          ),
+        for (final c in convos) _bridgeConvoTile(c),
+      ],
+    );
+  }
+
+  /// The chat pane for a bridged conversation. Reuses `_bubble` for messages but
+  /// makes the non-private nature unmistakable and routes the composer to the
+  /// bridge send path.
+  Widget _bridgeChat() {
+    final conv = _selBridge;
+    if (conv == null) return _emptyChat();
+    final ns = networkStyle(conv.network);
+    final narrow = MediaQuery.of(context).size.width < 720;
+    return Material(
+      color: _t.bg,
+      child: Column(
+        children: [
+          Container(
+            color: _t.surface,
+            padding: const EdgeInsets.fromLTRB(8, 10, 12, 10),
+            child: Row(
+              children: [
+                if (narrow)
+                  IconButton(
+                    icon: const Icon(Icons.arrow_back, size: 20),
+                    onPressed: () => setState(() => _selBridge = null),
+                  ),
+                _bridgeAvatar(conv, radius: 16),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(conv.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                              color: _t.text,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700)),
+                      Text(ns.label,
+                          style: TextStyle(color: _t.textDim, fontSize: 11)),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.refresh, size: 18),
+                  tooltip: 'Refresh',
+                  onPressed: () => _loadBridgeMessages(conv),
+                ),
+              ],
+            ),
+          ),
+          Container(
+            width: double.infinity,
+            color: const Color(0x22E0A100),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            child: Row(
+              children: [
+                const Icon(Icons.public, size: 14, color: Color(0xFFE0A100)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Bridged via ${ns.label} — not end-to-end private. '
+                    'Messages leave the Sideband network.',
+                    style: TextStyle(color: _t.text, fontSize: 11),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: _bridgeMsgs.isEmpty
+                ? Center(
+                    child: Text('No messages yet',
+                        style: TextStyle(color: _t.textDim, fontSize: 12)))
+                : ListView.builder(
+                    controller: _scroll,
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    itemCount: _bridgeMsgs.length,
+                    itemBuilder: (_, i) => _bubble(_bridgeMsgs[i]),
+                  ),
+          ),
+          _bridgeComposeRow(),
+        ],
+      ),
+    );
+  }
+
+  Widget _bridgeComposeRow() {
+    return Container(
+      color: _t.surface,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 2),
+            child: IconButton(
+              icon: const Text('😊', style: TextStyle(fontSize: 20)),
+              onPressed: _showEmojiPicker,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              splashRadius: 18,
+            ),
+          ),
+          Expanded(
+            child: TextField(
+              controller: _input,
+              minLines: 1,
+              maxLines: 5,
+              style: TextStyle(color: _t.text, fontSize: 14),
+              decoration: InputDecoration(
+                hintText: 'Message',
+                hintStyle: TextStyle(color: _t.textDim),
+                filled: true,
+                fillColor: _t.surface2,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(22),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+              onSubmitted: _sendToBridge,
+            ),
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            icon: Icon(Icons.send, color: _t.primary),
+            onPressed: () => _sendToBridge(_input.text),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Beeper-style bridges: account management ───────────────────────────────
+
+  void _showBridgesScreen() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setInner) {
+            Future<void> refresh() async {
+              await _loadBridges();
+              if (ctx.mounted) setInner(() {});
+            }
+
+            return AlertDialog(
+              backgroundColor: _t.surface,
+              title: Row(
+                children: [
+                  Icon(Icons.hub, size: 18, color: _t.primary),
+                  const SizedBox(width: 8),
+                  const Text('Bridges'),
+                ],
+              ),
+              content: SizedBox(
+                width: 380,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Connect other chat networks. Bridged chats are NOT '
+                      'end-to-end private — they leave the Sideband network.',
+                      style: TextStyle(
+                          color: _t.textDim, fontSize: 11.5, height: 1.4),
+                    ),
+                    const SizedBox(height: 12),
+                    if (_bridgeAccounts.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        child: Text('No bridges yet.',
+                            style:
+                                TextStyle(color: _t.textDim, fontSize: 12)),
+                      )
+                    else
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 280),
+                        child: ListView(
+                          shrinkWrap: true,
+                          children: [
+                            for (final a in _bridgeAccounts)
+                              _bridgeAccountRow(a, refresh),
+                          ],
+                        ),
+                      ),
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        icon: const Icon(Icons.add, size: 18),
+                        label: const Text('Add bridge'),
+                        onPressed: () async {
+                          await _showAddBridgeDialog();
+                          await refresh();
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text('Close')),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _bridgeAccountRow(BridgeAccount a, Future<void> Function() refresh) {
+    final ns = networkStyle(a.network);
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: CircleAvatar(
+        radius: 16,
+        backgroundColor: ns.color.withValues(alpha: 0.18),
+        child: Icon(ns.icon, size: 16, color: ns.color),
+      ),
+      title: Text(a.displayName.isEmpty ? ns.label : a.displayName,
+          style: TextStyle(
+              color: _t.text, fontSize: 13.5, fontWeight: FontWeight.w600)),
+      subtitle: Text('${ns.label} · ${a.status}',
+          style: TextStyle(color: _t.textDim, fontSize: 11)),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Switch(
+            value: a.enabled,
+            onChanged: (v) async {
+              await _toggleBridgeAccount(a, v);
+              await refresh();
+            },
+          ),
+          IconButton(
+            icon: Icon(Icons.delete_outline, size: 18, color: _t.errorFg),
+            tooltip: 'Remove',
+            onPressed: () async {
+              await _removeBridgeAccount(a);
+              await refresh();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showAddBridgeDialog() async {
+    const networks = ['demo', 'telegram', 'discord', 'googlechat', 'messenger'];
+    var network = 'demo';
+    final idCtl = TextEditingController();
+    final nameCtl = TextEditingController();
+    final configCtl = TextEditingController(text: '{}');
+    var enable = true;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setInner) {
+            return AlertDialog(
+              backgroundColor: _t.surface,
+              title: const Text('Add bridge'),
+              content: SizedBox(
+                width: 360,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      DropdownButtonFormField<String>(
+                        initialValue: network,
+                        dropdownColor: _t.surface,
+                        decoration: const InputDecoration(labelText: 'Network'),
+                        items: [
+                          for (final n in networks)
+                            DropdownMenuItem(
+                                value: n, child: Text(networkStyle(n).label)),
+                        ],
+                        onChanged: (v) => setInner(() => network = v ?? network),
+                      ),
+                      TextField(
+                        controller: idCtl,
+                        decoration: const InputDecoration(
+                            labelText: 'Account id (unique)'),
+                      ),
+                      TextField(
+                        controller: nameCtl,
+                        decoration: const InputDecoration(
+                            labelText: 'Display name (optional)'),
+                      ),
+                      TextField(
+                        controller: configCtl,
+                        decoration:
+                            const InputDecoration(labelText: 'Config JSON'),
+                        maxLines: 2,
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Checkbox(
+                            value: enable,
+                            onChanged: (v) =>
+                                setInner(() => enable = v ?? true),
+                          ),
+                          const Text('Enable now'),
+                        ],
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(
+                          network == 'demo'
+                              ? 'The demo bridge is a local echo connector for '
+                                  'testing — no account needed.'
+                              : 'Real networks need the mautrix bridge stack + a '
+                                  'Matrix connector (see docs/BRIDGES.md).',
+                          style: TextStyle(color: _t.textDim, fontSize: 11),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text('Cancel')),
+                FilledButton(
+                  onPressed: () async {
+                    final id = idCtl.text.trim().isEmpty
+                        ? '$network-${DateTime.now().millisecondsSinceEpoch}'
+                        : idCtl.text.trim();
+                    Navigator.of(ctx).pop();
+                    await _createBridgeAccount(
+                      id: id,
+                      network: network,
+                      name: nameCtl.text.trim(),
+                      config: configCtl.text.trim().isEmpty
+                          ? '{}'
+                          : configCtl.text.trim(),
+                      enable: enable,
+                    );
+                  },
+                  child: const Text('Add'),
+                ),
+              ],
+            );
+          },
+        );
+      },
     );
   }
 

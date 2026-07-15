@@ -144,6 +144,27 @@ everything inline" or "spawn a subagent for each thing."
 
 _Update this section as part of the handoff protocol._
 
+**Beeper-style bridges (Part B, Phase 1 DONE)** — opt-in multi-network bridge
+layer with a hard privacy boundary: Sideband-native (Tor/LAN/BT) stays the
+private E2E core; bridged conversations are `network != 'native'`, isolated from
+the cryptographic `contacts` domain, and always labeled *not private* in the UI.
+Connectors are **sidecar processes** speaking a small JSON-lines protocol
+(`src/bridge.rs`: `CoreToConnector`/`ConnectorToCore`, `BridgeManager` spawns/
+pumps/dispatches on the serve loop's ~1s tick). Core: `bridge_accounts`,
+`bridge_conversations`, `bridge_outbox` tables + `messages.network` column +
+helpers in `main.rs`; a DB **outbox** decouples GUI sends (desktop subprocess /
+Android FFI) from the listener-owned connectors. A loopback **demo connector**
+(`src/bin/sideband-bridge-demo.rs`, bundled in the AppImage) proves the whole
+pipeline with no external accounts — covered by interop test
+`bridge_demo_connector_roundtrips`. FFI `sideband_api_*bridge*` + CLI `bridge
+list|add|enable|disable|delete|conversations|send|history|read`. GUI: provider
+**rail** (desktop) / networks **drawer** (mobile), unified inbox with per-chat
+network badges + a bridged/"not private" indicator, bridged chat with a security
+banner, and a Bridges settings screen. **Phase 2 (NEXT, needs infra):** a real
+`matrix` connector (`matrix-sdk`) + a docker bundle (Conduit + mautrix-{telegram,
+discord,googlechat,meta}) so the four target networks light up; see
+`docs/plans/2026-07-14-briar-like-transports-and-bridges.md` Part B.
+
 **Shipped:** group chats across all clients; QR share overlay (TUI) + QR scan
 (Android); Double-Ratchet "Enable forward secrecy" button; Android foreground
 service, message notifications, and mobile-appropriate settings; offline retry

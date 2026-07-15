@@ -31,6 +31,7 @@ use arti_client::{TorClient, TorClientConfig};
 use tor_rtcompat::PreferredRuntime;
 
 mod app_api;
+mod bridge;
 mod handler;
 #[cfg(test)]
 mod interop;
@@ -240,6 +241,12 @@ enum CommandKind {
         #[command(subcommand)]
         action: GroupAction,
     },
+    /// Manage Beeper-style bridge accounts (other chat networks). Opt-in and
+    /// NOT part of Sideband's private end-to-end core.
+    Bridge {
+        #[command(subcommand)]
+        action: BridgeAction,
+    },
     History {
         #[command(flatten)]
         profile: ProfileArg,
@@ -437,6 +444,99 @@ enum GroupAction {
         /// Group id or exact title.
         #[arg(long)]
         group: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BridgeAction {
+    /// List configured bridge accounts.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create or update a bridge account.
+    Add {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Unique account id (e.g. "telegram-alice").
+        #[arg(long)]
+        id: String,
+        /// Network id (e.g. telegram, discord, googlechat, messenger, demo).
+        #[arg(long)]
+        network: String,
+        /// Human-readable name shown in the UI.
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Connector config as JSON (may set {"command":..,"args":[..]}).
+        #[arg(long, default_value = "{}")]
+        config: String,
+        /// Enable the account immediately (serve will start its connector).
+        #[arg(long)]
+        enable: bool,
+    },
+    /// Enable an account (serve starts its connector).
+    Enable {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        id: String,
+    },
+    /// Disable an account (serve stops its connector).
+    Disable {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        id: String,
+    },
+    /// Delete an account and all its bridged conversations + history.
+    Delete {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        id: String,
+    },
+    /// List bridged conversations (optionally for one account).
+    Conversations {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Restrict to one account id. Omit for all networks.
+        #[arg(long)]
+        account: Option<String>,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Queue an outbound message to a bridged conversation.
+    Send {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Bridged conversation id (account_id/remote_id).
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+    },
+    /// Show a bridged conversation's history.
+    History {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        conversation: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear a bridged conversation's unread counter.
+    Read {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        conversation: String,
     },
 }
 
@@ -1871,6 +1971,15 @@ fn init_db(profile: &Path) -> Result<Connection> {
             ON seen_messages(seen_at)",
         [],
     )?;
+    // Beeper-style bridges: a message's network ('native' for the private
+    // Sideband core; a bridge network id like 'telegram' otherwise). Native rows
+    // are untouched by the default. Bridged rows use conversation_kind='bridge'
+    // and conversation_id = <bridge_conversation.id>.
+    ensure_message_column(
+        &conn,
+        "network",
+        "ALTER TABLE messages ADD COLUMN network TEXT NOT NULL DEFAULT 'native'",
+    )?;
     ensure_message_column(
         &conn,
         "conversation_kind",
@@ -2004,6 +2113,44 @@ fn init_db(profile: &Path) -> Result<Connection> {
          AND conversation_kind = 'group'
          AND conversation_id LIKE '_legacy_fanout_%'",
         [],
+    )?;
+    // Beeper-style bridge domain. Kept strictly separate from `contacts` (the
+    // cryptographic Sideband trust domain): a bridged conversation is never a
+    // Sideband contact and carries no E2E guarantees. All opt-in, off by default.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bridge_accounts (
+            id            TEXT PRIMARY KEY,
+            network       TEXT NOT NULL,
+            display_name  TEXT NOT NULL DEFAULT '',
+            status        TEXT NOT NULL DEFAULT 'disconnected',
+            config_json   TEXT NOT NULL DEFAULT '{}',
+            enabled       INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS bridge_conversations (
+            id               TEXT PRIMARY KEY,
+            account_id       TEXT NOT NULL,
+            network          TEXT NOT NULL,
+            remote_id        TEXT NOT NULL,
+            title            TEXT NOT NULL DEFAULT '',
+            avatar_ref       TEXT NOT NULL DEFAULT '',
+            kind             TEXT NOT NULL DEFAULT 'dm',
+            last_activity_ms INTEGER NOT NULL DEFAULT 0,
+            unread           INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_bridge_conversations_account
+            ON bridge_conversations(account_id);
+        CREATE TABLE IF NOT EXISTS bridge_outbox (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            body            TEXT NOT NULL,
+            created_at_ms   INTEGER NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            message_row_id  INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_bridge_outbox_status
+            ON bridge_outbox(status);",
     )?;
     Ok(conn)
 }
@@ -2207,6 +2354,607 @@ pub(crate) fn purge_expired_messages(profile: &Path) -> Result<usize> {
         params![now],
     )?;
     Ok(n)
+}
+
+// ── Beeper-style bridges: DB layer ───────────────────────────────────────────
+//
+// A bridge account is a configured connection to a non-Sideband network (e.g.
+// Telegram). Its conversations and messages live in dedicated tables and are
+// tagged network != 'native' so the UI can always flag them as *not* private.
+// None of this touches the cryptographic `contacts` trust domain.
+
+/// A configured bridge account row (also the JSON shape exposed over FFI/CLI).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BridgeAccountRow {
+    pub id: String,
+    pub network: String,
+    pub display_name: String,
+    pub status: String,
+    #[serde(default)]
+    pub config_json: String,
+    pub enabled: bool,
+}
+
+/// A bridged conversation row (also the JSON shape exposed over FFI/CLI).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BridgeConversationRow {
+    pub id: String,
+    pub account_id: String,
+    pub network: String,
+    pub remote_id: String,
+    pub title: String,
+    pub avatar_ref: String,
+    pub kind: String,
+    pub last_activity_ms: i64,
+    pub unread: i64,
+}
+
+/// Stable, deterministic id for a bridged conversation.
+pub(crate) fn bridge_conversation_id(account_id: &str, remote_id: &str) -> String {
+    format!("{account_id}/{remote_id}")
+}
+
+/// Create or update a bridge account. Leaves `status` untouched on update
+/// (status is owned by the running connector), only (re)sets config/name/enabled.
+pub(crate) fn upsert_bridge_account(
+    profile: &Path,
+    id: &str,
+    network: &str,
+    display_name: &str,
+    config_json: &str,
+    enabled: bool,
+) -> Result<()> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO bridge_accounts (id, network, display_name, config_json, enabled, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+            network = excluded.network,
+            display_name = excluded.display_name,
+            config_json = excluded.config_json,
+            enabled = excluded.enabled",
+        params![
+            id,
+            network,
+            display_name,
+            config_json,
+            enabled as i64,
+            now_ms_i64().unwrap_or(0)
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn list_bridge_accounts(profile: &Path) -> Result<Vec<BridgeAccountRow>> {
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, network, display_name, status, config_json, enabled
+         FROM bridge_accounts ORDER BY created_at_ms ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(BridgeAccountRow {
+                id: r.get(0)?,
+                network: r.get(1)?,
+                display_name: r.get(2)?,
+                status: r.get(3)?,
+                config_json: r.get(4)?,
+                enabled: r.get::<_, i64>(5)? != 0,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub(crate) fn get_bridge_account(profile: &Path, id: &str) -> Result<Option<BridgeAccountRow>> {
+    let conn = init_db(profile)?;
+    let row = conn
+        .query_row(
+            "SELECT id, network, display_name, status, config_json, enabled
+             FROM bridge_accounts WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(BridgeAccountRow {
+                    id: r.get(0)?,
+                    network: r.get(1)?,
+                    display_name: r.get(2)?,
+                    status: r.get(3)?,
+                    config_json: r.get(4)?,
+                    enabled: r.get::<_, i64>(5)? != 0,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+pub(crate) fn set_bridge_account_status(profile: &Path, id: &str, status: &str) -> Result<()> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "UPDATE bridge_accounts SET status = ?2 WHERE id = ?1",
+        params![id, status],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn set_bridge_account_enabled(profile: &Path, id: &str, enabled: bool) -> Result<bool> {
+    let conn = init_db(profile)?;
+    let n = conn.execute(
+        "UPDATE bridge_accounts SET enabled = ?2 WHERE id = ?1",
+        params![id, enabled as i64],
+    )?;
+    // Disabling an account marks it disconnected; the connector is stopped by serve.
+    if !enabled {
+        let _ = conn.execute(
+            "UPDATE bridge_accounts SET status = 'disconnected' WHERE id = ?1",
+            params![id],
+        );
+    }
+    Ok(n > 0)
+}
+
+/// Delete a bridge account and everything under it (conversations, history,
+/// pending outbox). Bridged history is disposable — it lives on the network too.
+pub(crate) fn delete_bridge_account(profile: &Path, id: &str) -> Result<bool> {
+    let conn = init_db(profile)?;
+    let conv_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM bridge_conversations WHERE account_id = ?1")?;
+        let ids = stmt
+            .query_map(params![id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids
+    };
+    for cid in &conv_ids {
+        conn.execute(
+            "DELETE FROM messages WHERE conversation_kind = 'bridge' AND conversation_id = ?1",
+            params![cid],
+        )?;
+        conn.execute(
+            "DELETE FROM bridge_outbox WHERE conversation_id = ?1",
+            params![cid],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM bridge_conversations WHERE account_id = ?1",
+        params![id],
+    )?;
+    let n = conn.execute("DELETE FROM bridge_accounts WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
+
+/// Create or update a bridged conversation, returning its stable id.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn upsert_bridge_conversation(
+    profile: &Path,
+    account_id: &str,
+    network: &str,
+    remote_id: &str,
+    title: &str,
+    avatar_ref: &str,
+    kind: &str,
+    last_activity_ms: i64,
+) -> Result<String> {
+    let id = bridge_conversation_id(account_id, remote_id);
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO bridge_conversations
+            (id, account_id, network, remote_id, title, avatar_ref, kind, last_activity_ms, unread)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+         ON CONFLICT(id) DO UPDATE SET
+            title = CASE WHEN excluded.title != '' THEN excluded.title
+                         ELSE bridge_conversations.title END,
+            avatar_ref = CASE WHEN excluded.avatar_ref != '' THEN excluded.avatar_ref
+                              ELSE bridge_conversations.avatar_ref END,
+            kind = excluded.kind,
+            last_activity_ms = MAX(bridge_conversations.last_activity_ms, excluded.last_activity_ms)",
+        params![
+            id,
+            account_id,
+            network,
+            remote_id,
+            title,
+            avatar_ref,
+            kind,
+            last_activity_ms
+        ],
+    )?;
+    Ok(id)
+}
+
+fn map_bridge_conversation_row(r: &rusqlite::Row) -> rusqlite::Result<BridgeConversationRow> {
+    Ok(BridgeConversationRow {
+        id: r.get(0)?,
+        account_id: r.get(1)?,
+        network: r.get(2)?,
+        remote_id: r.get(3)?,
+        title: r.get(4)?,
+        avatar_ref: r.get(5)?,
+        kind: r.get(6)?,
+        last_activity_ms: r.get(7)?,
+        unread: r.get(8)?,
+    })
+}
+
+pub(crate) fn list_bridge_conversations(
+    profile: &Path,
+    account_id: Option<&str>,
+) -> Result<Vec<BridgeConversationRow>> {
+    const COLS: &str =
+        "id, account_id, network, remote_id, CASE WHEN title != '' THEN title ELSE remote_id END, avatar_ref, kind, last_activity_ms, unread";
+    let conn = init_db(profile)?;
+    match account_id {
+        Some(acc) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COLS} FROM bridge_conversations
+                 WHERE account_id = ?1 ORDER BY last_activity_ms DESC, title ASC"
+            ))?;
+            let rows = stmt
+                .query_map(params![acc], map_bridge_conversation_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+        None => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COLS} FROM bridge_conversations
+                 ORDER BY last_activity_ms DESC, title ASC"
+            ))?;
+            let rows = stmt
+                .query_map([], map_bridge_conversation_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    }
+}
+
+/// Append a bridged message to history and bump the conversation's activity.
+/// `direction` is 'in' or 'out'; inbound messages increment unread.
+pub(crate) fn insert_bridge_message(
+    profile: &Path,
+    conversation_id: &str,
+    network: &str,
+    direction: &str,
+    sender: &str,
+    body: &str,
+    timestamp_ms: i64,
+) -> Result<i64> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO messages
+            (direction, contact, onion, body, timestamp_ms, status, conversation_kind, conversation_id, network)
+         VALUES (?1, ?2, '', ?3, ?4, ?5, 'bridge', ?6, ?7)",
+        params![
+            direction,
+            sender,
+            body,
+            timestamp_ms,
+            DeliveryStatus::Sent.as_i64(),
+            conversation_id,
+            network,
+        ],
+    )?;
+    let row_id = conn.last_insert_rowid();
+    let bump_unread = if direction == "in" { 1 } else { 0 };
+    conn.execute(
+        "UPDATE bridge_conversations
+         SET last_activity_ms = MAX(last_activity_ms, ?2), unread = unread + ?3
+         WHERE id = ?1",
+        params![conversation_id, timestamp_ms, bump_unread],
+    )?;
+    Ok(row_id)
+}
+
+/// Clear a bridged conversation's unread counter (e.g. when it is opened).
+pub(crate) fn mark_bridge_conversation_read(profile: &Path, conversation_id: &str) -> Result<()> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "UPDATE bridge_conversations SET unread = 0 WHERE id = ?1",
+        params![conversation_id],
+    )?;
+    Ok(())
+}
+
+/// Queue an outbound bridged message for the connector to deliver. Returns the
+/// outbox row id. The message is also written to history immediately so it shows
+/// in the conversation right away.
+pub(crate) fn enqueue_bridge_outbox(
+    profile: &Path,
+    conversation_id: &str,
+    network: &str,
+    body: &str,
+) -> Result<i64> {
+    let ts = now_ms_i64().unwrap_or(0);
+    let row_id = insert_bridge_message(profile, conversation_id, network, "out", "You", body, ts)?;
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO bridge_outbox (conversation_id, body, created_at_ms, status, message_row_id)
+         VALUES (?1, ?2, ?3, 'pending', ?4)",
+        params![conversation_id, body, ts, row_id],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// A pending outbound bridged message resolved against its conversation, ready
+/// to hand to a connector.
+pub(crate) struct PendingOutboxRow {
+    pub id: i64,
+    pub account_id: String,
+    pub remote_id: String,
+    pub body: String,
+}
+
+/// Read up to `limit` pending outbox rows joined with their conversation.
+pub(crate) fn take_pending_bridge_outbox(
+    profile: &Path,
+    limit: usize,
+) -> Result<Vec<PendingOutboxRow>> {
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT o.id, c.account_id, c.remote_id, o.body
+         FROM bridge_outbox o
+         JOIN bridge_conversations c ON c.id = o.conversation_id
+         WHERE o.status = 'pending'
+         ORDER BY o.id ASC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |r| {
+            Ok(PendingOutboxRow {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                remote_id: r.get(2)?,
+                body: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Mark an outbox row as handed to the connector (awaiting a SendResult).
+pub(crate) fn mark_bridge_outbox_sent(profile: &Path, id: i64) -> Result<()> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "UPDATE bridge_outbox SET status = 'sent' WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// Queue an outbound message to a bridged conversation (looks up its network).
+/// Shared by the FFI and the `bridge send` CLI command.
+pub(crate) fn bridge_send(profile: &Path, conversation_id: &str, text: &str) -> Result<()> {
+    let convs = list_bridge_conversations(profile, None)?;
+    let conv = convs
+        .into_iter()
+        .find(|c| c.id == conversation_id)
+        .ok_or_else(|| anyhow!("unknown bridged conversation '{conversation_id}'"))?;
+    enqueue_bridge_outbox(profile, conversation_id, &conv.network, text)?;
+    Ok(())
+}
+
+/// Read a bridged conversation's history (oldest→newest, capped at `limit`).
+pub(crate) fn list_bridge_history(
+    profile: &Path,
+    conversation_id: &str,
+    limit: usize,
+) -> Result<Vec<HistoryRow>> {
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, direction, contact, onion, body, timestamp_ms, status, created_at, conversation_kind, conversation_id
+         FROM messages
+         WHERE conversation_kind = 'bridge' AND conversation_id = ?1
+         ORDER BY timestamp_ms DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![conversation_id, limit as i64], |r| {
+            Ok(HistoryRow {
+                id: r.get(0)?,
+                direction: r.get(1)?,
+                contact: r.get(2)?,
+                onion: r.get(3)?,
+                body: r.get(4)?,
+                timestamp_ms: r.get(5)?,
+                status: r.get(6)?,
+                created_at: r.get(7)?,
+                conversation_kind: r.get(8)?,
+                conversation_id: r.get(9)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut rows = rows;
+    rows.reverse();
+    Ok(rows)
+}
+
+/// Apply a connector's delivery result: update the outbox row and the linked
+/// history message's status (delivered / failed).
+pub(crate) fn resolve_bridge_outbox(
+    profile: &Path,
+    outbox_id: i64,
+    ok: bool,
+    error: &str,
+) -> Result<()> {
+    let conn = init_db(profile)?;
+    let msg_row_id: Option<i64> = conn
+        .query_row(
+            "SELECT message_row_id FROM bridge_outbox WHERE id = ?1",
+            params![outbox_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let (outbox_status, msg_status) = if ok {
+        ("delivered", DeliveryStatus::Delivered.as_i64())
+    } else {
+        ("failed", DeliveryStatus::Failed.as_i64())
+    };
+    conn.execute(
+        "UPDATE bridge_outbox SET status = ?2, last_error = ?3 WHERE id = ?1",
+        params![outbox_id, outbox_status, error],
+    )?;
+    if let Some(row_id) = msg_row_id {
+        if row_id > 0 {
+            conn.execute(
+                "UPDATE messages SET status = ?2 WHERE id = ?1",
+                params![row_id, msg_status],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// CLI handler for `sideband bridge …`. Prints text or JSON. Mirrors the FFI
+/// surface so the desktop GUI (which shells out) and the TUI share behaviour.
+fn handle_bridge_command(action: BridgeAction) -> Result<()> {
+    match action {
+        BridgeAction::List { profile, json } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let accounts = list_bridge_accounts(&profile)?;
+            if json {
+                println!("{}", serde_json::to_string(&accounts)?);
+            } else if accounts.is_empty() {
+                println!("no bridge accounts configured");
+            } else {
+                for a in &accounts {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        a.id,
+                        a.network,
+                        if a.enabled { "enabled" } else { "disabled" },
+                        a.status,
+                        a.display_name
+                    );
+                }
+            }
+            Ok(())
+        }
+        BridgeAction::Add {
+            profile,
+            id,
+            network,
+            name,
+            config,
+            enable,
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let cfg = if config.trim().is_empty() {
+                "{}"
+            } else {
+                &config
+            };
+            upsert_bridge_account(&profile, &id, &network, &name, cfg, enable)?;
+            println!("bridge account '{id}' saved ({network})");
+            Ok(())
+        }
+        BridgeAction::Enable { profile, id } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if set_bridge_account_enabled(&profile, &id, true)? {
+                println!("bridge account '{id}' enabled");
+            } else {
+                println!("bridge account '{id}' not found");
+            }
+            Ok(())
+        }
+        BridgeAction::Disable { profile, id } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if set_bridge_account_enabled(&profile, &id, false)? {
+                println!("bridge account '{id}' disabled");
+            } else {
+                println!("bridge account '{id}' not found");
+            }
+            Ok(())
+        }
+        BridgeAction::Delete { profile, id } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if delete_bridge_account(&profile, &id)? {
+                println!("bridge account '{id}' deleted");
+            } else {
+                println!("bridge account '{id}' not found");
+            }
+            Ok(())
+        }
+        BridgeAction::Conversations {
+            profile,
+            account,
+            json,
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let convs = list_bridge_conversations(&profile, account.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string(&convs)?);
+            } else if convs.is_empty() {
+                println!("no bridged conversations");
+            } else {
+                for c in &convs {
+                    println!(
+                        "{}\t{}\t{}\tunread={}\t{}",
+                        c.id, c.network, c.kind, c.unread, c.title
+                    );
+                }
+            }
+            Ok(())
+        }
+        BridgeAction::Send {
+            profile,
+            conversation,
+            message,
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            bridge_send(&profile, &conversation, &message)?;
+            println!("queued to '{conversation}'");
+            Ok(())
+        }
+        BridgeAction::History {
+            profile,
+            conversation,
+            limit,
+            json,
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let rows = list_bridge_history(&profile, &conversation, limit)?;
+            if json {
+                let items: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "direction": r.direction,
+                            "contact": r.contact,
+                            "body": r.body,
+                            "timestamp_ms": r.timestamp_ms,
+                            "status": r.status,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string(&items)?);
+            } else {
+                for r in &rows {
+                    let who = if r.direction == "out" {
+                        "You"
+                    } else {
+                        &r.contact
+                    };
+                    println!("[{}] {}: {}", r.timestamp_ms, who, r.body);
+                }
+            }
+            Ok(())
+        }
+        BridgeAction::Read {
+            profile,
+            conversation,
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            mark_bridge_conversation_read(&profile, &conversation)?;
+            println!("ok");
+            Ok(())
+        }
+    }
 }
 
 /// Read the per-conversation default disappearing-message TTL, in ms.
@@ -4503,6 +5251,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        CommandKind::Bridge { action } => handle_bridge_command(action),
         CommandKind::History {
             profile,
             contact,
@@ -6288,6 +7037,12 @@ pub(crate) async fn serve(
     let mut next_lan_props_check = std::time::Instant::now();
     let mut next_presence_heartbeat = std::time::Instant::now();
     let mut last_presence_revision = String::new();
+    // Beeper-style bridges: manage sidecar connectors for enabled bridge
+    // accounts, pump their inbound traffic into the DB, and dispatch queued
+    // outbound messages. Entirely opt-in (only enabled accounts spawn anything)
+    // and isolated from the private Tor/LAN/BT path.
+    let mut bridge_mgr = bridge::BridgeManager::new(profile.to_path_buf());
+    let mut next_bridge_tick = std::time::Instant::now();
     loop {
         while let Ok(cmd) = control_rx.try_recv() {
             let profile = profile.to_path_buf();
@@ -6777,12 +7532,23 @@ pub(crate) async fn serve(
             }
         }
 
+        // Bridges: reconcile connectors with enabled accounts, drain their
+        // inbound events into the DB, and push queued outbound messages. Cheap;
+        // runs about once a second.
+        if std::time::Instant::now() >= next_bridge_tick {
+            next_bridge_tick = std::time::Instant::now() + Duration::from_millis(1000);
+            bridge_mgr.reconcile().await;
+            bridge_mgr.pump();
+            bridge_mgr.dispatch_outbox();
+        }
+
         // If the IO loop has finished, we're done.
         if io_handle.is_finished() {
             break;
         }
     }
 
+    bridge_mgr.shutdown().await;
     // Propagate any panic/error from the IO loop.
     io_handle.await??;
     Ok(())

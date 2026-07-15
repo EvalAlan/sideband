@@ -294,7 +294,19 @@ unverified/blocked sender is dropped; a `state:"away"` renders away.
 
 ---
 
-## Part B — Beeper-style multi-network bridges + shared inbox *(later; separate track)*
+## Part B — Beeper-style multi-network bridges + shared inbox
+
+> **Phase 1 DONE** (foundation + UI, fully buildable/verifiable): network-tagged
+> data model (`bridge_accounts`/`bridge_conversations`/`bridge_outbox` +
+> `messages.network`), sidecar **connector abstraction** + `BridgeManager`
+> (`src/bridge.rs`) wired into `serve`, a loopback **demo connector**
+> (`src/bin/sideband-bridge-demo.rs`) with interop coverage
+> (`bridge_demo_connector_roundtrips`), FFI/CLI surface, and the full desktop
+> **rail** / mobile **drawer** unified-inbox UI with network badges + a bridged
+> "not private" indicator + a Bridges settings screen. **Phase 2 (NEXT):** a real
+> `matrix` connector (`matrix-sdk`) + a docker bundle (Conduit + mautrix-
+> {telegram,discord,googlechat,meta}) so the four target networks light up.
+> Details below (B1–B4 describe the full end-state).
 
 Goal: let a user see and use **other chat networks** (WhatsApp, Signal, Telegram,
 XMPP, IRC, SMS, iMessage, …) inside Sideband — one **shared inbox**, switch

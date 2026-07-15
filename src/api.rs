@@ -346,6 +346,126 @@ pub fn api_set_status(profile_path: &str, status: &str) -> Result<bool> {
     Ok(true)
 }
 
+// ── Beeper-style bridges ─────────────────────────────────────────────────────
+//
+// A bridge account connects a non-Sideband network (Telegram, Discord, a Matrix
+// homeserver aggregating mautrix bridges, …). Everything here is opt-in and
+// explicitly *not* part of the private Sideband trust domain: bridged
+// conversations always carry network != "native" so the UI flags them as not
+// end-to-end private.
+
+pub fn api_list_bridge_accounts(profile_path: &str) -> Result<Vec<crate::BridgeAccountRow>> {
+    let profile = expand_profile(profile_path);
+    crate::list_bridge_accounts(&profile)
+}
+
+/// Create or update a bridge account. `enabled` controls whether serve spawns
+/// its connector. `config_json` is connector-specific (may name the connector
+/// command); pass "{}" for the bundled default.
+pub fn api_add_bridge_account(
+    profile_path: &str,
+    id: &str,
+    network: &str,
+    display_name: &str,
+    config_json: &str,
+    enabled: bool,
+) -> Result<bool> {
+    if id.trim().is_empty() || network.trim().is_empty() {
+        return Err(anyhow!("bridge account id and network are required"));
+    }
+    let profile = expand_profile(profile_path);
+    let config = if config_json.trim().is_empty() {
+        "{}"
+    } else {
+        config_json
+    };
+    crate::upsert_bridge_account(&profile, id, network, display_name, config, enabled)?;
+    Ok(true)
+}
+
+pub fn api_set_bridge_enabled(profile_path: &str, id: &str, enabled: bool) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::set_bridge_account_enabled(&profile, id, enabled)
+}
+
+pub fn api_delete_bridge_account(profile_path: &str, id: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::delete_bridge_account(&profile, id)
+}
+
+/// Kick a bridge account's login/connect flow. For Phase-1 connectors this just
+/// ensures the account is enabled + connecting; the serve loop's bridge manager
+/// (re)starts the connector on its next tick.
+pub fn api_bridge_login(profile_path: &str, id: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::set_bridge_account_enabled(&profile, id, true)?;
+    crate::set_bridge_account_status(&profile, id, "connecting")?;
+    Ok(true)
+}
+
+/// List bridged conversations. Pass an empty `account_id` for all networks.
+pub fn api_list_bridge_conversations(
+    profile_path: &str,
+    account_id: &str,
+) -> Result<Vec<crate::BridgeConversationRow>> {
+    let profile = expand_profile(profile_path);
+    let acc = if account_id.trim().is_empty() {
+        None
+    } else {
+        Some(account_id)
+    };
+    crate::list_bridge_conversations(&profile, acc)
+}
+
+pub fn api_list_bridge_messages(
+    profile_path: &str,
+    conversation_id: &str,
+    limit: usize,
+) -> Result<Vec<ApiMessage>> {
+    let profile = expand_profile(profile_path);
+    let rows = crate::list_bridge_history(&profile, conversation_id, limit)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ApiMessage {
+            id: r.id,
+            direction: r.direction,
+            contact: r.contact,
+            onion: r.onion,
+            body: r.body,
+            timestamp_ms: r.timestamp_ms,
+            status: match r.status {
+                3 => "read".to_string(),
+                2 => "failed".to_string(),
+                1 => "delivered".to_string(),
+                _ => "sent".to_string(),
+            },
+            created_at: r.created_at,
+            group_id: String::new(),
+        })
+        .collect())
+}
+
+/// Queue an outbound message to a bridged conversation. It is written to history
+/// immediately and delivered by the connector on the serve loop's next tick.
+pub fn api_send_bridge_message(
+    profile_path: &str,
+    conversation_id: &str,
+    text: &str,
+) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::bridge_send(&profile, conversation_id, text)?;
+    Ok(true)
+}
+
+pub fn api_mark_bridge_conversation_read(
+    profile_path: &str,
+    conversation_id: &str,
+) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::mark_bridge_conversation_read(&profile, conversation_id)?;
+    Ok(true)
+}
+
 /// Whether LAN discovery + delivery is enabled (default off).
 pub fn api_get_lan_enabled(profile_path: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
@@ -929,6 +1049,127 @@ pub extern "C" fn sideband_api_set_status(
         api_set_status(
             cstr_arg(profile_path, "profile_path")?,
             cstr_arg(status, "status")?,
+        )
+    })())
+}
+
+// ── Beeper-style bridges: FFI exports ────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn sideband_api_list_bridge_accounts(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_list_bridge_accounts(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_add_bridge_account(
+    profile_path: *const c_char,
+    id: *const c_char,
+    network: *const c_char,
+    display_name: *const c_char,
+    config_json: *const c_char,
+    enabled: bool,
+) -> *mut c_char {
+    json_response((|| {
+        api_add_bridge_account(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(id, "id")?,
+            cstr_arg(network, "network")?,
+            cstr_arg(display_name, "display_name")?,
+            cstr_arg(config_json, "config_json")?,
+            enabled,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_set_bridge_enabled(
+    profile_path: *const c_char,
+    id: *const c_char,
+    enabled: bool,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_bridge_enabled(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(id, "id")?,
+            enabled,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_delete_bridge_account(
+    profile_path: *const c_char,
+    id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_delete_bridge_account(cstr_arg(profile_path, "profile_path")?, cstr_arg(id, "id")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_bridge_login(
+    profile_path: *const c_char,
+    id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_bridge_login(cstr_arg(profile_path, "profile_path")?, cstr_arg(id, "id")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_list_bridge_conversations(
+    profile_path: *const c_char,
+    account_id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_list_bridge_conversations(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(account_id, "account_id")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_list_bridge_messages(
+    profile_path: *const c_char,
+    conversation_id: *const c_char,
+    limit: usize,
+) -> *mut c_char {
+    json_response((|| {
+        api_list_bridge_messages(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(conversation_id, "conversation_id")?,
+            limit,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_send_bridge_message(
+    profile_path: *const c_char,
+    conversation_id: *const c_char,
+    text: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_send_bridge_message(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(conversation_id, "conversation_id")?,
+            cstr_arg(text, "text")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_mark_bridge_conversation_read(
+    profile_path: *const c_char,
+    conversation_id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_mark_bridge_conversation_read(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(conversation_id, "conversation_id")?,
         )
     })())
 }
