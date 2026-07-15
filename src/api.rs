@@ -122,6 +122,7 @@ pub fn api_list_contacts(profile_path: &str) -> Result<Vec<ApiContact>> {
             pending: c.pending,
             blocked: c.blocked,
             ratchet_active: crate::ratchet_is_active(&profile, &c.name),
+            presence: crate::get_contact_presence(&profile, &c.pubkey_b64),
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -317,6 +318,18 @@ pub fn api_get_read_receipts(profile_path: &str) -> Result<bool> {
 pub fn api_set_read_receipts(profile_path: &str, enabled: bool) -> Result<bool> {
     let profile = expand_profile(profile_path);
     crate::set_read_receipts_enabled(&profile, enabled)?;
+    Ok(true)
+}
+
+/// Whether this profile shares live presence with contacts.
+pub fn api_get_share_presence(profile_path: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    Ok(crate::share_presence_enabled(&profile))
+}
+
+pub fn api_set_share_presence(profile_path: &str, enabled: bool) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::set_share_presence_enabled(&profile, enabled)?;
     Ok(true)
 }
 
@@ -870,6 +883,24 @@ pub extern "C" fn sideband_api_set_read_receipts(
     })())
 }
 
+/// Whether this profile shares live presence with contacts (default off).
+#[no_mangle]
+pub extern "C" fn sideband_api_get_share_presence(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_get_share_presence(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_set_share_presence(
+    profile_path: *const c_char,
+    enabled: bool,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_share_presence(cstr_arg(profile_path, "profile_path")?, enabled)
+    })())
+}
+
 /// Whether LAN discovery + delivery is enabled (default off).
 #[no_mangle]
 pub extern "C" fn sideband_api_get_lan_enabled(profile_path: *const c_char) -> *mut c_char {
@@ -979,6 +1010,7 @@ pub extern "C" fn sideband_api_add_contact(
                 pending: false,
                 blocked: false,
                 ratchet_active: false,
+                presence: String::new(),
             },
         )
     })())

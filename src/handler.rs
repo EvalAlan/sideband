@@ -16,12 +16,12 @@ use crate::transport::tor::TorTransport;
 use crate::{
     contact_is_blocked, decrypt_and_verify, discover_or_update_group,
     mark_delivered_by_fingerprint, mark_read_up_to, message_replay_fingerprint,
-    resolve_contact_name_by_pubkey, send_delivered_receipt, send_sync_ack, send_sync_inventory,
-    send_sync_items, send_sync_request, send_typed_message, set_contact_transport_prop,
-    store_message, store_message_for_conversation, store_message_for_conversation_expiring,
-    ChatMessage, ContactsMap, DeliveryStatus, FileAckPayload, FileChunkPayload, FileInlinePayload,
-    FileOfferPayload, GroupMessagePayload, IncomingFileState, ReceiptPayload,
-    TransportPropsPayload, TuiEvent,
+    note_contact_presence, resolve_contact_name_by_pubkey, send_delivered_receipt, send_sync_ack,
+    send_sync_inventory, send_sync_items, send_sync_request, send_typed_message,
+    set_contact_transport_prop, store_message, store_message_for_conversation,
+    store_message_for_conversation_expiring, ChatMessage, ContactsMap, DeliveryStatus,
+    FileAckPayload, FileChunkPayload, FileInlinePayload, FileOfferPayload, GroupMessagePayload,
+    IncomingFileState, PresencePayload, ReceiptPayload, TransportPropsPayload, TuiEvent,
 };
 
 type TorClientArc = Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>;
@@ -94,6 +94,10 @@ pub async fn handle_inbound(
 
     if msg.r#type == "receipt" {
         return handle_receipt(profile, contacts, msg).await;
+    }
+
+    if msg.r#type == "presence" {
+        return handle_presence(profile, contacts, msg);
     }
 
     if msg.r#type == "transport_props" {
@@ -373,6 +377,47 @@ pub(crate) async fn handle_receipt(
         }
         other => tracing::debug!(state = %other, "unknown receipt state"),
     }
+    Ok(())
+}
+
+/// Handle an inbound presence heartbeat (A7): verify it came from an accepted
+/// contact, then record their state with a receiver-stamped validity window.
+/// Never stored as a message or shown; `seq` gates out stale/reordered packets.
+pub(crate) fn handle_presence(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let (plaintext, verified) = match decrypt_and_verify(msg, profile, contacts) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    if !verified {
+        return Ok(());
+    }
+    // Presence is only meaningful from an accepted, non-blocked contact.
+    if !contacts
+        .values()
+        .any(|c| c.pubkey_b64 == msg.from && !c.pending && !c.blocked)
+    {
+        return Ok(());
+    }
+    let payload: PresencePayload = match serde_json::from_str(&plaintext) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    if payload.kind != "presence" {
+        return Ok(());
+    }
+    let state = match payload.state.as_str() {
+        "online" | "away" => payload.state.as_str(),
+        _ => return Ok(()),
+    };
+    // Clamp the sender-chosen TTL so a malicious contact cannot claim to be
+    // "online" for an unbounded time. Stamp validity from OUR clock.
+    let ttl = payload.ttl_ms.min(crate::PRESENCE_TTL_MS.saturating_mul(4)) as u128;
+    let now = crate::now_ms_i64().unwrap_or(0).max(0) as u128;
+    note_contact_presence(profile, &msg.from, state, now + ttl, payload.seq)?;
     Ok(())
 }
 

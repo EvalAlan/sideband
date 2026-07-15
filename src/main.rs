@@ -185,6 +185,18 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set whether this profile shares live presence with contacts
+    /// (off by default; tells contacts when you are online).
+    SharePresence {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Turn presence sharing on or off. Omit to just show.
+        #[arg(long)]
+        set: Option<bool>,
+        /// Emit machine-readable JSON ({"enabled": <bool>}) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show or set LAN discovery + delivery (off by default; broadcasts identity
     /// on the local network).
     Lan {
@@ -1443,6 +1455,94 @@ async fn send_typed_message(
     }
 }
 
+/// Send a typed message over a *local* carrier only (LAN/Bluetooth), never Tor.
+/// Returns `true` if delivered, `false` if the contact has no reachable non-Tor
+/// route. Used for presence so heartbeats never build a Tor circuit.
+async fn send_over_local_carrier(
+    profile: &Path,
+    to_onion: &str,
+    contact_name: &str,
+    message_type: &str,
+    plaintext: &str,
+) -> Result<bool> {
+    use crate::transport::registry::RouteEndpoint;
+    let sender_onion = std::env::var("SIDEBAND_REPLY_ONION").unwrap_or_default();
+    let msg = build_outbound_message(
+        profile,
+        contact_name,
+        message_type,
+        plaintext,
+        &sender_onion,
+        None,
+    )?;
+    let payload = format!("{}\n", serde_json::to_string(&msg)?);
+    for route in outbound_routes(profile, contact_name, to_onion) {
+        match route.endpoint() {
+            RouteEndpoint::Lan(addr) => {
+                if crate::transport::lan::send_btp(profile, contact_name, *addr, &payload)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(true);
+                }
+            }
+            RouteEndpoint::Bluetooth(property) => {
+                if crate::transport::bluetooth::send_btp(profile, contact_name, property, &payload)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(true);
+                }
+            }
+            // Never open a Tor circuit just to advertise presence.
+            RouteEndpoint::Tor => break,
+            _ => continue,
+        }
+    }
+    Ok(false)
+}
+
+/// Send one presence heartbeat to a contact over a local carrier only.
+pub(crate) async fn send_presence_to_contact(
+    profile: &Path,
+    contact_name: &str,
+    to_onion: &str,
+    state: &str,
+) -> Result<bool> {
+    // Wall-clock ms as the monotonic sequence: survives restart and only needs to
+    // increase per sender; the receiver keeps the highest it has seen.
+    let seq = now_ms_i64().unwrap_or(0).max(0) as u64;
+    let payload = PresencePayload {
+        kind: "presence".to_string(),
+        state: state.to_string(),
+        ttl_ms: PRESENCE_TTL_MS,
+        seq,
+    };
+    let json = serde_json::to_string(&payload)?;
+    send_over_local_carrier(profile, to_onion, contact_name, "presence", &json).await
+}
+
+/// Broadcast an `online` presence heartbeat to every accepted contact reachable
+/// on a local carrier. No-op when presence sharing is disabled. Never uses Tor.
+pub(crate) async fn broadcast_presence(profile: &Path) -> Result<usize> {
+    if !share_presence_enabled(profile) {
+        return Ok(0);
+    }
+    let contacts = load_contacts(profile)?;
+    let mut sent = 0usize;
+    for contact in contacts.values() {
+        if contact.pending || contact.blocked || contact.onion.is_empty() {
+            continue;
+        }
+        if let Ok(true) =
+            send_presence_to_contact(profile, &contact.name, &contact.onion, "online").await
+        {
+            sent += 1;
+        }
+    }
+    Ok(sent)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum DeliveryStatus {
     Sent = 0,
@@ -1486,6 +1586,23 @@ pub(crate) struct ReceiptPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up_to_ms: Option<u128>,
 }
+
+/// Live-presence heartbeat (A7). Signed+encrypted like a receipt; the receiver
+/// stamps validity from its own clock (`now + ttl_ms`) so sender clock skew never
+/// makes a contact look permanently online, and drops any heartbeat whose `seq`
+/// is not newer than the last one seen from that sender.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PresencePayload {
+    pub kind: String,  // always "presence"
+    pub state: String, // "online" | "away"
+    pub ttl_ms: u64,
+    pub seq: u64,
+}
+
+/// How long a received presence heartbeat stays valid without a refresh.
+pub(crate) const PRESENCE_TTL_MS: u64 = 150_000;
+/// How often the heartbeat scheduler refreshes presence to reachable contacts.
+pub(crate) const PRESENCE_HEARTBEAT_SECS: u64 = 60;
 
 /// Contact-only transport addresses. The outer `ChatMessage` supplies both
 /// encryption and an Ed25519 signature, just like a receipt.
@@ -1726,6 +1843,17 @@ fn init_db(profile: &Path) -> Result<Connection> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint ON messages(msg_fingerprint)",
+        [],
+    )?;
+    // Live presence (A7): ephemeral per-contact heartbeat state. valid_until_ms is
+    // stamped from the receiver's clock; seq gates out stale/reordered heartbeats.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS contact_presence (
+            peer_ed25519   TEXT NOT NULL PRIMARY KEY,
+            state          TEXT NOT NULL,
+            valid_until_ms INTEGER NOT NULL,
+            seq            INTEGER NOT NULL
+        )",
         [],
     )?;
     conn.execute(
@@ -2262,6 +2390,71 @@ pub(crate) fn set_read_receipts_enabled(profile: &Path, enabled: bool) -> Result
         READ_RECEIPTS_KEY,
         if enabled { "true" } else { "false" },
     )
+}
+
+const SHARE_PRESENCE_KEY: &str = "share_presence";
+
+/// Whether this profile broadcasts live presence to contacts. Default OFF:
+/// enabling it tells contacts when you are online (a metadata disclosure).
+pub(crate) fn share_presence_enabled(profile: &Path) -> bool {
+    matches!(get_setting(profile, SHARE_PRESENCE_KEY), Ok(Some(s)) if s == "true")
+}
+
+pub(crate) fn set_share_presence_enabled(profile: &Path, enabled: bool) -> Result<()> {
+    set_setting(
+        profile,
+        SHARE_PRESENCE_KEY,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// Record an inbound presence heartbeat: upsert only if `seq` is newer than the
+/// last one seen from this peer, stamping `valid_until_ms` from our own clock.
+pub(crate) fn note_contact_presence(
+    profile: &Path,
+    peer_ed25519: &str,
+    state: &str,
+    valid_until_ms: u128,
+    seq: u64,
+) -> Result<()> {
+    let conn = init_db(profile)?;
+    conn.execute(
+        "INSERT INTO contact_presence(peer_ed25519, state, valid_until_ms, seq)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(peer_ed25519) DO UPDATE SET
+             state=excluded.state, valid_until_ms=excluded.valid_until_ms, seq=excluded.seq
+         WHERE excluded.seq > contact_presence.seq",
+        params![peer_ed25519, state, valid_until_ms as i64, seq as i64],
+    )?;
+    Ok(())
+}
+
+/// Current presence of a contact by Ed25519 pubkey: "online" / "away" while the
+/// heartbeat is still valid, else "offline" (also "" if we never heard one).
+pub(crate) fn get_contact_presence(profile: &Path, peer_ed25519: &str) -> String {
+    let Ok(conn) = init_db(profile) else {
+        return String::new();
+    };
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT state, valid_until_ms FROM contact_presence WHERE peer_ed25519 = ?1",
+            params![peer_ed25519],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    match row {
+        Some((state, valid_until)) => {
+            let now = now_ms_i64().unwrap_or(i64::MAX);
+            if now < valid_until {
+                state
+            } else {
+                "offline".to_string()
+            }
+        }
+        None => String::new(),
+    }
 }
 
 const LAN_ENABLED_KEY: &str = "lan_enabled";
@@ -3928,6 +4121,20 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        CommandKind::SharePresence { profile, set, json } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if let Some(enabled) = set {
+                set_share_presence_enabled(&profile, enabled)?;
+            }
+            let enabled = share_presence_enabled(&profile);
+            if json {
+                println!("{{\"enabled\":{enabled}}}");
+            } else {
+                println!("share presence: {}", if enabled { "on" } else { "off" });
+            }
+            Ok(())
+        }
         CommandKind::Lan { profile, set, json } => {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
@@ -4958,6 +5165,7 @@ fn contact_list(profile: &Path, json: bool) -> Result<()> {
             x25519_pubkey_b64: Option<&'a str>,
             pending: bool,
             blocked: bool,
+            presence: String,
         }
 
         let mut rows: Vec<_> = contacts
@@ -4969,6 +5177,7 @@ fn contact_list(profile: &Path, json: bool) -> Result<()> {
                 x25519_pubkey_b64: c.x25519_pubkey_b64.as_deref(),
                 pending: c.pending,
                 blocked: c.blocked,
+                presence: get_contact_presence(profile, &c.pubkey_b64),
             })
             .collect();
         rows.sort_by(|a, b| a.name.cmp(b.name));
@@ -5939,6 +6148,7 @@ pub(crate) async fn serve(
     let transfer_state = transport.transfer_state();
     let mut last_lan_props_revision = String::new();
     let mut next_lan_props_check = std::time::Instant::now();
+    let mut next_presence_heartbeat = std::time::Instant::now();
     loop {
         while let Ok(cmd) = control_rx.try_recv() {
             let profile = profile.to_path_buf();
@@ -6386,6 +6596,23 @@ pub(crate) async fn serve(
                 let tc = Arc::clone(&tor_client);
                 tokio::spawn(async move {
                     publish_transport_props(&profile, properties, tc).await;
+                });
+            }
+        }
+
+        // Live presence (A7): broadcast an `online` heartbeat to locally-reachable
+        // contacts on a timer. Opt-in and LAN/BT-only — never opens a Tor circuit.
+        if std::time::Instant::now() >= next_presence_heartbeat {
+            next_presence_heartbeat =
+                std::time::Instant::now() + Duration::from_secs(PRESENCE_HEARTBEAT_SECS);
+            if share_presence_enabled(profile) {
+                let profile = profile.to_path_buf();
+                tokio::spawn(async move {
+                    if let Ok(n) = broadcast_presence(&profile).await {
+                        if n > 0 {
+                            tracing::debug!(sent = n, "presence: heartbeat broadcast");
+                        }
+                    }
                 });
             }
         }

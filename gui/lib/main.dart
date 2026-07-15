@@ -337,6 +337,7 @@ class Contact {
     required this.ratchetActive,
     this.pending = false,
     this.blocked = false,
+    this.presence = '',
   });
   final String name;
   final String onion;
@@ -345,6 +346,9 @@ class Contact {
   final bool ratchetActive;
   final bool pending;
   final bool blocked;
+  // Authoritative live presence from the core: "online"/"away"/"offline", or ""
+  // if this contact does not share presence (fall back to the activity heuristic).
+  final String presence;
 
   String get initial => name.isNotEmpty ? name[0].toUpperCase() : '?';
 
@@ -1017,6 +1021,7 @@ class _Cli {
         ratchetActive: _ratchetActive(item['name'] as String),
         pending: item['pending'] == true,
         blocked: item['blocked'] == true,
+        presence: item['presence'] as String? ?? '',
       ));
     }
     parsed.sort((a, b) => a.name.compareTo(b.name));
@@ -1221,6 +1226,27 @@ class _Cli {
     ]);
   }
 
+  /// Whether this profile shares live presence with contacts (default off).
+  Future<bool> getSharePresence() async {
+    final raw = await _run(['share-presence', '--profile', profile, '--json']);
+    final decoded = jsonDecode(raw);
+    if (decoded is Map && decoded['enabled'] is bool) {
+      return decoded['enabled'] as bool;
+    }
+    return false;
+  }
+
+  Future<void> setSharePresence(bool enabled) async {
+    await _run([
+      'share-presence',
+      '--profile',
+      profile,
+      '--set',
+      enabled ? 'true' : 'false',
+      '--json'
+    ]);
+  }
+
   /// Whether LAN discovery + delivery is enabled (default off).
   Future<bool> getLanEnabled() async {
     final raw = await _run(['lan', '--profile', profile, '--json']);
@@ -1333,6 +1359,16 @@ class _MobileApi {
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
                 ffi.Pointer<Utf8> Function(
                     ffi.Pointer<Utf8>, bool)>('sideband_api_set_read_receipts'),
+        _getSharePresence = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>)>('sideband_api_get_share_presence'),
+        _setSharePresence = ffi.DynamicLibrary.open('libsideband.so')
+            .lookupFunction<
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
+                ffi.Pointer<Utf8> Function(
+                    ffi.Pointer<Utf8>, bool)>('sideband_api_set_share_presence'),
         _getLanEnabled = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
@@ -1467,6 +1503,8 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, int) _setRetryWindow;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getReadReceipts;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setReadReceipts;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getSharePresence;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setSharePresence;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getLanEnabled;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setLanEnabled;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getBluetoothEnabled;
@@ -1632,6 +1670,7 @@ class _MobileApi {
         ratchetActive: item['ratchet_active'] == true,
         pending: item['pending'] == true,
         blocked: item['blocked'] == true,
+        presence: item['presence'] as String? ?? '',
       ));
     }
     contacts.sort((a, b) => a.name.compareTo(b.name));
@@ -1796,6 +1835,25 @@ class _MobileApi {
     final profile = (await profilePath()).toNativeUtf8();
     try {
       _decode<Object?>(_setReadReceipts(profile, enabled));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  /// Whether this profile shares live presence with contacts (default off).
+  Future<bool> getSharePresence() async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      return _decode<bool>(_getSharePresence(profile));
+    } finally {
+      calloc.free(profile);
+    }
+  }
+
+  Future<void> setSharePresence(bool enabled) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    try {
+      _decode<Object?>(_setSharePresence(profile, enabled));
     } finally {
       calloc.free(profile);
     }
@@ -2328,6 +2386,9 @@ class _ChatScreenState extends State<_ChatScreen>
   // Whether we send read receipts for 1:1 conversations. Persisted in the
   // profile; loaded for real when Settings opens (see `_showSettings`).
   bool _sendReadReceipts = true;
+  // Whether we broadcast live presence to contacts (persisted; default off —
+  // tells contacts when you're online). Loaded when Settings opens.
+  bool _sharePresence = false;
   // Whether LAN discovery + delivery is enabled (persisted; default off — a LAN
   // beacon advertises this identity on the local network). Loaded in Settings.
   bool _lanEnabled = false;
@@ -2414,18 +2475,27 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
-  /// True only if we observed a live inbound message from `contact` within the
-  /// online window. There is no active heartbeat, so this is honest evidence of
-  /// recent reachability rather than a sticky flag.
-  bool _isOnline(String contact) {
+  /// Resolved presence: the contact's authoritative live-heartbeat state when
+  /// they share presence ("online"/"away"/"offline"), otherwise "online" if the
+  /// activity heuristic saw them recently, else "" (unknown/offline).
+  String _presenceState(String contact) {
+    for (final c in _contacts) {
+      if (c.name == contact && c.presence.isNotEmpty) return c.presence;
+    }
     final seen = _lastPresence[contact];
-    return seen != null && DateTime.now().difference(seen) < _onlineWindow;
+    if (seen != null && DateTime.now().difference(seen) < _onlineWindow) {
+      return 'online';
+    }
+    return '';
   }
 
+  bool _isOnline(String contact) => _presenceState(contact) == 'online';
+
   String _presenceLabel(String contactName) {
-    final isOnline = _isOnline(contactName);
+    final state = _presenceState(contactName);
+    if (state == 'online') return 'online';
+    if (state == 'away') return 'away';
     final lastSeen = _lastSeen[contactName];
-    if (isOnline) return 'online';
     if (lastSeen == null) return 'last seen unknown';
     final diff = DateTime.now().difference(lastSeen);
     if (diff.inMinutes < 1) return 'last seen just now';
@@ -3252,6 +3322,20 @@ class _ChatScreenState extends State<_ChatScreen>
       if (mounted) setState(() => _sendReadReceipts = enabled);
     } catch (e) {
       if (mounted) setState(() => _error = 'could not set read receipts: $e');
+    }
+  }
+
+  /// Persist the presence-sharing preference via the active backend.
+  Future<void> _setSharePresence(bool enabled) async {
+    try {
+      if (_canUseMobileBackend && _mobile != null) {
+        await _mobile!.setSharePresence(enabled);
+      } else {
+        await _cli.setSharePresence(enabled);
+      }
+      if (mounted) setState(() => _sharePresence = enabled);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'could not set presence sharing: $e');
     }
   }
 
@@ -5710,6 +5794,13 @@ class _ChatScreenState extends State<_ChatScreen>
           : await _cli.getReadReceipts();
       if (mounted) setState(() => _sendReadReceipts = enabled);
     } catch (_) {}
+    // Load the persisted presence-sharing preference.
+    try {
+      final enabled = (_canUseMobileBackend && _mobile != null)
+          ? await _mobile!.getSharePresence()
+          : await _cli.getSharePresence();
+      if (mounted) setState(() => _sharePresence = enabled);
+    } catch (_) {}
     // Load the persisted LAN-discovery preference.
     try {
       final enabled = (_canUseMobileBackend && _mobile != null)
@@ -5801,6 +5892,18 @@ class _ChatScreenState extends State<_ChatScreen>
                     onChanged: (value) {
                       setDialogState(() {});
                       unawaited(_setReadReceipts(value));
+                    },
+                  ),
+                  SwitchListTile(
+                    secondary: const Icon(Icons.circle, size: 18),
+                    title: const Text('Share my presence'),
+                    subtitle: const Text(
+                        'Let contacts see when you are online (sent over LAN/'
+                        'Bluetooth, or piggybacked on messages — never a Tor ping)'),
+                    value: _sharePresence,
+                    onChanged: (value) {
+                      setDialogState(() {});
+                      unawaited(_setSharePresence(value));
                     },
                   ),
                   SwitchListTile(

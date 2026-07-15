@@ -274,9 +274,16 @@ contact online with a TTL; expiry → offline; a lower `seq` is ignored; an
 unverified/blocked sender is dropped; a `state:"away"` renders away.
 
 **Phasing.**
-- P1: `presence` typed message + `handle_presence` + core state + GUI wiring, with
-  **LAN/BT direct + Tor piggyback only** (no new Tor circuits) + the opt-in
-  setting. This is the whole user-visible win at minimal cost.
+- P1: **[x] DONE.** `presence` typed message + `handle_presence` + `contact_presence`
+  DB state + `get_contact_presence` (receiver-stamped TTL, seq guard); a heartbeat
+  scheduler in `serve` that only sends over local carriers (`send_over_local_carrier`
+  — LAN/BT, never a Tor circuit); `share_presence` opt-in setting (CLI
+  `share-presence`, FFI, GUI "Share my presence" toggle); presence surfaced on the
+  contact list (FFI + CLI) and consumed by the GUI (`_presenceState` prefers the
+  authoritative signal, falls back to the activity heuristic). Interop tests:
+  `presence_heartbeat_marks_online_honors_ttl_and_seq`, `presence_from_non_contact_is_dropped`.
+  NOTE: "Tor piggyback" (attaching presence to messages already going over Tor) is
+  P2 — P1 relies on the activity/receipt heuristic for Tor-only contacts.
 - P2: low-frequency active Tor heartbeat for in-conversation contacts; `away`/idle
   states driven by app lifecycle; explicit bye on shutdown.
 - P3: presence as a first-class transport-registry consumer; multi-device.

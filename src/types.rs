@@ -15,6 +15,10 @@ pub struct ApiContact {
     /// contact (i.e. the ratchet state file exists on disk).
     #[serde(default)]
     pub ratchet_active: bool,
+    /// Live presence: "online" / "away" while the contact's latest heartbeat is
+    /// valid, "offline" once it expires, or "" if they never shared presence.
+    #[serde(default)]
+    pub presence: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

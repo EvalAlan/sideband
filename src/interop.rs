@@ -17,14 +17,16 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 use crate::handler::{
-    handle_receipt, handle_text_message, handle_transport_props, parse_inbound_line,
+    handle_presence, handle_receipt, handle_text_message, handle_transport_props,
+    parse_inbound_line,
 };
 use crate::{
-    build_outbound_message, contact_add, enqueue_retry, get_conversation_ttl,
+    build_outbound_message, contact_add, enqueue_retry, get_contact_presence, get_conversation_ttl,
     init_profile_with_name, init_ratchet_for_contact, load_contacts, load_history,
     load_signing_key, load_x25519_public, message_replay_fingerprint, resolve_message_expiry,
     retry_queue_len, set_conversation_ttl, set_message_fingerprint, store_message_for_conversation,
-    DeliveryStatus, ReceiptPayload, TransportProp, TransportPropsPayload, TuiEvent,
+    DeliveryStatus, PresencePayload, ReceiptPayload, TransportProp, TransportPropsPayload,
+    TuiEvent,
 };
 
 // Valid v3 onion addresses (checksum-correct) for harness peers. They are never
@@ -545,6 +547,89 @@ async fn read_receipt_marks_messages_read_up_to_timestamp() {
         status("third"),
         DeliveryStatus::Sent as i64,
         "a message sent after the read watermark must stay unread"
+    );
+}
+
+/// A presence heartbeat (A7) marks a contact online, honors the receiver-stamped
+/// TTL (expiry → offline), and rejects a heartbeat whose seq is not newer.
+#[tokio::test]
+async fn presence_heartbeat_marks_online_honors_ttl_and_seq() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+    let alice_ed = alice.ed25519_b64();
+
+    let deliver = |state: &str, ttl_ms: u64, seq: u64| {
+        let payload = PresencePayload {
+            kind: "presence".into(),
+            state: state.into(),
+            ttl_ms,
+            seq,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let mut msg = build_outbound_message(
+            alice.profile(),
+            "bob",
+            "presence",
+            &json,
+            &alice.onion,
+            None,
+        )
+        .unwrap();
+        let contacts = load_contacts(bob.profile()).unwrap();
+        handle_presence(bob.profile(), &contacts, &mut msg).unwrap();
+    };
+
+    deliver("online", 150_000, 10);
+    assert_eq!(get_contact_presence(bob.profile(), &alice_ed), "online");
+
+    // A lower-seq "away" is stale and ignored.
+    deliver("away", 150_000, 5);
+    assert_eq!(get_contact_presence(bob.profile(), &alice_ed), "online");
+
+    // A newer-seq "away" takes effect.
+    deliver("away", 150_000, 11);
+    assert_eq!(get_contact_presence(bob.profile(), &alice_ed), "away");
+
+    // A newer heartbeat with a 0 TTL is already expired → offline.
+    deliver("online", 0, 12);
+    assert_eq!(get_contact_presence(bob.profile(), &alice_ed), "offline");
+}
+
+/// Presence from a peer who is NOT an accepted contact must be dropped, not
+/// recorded — presence is contact-only.
+#[tokio::test]
+async fn presence_from_non_contact_is_dropped() {
+    let bob = Peer::new("bob", BOB_ONION);
+    let carol = Peer::new("carol", ALICE_ONION);
+    // Carol knows Bob (so she can encrypt to him), but Bob has NOT added Carol.
+    carol.add_contact(&bob, "bob");
+    let carol_ed = carol.ed25519_b64();
+
+    let payload = PresencePayload {
+        kind: "presence".into(),
+        state: "online".into(),
+        ttl_ms: 150_000,
+        seq: 1,
+    };
+    let json = serde_json::to_string(&payload).unwrap();
+    let mut msg = build_outbound_message(
+        carol.profile(),
+        "bob",
+        "presence",
+        &json,
+        &carol.onion,
+        None,
+    )
+    .unwrap();
+    let contacts = load_contacts(bob.profile()).unwrap();
+    handle_presence(bob.profile(), &contacts, &mut msg).unwrap();
+
+    assert_eq!(
+        get_contact_presence(bob.profile(), &carol_ed),
+        "",
+        "presence from a non-contact must not be recorded"
     );
 }
 
