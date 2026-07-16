@@ -820,3 +820,76 @@ async fn ratchet_message_roundtrips() {
     assert_eq!(events[0].1, "ratchet hi");
     assert!(events[0].2, "v3 ratchet message must verify and decrypt");
 }
+
+/// Two live Sideband instances exchange a real message over the LAN carrier on
+/// localhost — no second device, no Tor, no UDP discovery. Alice's core resolves
+/// Bob's LAN address (as it would from a transport-property exchange), sends over
+/// the real BTP-lite TCP carrier, and the message lands decrypted in Bob's
+/// history. This exercises the WiFi/LAN send *and* receive path end to end.
+#[tokio::test]
+async fn lan_two_instances_exchange_a_message_over_localhost() {
+    let alice = Peer::new("alice", ALICE_ONION);
+    let bob = Peer::new("bob", BOB_ONION);
+    alice.add_contact(&bob, "bob");
+    bob.add_contact(&alice, "alice");
+
+    // Bob's real LAN listener on loopback.
+    let (btx, mut brx) = mpsc::channel::<crate::transport::Envelope>(16);
+    let (bob_port, _bob_handle) =
+        crate::transport::lan::spawn_listener(bob.profile().to_path_buf(), btx)
+            .await
+            .unwrap();
+
+    // Alice has LAN enabled and knows Bob's LAN address (transport-property
+    // exchange result) — the only inputs the real send path needs.
+    crate::set_lan_enabled(alice.profile(), true).unwrap();
+    crate::set_contact_transport_prop(
+        alice.profile(),
+        "bob",
+        "lan",
+        &format!("127.0.0.1:{bob_port}"),
+        1,
+    )
+    .unwrap();
+
+    // Bob's inbound pump: real carrier envelope -> parse -> decrypt + store, the
+    // same path serve() runs.
+    let bob_profile = bob.profile().to_path_buf();
+    let pump = tokio::spawn(async move {
+        while let Some(env) = brx.recv().await {
+            let Ok(body) = std::str::from_utf8(&env.body) else {
+                continue;
+            };
+            if let Some(mut msg) = parse_inbound_line(body).unwrap_or(None) {
+                let contacts = load_contacts(&bob_profile).unwrap();
+                let (tx, _rx) = mpsc::channel::<TuiEvent>(8);
+                handle_text_message(&bob_profile, &tx, &contacts, &mut msg, None)
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    // Alice sends over the real local carrier: route resolution -> BTP over TCP.
+    let delivered =
+        crate::send_over_local_carrier(alice.profile(), &bob.onion, "bob", "msg", "hi over wifi")
+            .await
+            .unwrap();
+    assert!(
+        delivered,
+        "LAN carrier should deliver once Bob's address is known"
+    );
+
+    // The message arrives in Bob's history, decrypted and attributed to alice.
+    let mut found = false;
+    for _ in 0..80 {
+        let hist = load_history(bob.profile(), Some("alice"), 50).unwrap();
+        if hist.iter().any(|r| r.body == "hi over wifi") {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(found, "a message sent over LAN must land in Bob's history");
+    pump.abort();
+}
