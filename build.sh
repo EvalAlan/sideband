@@ -60,10 +60,14 @@ resolve_ndk() {
 build_tui() {
   log "Building Rust CLI/TUI (release)..."
   cargo build --release --bin sideband
-  # Bundled bridge connectors (Beeper-style). The demo/loopback connector ships
-  # so the in-app demo bridge works without any external infrastructure.
-  cargo build --release --bin sideband-bridge-demo
+  # Matrix stays a sidecar so its SDK and crypto store never enter the core or
+  # Android cdylib dependency graph.
+  cargo build --release --locked \
+    --manifest-path bridges/matrix-connector/Cargo.toml
+  cp bridges/matrix-connector/target/release/sideband-bridge-matrix \
+    target/release/sideband-bridge-matrix
   log "Built ${REPO_ROOT}/target/release/sideband"
+  log "Built ${REPO_ROOT}/target/release/sideband-bridge-matrix"
 }
 
 # --- android -----------------------------------------------------------------
@@ -184,12 +188,13 @@ build_desktop() {
   mv "${appdir}/usr/bin/sideband_gui" "${appdir}/usr/bin/sideband_gui.bin"
   cp "${REPO_ROOT}/target/release/sideband" "${appdir}/usr/bin/sideband"
   chmod +x "${appdir}/usr/bin/sideband"
-  # Bundle bridge connectors next to `sideband` so the core resolves them as
-  # siblings (see src/bridge.rs). The demo/loopback connector is always shipped.
-  if [[ -f "${REPO_ROOT}/target/release/sideband-bridge-demo" ]]; then
-    cp "${REPO_ROOT}/target/release/sideband-bridge-demo" \
-      "${appdir}/usr/bin/sideband-bridge-demo"
-    chmod +x "${appdir}/usr/bin/sideband-bridge-demo"
+  # Bundle the Matrix provider connector next to `sideband`; the core resolves
+  # provider sidecars as siblings (see src/bridge.rs).
+  local matrix_connector="${REPO_ROOT}/bridges/matrix-connector/target/release/sideband-bridge-matrix"
+  if [[ -f "${matrix_connector}" ]]; then
+    cp "${matrix_connector}" \
+      "${appdir}/usr/bin/sideband-bridge-matrix"
+    chmod +x "${appdir}/usr/bin/sideband-bridge-matrix"
   fi
 
   cat > "${appdir}/usr/bin/sideband_gui" <<'WRAPPER'

@@ -54,6 +54,15 @@ cli_contract() {
     # group list --json (GUI sidebar) must be valid JSON even when empty.
     "$bin" group list --profile "$prof" --json >/dev/null
 
+    # Guided bridge setup uses the app's built-in backend plus DB-backed login commands.
+    "$bin" bridge add --profile "$prof" --id telegram-contract \
+        --network telegram --name Telegram >/dev/null
+    "$bin" bridge login-start --profile "$prof" --id telegram-contract >/dev/null
+    test "$("$bin" bridge login-poll --profile "$prof" --id telegram-contract)" = "null" \
+        || { red "bridge login-poll contract failed"; exit 1; }
+    "$bin" bridge list --profile "$prof" --json | grep -q telegram-contract \
+        || { red "bridge account contract failed"; exit 1; }
+
     "$bin" contact delete --profile "$prof" --name Rocky >/dev/null
     "$bin" contact list --profile "$prof" | grep -q "no contacts" \
         || { red "contact delete did not remove Rocky"; exit 1; }
@@ -65,6 +74,8 @@ cli_contract() {
 run_fast() {
   hr "cargo test (core + interop harness + FFI contract)"
   cargo test
+  hr "bridge provisioning (Bridge v2 login state machine; isolated, no matrix-sdk)"
+  cargo test --manifest-path bridges/provisioning/Cargo.toml
   cli_contract
   hr "flutter test (Dart logic + widgets)"
   (cd gui && "$FLUTTER" test)

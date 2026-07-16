@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Bump when the wire protocol changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Messages the core sends *to* a connector (one JSON object per line).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +35,7 @@ pub enum CoreToConnector {
         protocol: u32,
         account_id: String,
         network: String,
+        profile: String,
         config: serde_json::Value,
     },
     /// Deliver an outbound message to `remote_id`.
@@ -44,7 +45,13 @@ pub enum CoreToConnector {
         text: String,
     },
     /// Ask the connector to (re)start its login/auth flow.
-    Login,
+    Login { input_id: i64 },
+    /// Answer the connector's current interactive login prompt.
+    LoginInput {
+        input_id: i64,
+        step_id: String,
+        value: String,
+    },
     /// Graceful shutdown request.
     Shutdown,
 }
@@ -73,6 +80,8 @@ pub enum ConnectorToCore {
     Message {
         remote_id: String,
         #[serde(default)]
+        event_id: String,
+        #[serde(default)]
         sender: String,
         text: String,
         #[serde(default)]
@@ -85,12 +94,20 @@ pub enum ConnectorToCore {
         #[serde(default)]
         error: String,
     },
-    /// A login hint to surface to the user (e.g. a QR/URL/code). Phase-2 UI.
-    Login {
+    /// A durable login request was accepted by the connector.
+    LoginInputAck { input_id: i64 },
+    /// One step in an interactive provider login flow.
+    LoginPrompt {
+        step_id: String,
+        kind: String,
         #[serde(default)]
-        message: String,
+        prompt: String,
         #[serde(default)]
-        url_or_code: String,
+        qr: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        code: String,
     },
     /// A non-fatal error to log.
     Error { message: String },
@@ -110,10 +127,10 @@ struct ConnectorHandle {
 }
 
 impl ConnectorHandle {
-    fn send(&self, msg: CoreToConnector) {
-        // A closed channel just means the writer task died with the child; the
-        // manager will notice via the disconnected status and restart it.
-        let _ = self.to_child.send(msg);
+    fn send(&self, msg: CoreToConnector) -> Result<()> {
+        self.to_child
+            .send(msg)
+            .map_err(|_| anyhow!("connector writer channel is closed"))
     }
 }
 
@@ -289,12 +306,17 @@ impl BridgeManager {
             child,
             to_child,
         };
+        // Inject the operator homeserver + app-owned internal-account
+        // credentials so the connector can establish its Matrix session without
+        // ever prompting the user for Matrix credentials.
+        let config = crate::bridge_connector_config(&self.profile, &account.config_json)?;
         handle.send(CoreToConnector::Hello {
             protocol: PROTOCOL_VERSION,
             account_id: account.id.clone(),
             network: account.network.clone(),
-            config: serde_json::from_str(&account.config_json).unwrap_or(serde_json::Value::Null),
-        });
+            profile: self.profile.to_string_lossy().into_owned(),
+            config,
+        })?;
         self.connectors.insert(account.id.clone(), handle);
         let _ = crate::set_bridge_account_status(&self.profile, &account.id, "connecting");
         Ok(())
@@ -302,7 +324,7 @@ impl BridgeManager {
 
     async fn stop_account(&mut self, id: &str) {
         if let Some(mut handle) = self.connectors.remove(id) {
-            handle.send(CoreToConnector::Shutdown);
+            let _ = handle.send(CoreToConnector::Shutdown);
             // kill_on_drop handles the child if it does not exit promptly.
             let _ = handle.child.start_kill();
             let _ = crate::set_bridge_account_status(&self.profile, id, "disconnected");
@@ -365,10 +387,16 @@ impl BridgeManager {
             }
             ConnectorToCore::Message {
                 remote_id,
+                event_id,
                 sender,
                 text,
                 timestamp_ms,
             } => {
+                if !event_id.is_empty()
+                    && !crate::claim_bridge_event(profile, account_id, &event_id).unwrap_or(false)
+                {
+                    return;
+                }
                 let ts = if timestamp_ms > 0 {
                     timestamp_ms
                 } else {
@@ -382,9 +410,14 @@ impl BridgeManager {
                 )
                 .unwrap_or_else(|_| crate::bridge_conversation_id(account_id, &remote_id));
                 let sender = if sender.is_empty() { remote_id } else { sender };
-                let _ = crate::insert_bridge_message(
+                if crate::insert_bridge_message(
                     profile, &conv_id, &network, "in", &sender, &text, ts,
-                );
+                )
+                .is_err()
+                    && !event_id.is_empty()
+                {
+                    crate::release_bridge_event(profile, account_id, &event_id);
+                }
             }
             ConnectorToCore::SendResult {
                 outbox_id,
@@ -393,14 +426,45 @@ impl BridgeManager {
             } => {
                 let _ = crate::resolve_bridge_outbox(profile, outbox_id, ok, &error);
             }
-            ConnectorToCore::Login {
-                message,
-                url_or_code,
+            ConnectorToCore::LoginInputAck { input_id } => {
+                let _ = crate::delete_bridge_login_input(profile, input_id);
+            }
+            ConnectorToCore::LoginPrompt {
+                step_id,
+                kind,
+                prompt,
+                qr,
+                url,
+                code,
             } => {
-                info!(account=%account_id, %message, %url_or_code, "bridge: login hint");
+                if kind == "success" {
+                    let _ = crate::clear_bridge_login_prompts(profile, account_id);
+                    let _ = crate::set_bridge_account_status(profile, account_id, "connected");
+                } else if kind == "error" {
+                    let _ = crate::store_bridge_login_prompt(
+                        profile, account_id, &step_id, &kind, &prompt, &qr, &url, &code,
+                    );
+                    let _ = crate::set_bridge_account_status(profile, account_id, "error");
+                } else {
+                    let _ = crate::store_bridge_login_prompt(
+                        profile, account_id, &step_id, &kind, &prompt, &qr, &url, &code,
+                    );
+                    let _ = crate::set_bridge_account_status(profile, account_id, "login_required");
+                }
             }
             ConnectorToCore::Error { message } => {
                 warn!(account=%account_id, %message, "bridge: connector error");
+                let _ = crate::store_bridge_login_prompt(
+                    profile,
+                    account_id,
+                    "connector-error",
+                    "error",
+                    &message,
+                    "",
+                    "",
+                    "",
+                );
+                let _ = crate::set_bridge_account_status(profile, account_id, "error");
             }
         }
     }
@@ -419,21 +483,41 @@ impl BridgeManager {
             let Some(handle) = self.connectors.get(&row.account_id) else {
                 continue; // connector not up yet; retry next tick
             };
-            handle.send(CoreToConnector::Send {
-                outbox_id: row.id,
-                remote_id: row.remote_id,
-                text: row.body,
-            });
-            let _ = crate::mark_bridge_outbox_sent(&self.profile, row.id);
+            if handle
+                .send(CoreToConnector::Send {
+                    outbox_id: row.id,
+                    remote_id: row.remote_id,
+                    text: row.body,
+                })
+                .is_ok()
+            {
+                let _ = crate::mark_bridge_outbox_sent(&self.profile, row.id);
+            }
         }
     }
 
-    /// Trigger a connector's login flow if it is running. (Phase 2: wired to a
-    /// login control command; demo connectors need no login.)
-    #[allow(dead_code)]
-    pub fn login(&self, account_id: &str) {
-        if let Some(handle) = self.connectors.get(account_id) {
-            handle.send(CoreToConnector::Login);
+    /// Forward DB-queued login starts and answers to the listener-owned sidecar.
+    pub fn dispatch_login_inputs(&mut self) {
+        let pending = match crate::take_bridge_login_inputs(&self.profile, 50) {
+            Ok(rows) => rows,
+            Err(e) => {
+                debug!(error=%e, "bridge: failed to read login inputs");
+                return;
+            }
+        };
+        for row in pending {
+            let Some(handle) = self.connectors.get(&row.account_id) else {
+                continue;
+            };
+            if row.step_id == "__start__" {
+                let _ = handle.send(CoreToConnector::Login { input_id: row.id });
+            } else {
+                let _ = handle.send(CoreToConnector::LoginInput {
+                    input_id: row.id,
+                    step_id: row.step_id,
+                    value: row.value,
+                });
+            }
         }
     }
 
@@ -448,26 +532,14 @@ impl BridgeManager {
 
 /// Resolve the command + args to launch a connector for `account`.
 ///
-/// The account's `config_json` may specify `{"command": "...", "args": [...]}`.
-/// Otherwise we fall back to a bundled connector named `sideband-bridge-<net>`
-/// sitting next to the current executable (how the demo + future Matrix
-/// connectors ship).
 fn resolve_connector_command(account: &crate::BridgeAccountRow) -> Result<(String, Vec<String>)> {
-    if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&account.config_json) {
-        if let Some(cmd) = cfg.get("command").and_then(|v| v.as_str()) {
-            let args = cfg
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            return Ok((cmd.to_string(), args));
-        }
-    }
-    let bin = format!("sideband-bridge-{}", account.network);
+    let connector = match account.network.as_str() {
+        "telegram" | "discord" | "googlechat" | "messenger" => "matrix",
+        #[cfg(test)]
+        "login-mock" => "login-mock",
+        other => other,
+    };
+    let bin = format!("sideband-bridge-{connector}");
     if let Some(path) = sibling_binary(&bin) {
         return Ok((path, Vec::new()));
     }

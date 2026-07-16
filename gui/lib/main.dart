@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:tray_manager/tray_manager.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:zxing2/qrcode.dart';
 import 'dart:ffi' as ffi;
@@ -487,6 +488,49 @@ class _History {
 
 // ── Beeper-style bridges ─────────────────────────────────────────────────────
 
+List<String> bridgeAddAccountArgs({
+  required String profile,
+  required String id,
+  required String network,
+  required String name,
+  required bool enable,
+}) {
+  final args = [
+    'bridge',
+    'add',
+    '--profile',
+    profile,
+    '--id',
+    id,
+    '--network',
+    network,
+    '--name',
+    name,
+  ];
+  if (enable) args.add('--enable');
+  return args;
+}
+
+bool bridgeLoginUrlAllowed(Uri uri) =>
+    uri.scheme == 'https' && uri.host.isNotEmpty && uri.userInfo.isEmpty;
+
+List<String> bridgeLoginSubmitArgs({
+  required String profile,
+  required String accountId,
+  required String stepId,
+}) =>
+    [
+      'bridge',
+      'login-submit',
+      '--profile',
+      profile,
+      '--id',
+      accountId,
+      '--step-id',
+      stepId,
+      '--json',
+    ];
+
 /// A configured bridge account (a connection to a non-Sideband network).
 class BridgeAccount {
   const BridgeAccount({
@@ -511,6 +555,37 @@ class BridgeAccount {
         displayName: m['display_name']?.toString() ?? '',
         status: m['status']?.toString() ?? 'disconnected',
         enabled: m['enabled'] == true,
+      );
+}
+
+/// One interactive step in a bridge provider's login flow.
+class BridgeLoginStep {
+  const BridgeLoginStep({
+    required this.accountId,
+    required this.stepId,
+    required this.kind,
+    required this.prompt,
+    required this.qr,
+    required this.url,
+    required this.code,
+  });
+
+  final String accountId;
+  final String stepId;
+  final String kind;
+  final String prompt;
+  final String qr;
+  final String url;
+  final String code;
+
+  factory BridgeLoginStep.fromJson(Map<dynamic, dynamic> m) => BridgeLoginStep(
+        accountId: m['account_id']?.toString() ?? '',
+        stepId: m['step_id']?.toString() ?? '',
+        kind: m['kind']?.toString() ?? '',
+        prompt: m['prompt']?.toString() ?? '',
+        qr: m['qr']?.toString() ?? '',
+        url: m['url']?.toString() ?? '',
+        code: m['code']?.toString() ?? '',
       );
 }
 
@@ -586,7 +661,8 @@ NetworkStyle networkStyle(String network) {
   switch (network) {
     case 'native':
     case 'sideband':
-      return const NetworkStyle(Icons.shield_outlined, Color(0xFF6C63FF), 'Sideband');
+      return const NetworkStyle(
+          Icons.shield_outlined, Color(0xFF6C63FF), 'Sideband');
     case 'telegram':
       return const NetworkStyle(Icons.send, Color(0xFF29A9EB), 'Telegram');
     case 'discord':
@@ -596,17 +672,21 @@ NetworkStyle networkStyle(String network) {
       return const NetworkStyle(Icons.chat, Color(0xFF1A73E8), 'Google Chat');
     case 'messenger':
     case 'meta':
-      return const NetworkStyle(Icons.chat_bubble, Color(0xFF0084FF), 'Messenger');
+      return const NetworkStyle(
+          Icons.chat_bubble, Color(0xFF0084FF), 'Messenger');
     case 'whatsapp':
-      return const NetworkStyle(Icons.chat_bubble_outline, Color(0xFF25D366), 'WhatsApp');
+      return const NetworkStyle(
+          Icons.chat_bubble_outline, Color(0xFF25D366), 'WhatsApp');
     case 'signal':
-      return const NetworkStyle(Icons.lock_outline, Color(0xFF3A76F0), 'Signal');
+      return const NetworkStyle(
+          Icons.lock_outline, Color(0xFF3A76F0), 'Signal');
     case 'slack':
       return const NetworkStyle(Icons.tag, Color(0xFF4A154B), 'Slack');
     case 'matrix':
       return const NetworkStyle(Icons.hub, Color(0xFF0DBD8B), 'Matrix');
     case 'demo':
-      return const NetworkStyle(Icons.smart_toy_outlined, Color(0xFFED8936), 'Demo');
+      return const NetworkStyle(
+          Icons.smart_toy_outlined, Color(0xFFED8936), 'Demo');
     default:
       return NetworkStyle(Icons.hub_outlined, const Color(0xFF9AA0A6),
           network.isEmpty ? 'Bridge' : network);
@@ -964,6 +1044,20 @@ class _Cli {
     return (r.stdout as String).trim();
   }
 
+  Future<String> _runWithStdin(List<String> args, String input) async {
+    final process = await Process.start(_bin, args);
+    process.stdin.write(input);
+    await process.stdin.close();
+    final stdout = await process.stdout.transform(utf8.decoder).join();
+    final stderr = await process.stderr.transform(utf8.decoder).join();
+    final exitCode = await process.exitCode;
+    if (exitCode != 0) {
+      final detail = stderr.trim().isNotEmpty ? stderr.trim() : stdout.trim();
+      throw Exception(detail.isEmpty ? '$_bin exited $exitCode' : detail);
+    }
+    return stdout.trim();
+  }
+
   Future<String> identity() => _run(['identity', '--profile', profile]);
 
   Future<ShareInfo> share(String onion) async {
@@ -1308,8 +1402,8 @@ class _Cli {
   }
 
   Future<List<BridgeConversation>> bridgeConversations() async {
-    final raw = await _run(
-        ['bridge', 'conversations', '--profile', profile, '--json']);
+    final raw =
+        await _run(['bridge', 'conversations', '--profile', profile, '--json']);
     if (raw.trim().isEmpty) return [];
     final decoded = jsonDecode(raw);
     if (decoded is! List) return [];
@@ -1355,25 +1449,51 @@ class _Cli {
     required String id,
     required String network,
     required String name,
-    required String config,
     required bool enable,
   }) async {
-    final args = [
+    await _run(bridgeAddAccountArgs(
+      profile: profile,
+      id: id,
+      network: network,
+      name: name,
+      enable: enable,
+    ));
+  }
+
+  Future<void> bridgeLoginStart(String id) async {
+    await _run([
       'bridge',
-      'add',
+      'login-start',
       '--profile',
       profile,
       '--id',
       id,
-      '--network',
-      network,
-      '--name',
-      name,
-      '--config',
-      config,
-    ];
-    if (enable) args.add('--enable');
-    await _run(args);
+    ]);
+  }
+
+  Future<BridgeLoginStep?> bridgeLoginPoll(String id) async {
+    final raw = await _run([
+      'bridge',
+      'login-poll',
+      '--profile',
+      profile,
+      '--id',
+      id,
+    ]);
+    if (raw.isEmpty) return null;
+    final decoded = jsonDecode(raw);
+    return decoded is Map ? BridgeLoginStep.fromJson(decoded) : null;
+  }
+
+  Future<void> bridgeLoginSubmit(String id, String stepId, String value) async {
+    await _runWithStdin(
+      bridgeLoginSubmitArgs(
+        profile: profile,
+        accountId: id,
+        stepId: stepId,
+      ),
+      value,
+    );
   }
 
   Future<void> setBridgeEnabled(String id, bool enabled) async {
@@ -1536,6 +1656,10 @@ typedef _NativePtr3 = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
 typedef _Ptr3 = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _NativePtr4 = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _Ptr4 = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
 // 3 strings + a bool (for import's `overwrite`).
 typedef _NativePtr3Bool = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Bool);
@@ -1552,10 +1676,20 @@ typedef _NativePtr2Bool = ffi.Pointer<Utf8> Function(
 typedef _Ptr2Bool = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, bool);
 // 5 strings + a bool (add_bridge_account: profile, id, network, name, config, enabled).
-typedef _NativePtr5Bool = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Bool);
-typedef _Ptr5Bool = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
-    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, bool);
+typedef _NativePtr5Bool = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Bool);
+typedef _Ptr5Bool = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    ffi.Pointer<Utf8>,
+    bool);
 
 class _MobileApi {
   _MobileApi()
@@ -1636,8 +1770,8 @@ class _MobileApi {
         _setSharePresence = ffi.DynamicLibrary.open('libsideband.so')
             .lookupFunction<
                 ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Bool),
-                ffi.Pointer<Utf8> Function(
-                    ffi.Pointer<Utf8>, bool)>('sideband_api_set_share_presence'),
+                ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>,
+                    bool)>('sideband_api_set_share_presence'),
         _getStatus = ffi.DynamicLibrary.open('libsideband.so').lookupFunction<
             ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>),
             ffi.Pointer<Utf8> Function(
@@ -1783,7 +1917,8 @@ class _MobileApi {
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getSharePresence;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setSharePresence;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getStatus;
-  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>) _setStatus;
+  final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>)
+      _setStatus;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getLanEnabled;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, bool) _setLanEnabled;
   final ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>) _getBluetoothEnabled;
@@ -1851,6 +1986,9 @@ class _MobileApi {
   _Ptr3 _lookup3(String symbol) => _resolve<_Ptr3>(
       symbol, () => _lib.lookupFunction<_NativePtr3, _Ptr3>(symbol));
 
+  _Ptr4 _lookup4(String symbol) => _resolve<_Ptr4>(
+      symbol, () => _lib.lookupFunction<_NativePtr4, _Ptr4>(symbol));
+
   _Ptr2 _lookup2(String symbol) => _resolve<_Ptr2>(
       symbol, () => _lib.lookupFunction<_NativePtr2, _Ptr2>(symbol));
 
@@ -1895,6 +2033,9 @@ class _MobileApi {
       _lookup2('sideband_api_delete_bridge_account');
   _Ptr2 get _markBridgeRead =>
       _lookup2('sideband_api_mark_bridge_conversation_read');
+  _Ptr2 get _bridgeLoginStart => _lookup2('sideband_api_bridge_login_start');
+  _Ptr2 get _bridgeLoginPoll => _lookup2('sideband_api_bridge_login_poll');
+  _Ptr4 get _bridgeLoginSubmit => _lookup4('sideband_api_bridge_login_submit');
 
   String? _profilePath;
 
@@ -1975,8 +2116,8 @@ class _MobileApi {
   // ── Beeper-style bridges (Android) ─────────────────────────────────────────
 
   Future<List<BridgeAccount>> bridgeAccounts() async {
-    final raw = _withCString1<List<dynamic>>(
-        await profilePath(), _listBridgeAccounts);
+    final raw =
+        _withCString1<List<dynamic>>(await profilePath(), _listBridgeAccounts);
     return raw.whereType<Map>().map((m) => BridgeAccount.fromJson(m)).toList();
   }
 
@@ -1995,8 +2136,7 @@ class _MobileApi {
     final ca = p.toNativeUtf8();
     final cb = conversationId.toNativeUtf8();
     try {
-      final raw =
-          _decode<List<dynamic>>(_listBridgeMessages(ca, cb, limit));
+      final raw = _decode<List<dynamic>>(_listBridgeMessages(ca, cb, limit));
       return raw.whereType<Map>().map(chatMsgFromBridgeJson).toList();
     } finally {
       calloc.free(ca);
@@ -2029,6 +2169,31 @@ class _MobileApi {
       calloc.free(cn);
       calloc.free(cm);
       calloc.free(cc);
+    }
+  }
+
+  Future<void> bridgeLoginStart(String id) async {
+    _withCString2<Object?>(await profilePath(), id, _bridgeLoginStart);
+  }
+
+  Future<BridgeLoginStep?> bridgeLoginPoll(String id) async {
+    final raw =
+        _withCString2<Object?>(await profilePath(), id, _bridgeLoginPoll);
+    return raw is Map ? BridgeLoginStep.fromJson(raw) : null;
+  }
+
+  Future<void> bridgeLoginSubmit(String id, String stepId, String value) async {
+    final p = (await profilePath()).toNativeUtf8();
+    final ci = id.toNativeUtf8();
+    final cs = stepId.toNativeUtf8();
+    final cv = value.toNativeUtf8();
+    try {
+      _decode<Object?>(_bridgeLoginSubmit(p, ci, cs, cv));
+    } finally {
+      calloc.free(p);
+      calloc.free(ci);
+      calloc.free(cs);
+      calloc.free(cv);
     }
   }
 
@@ -2673,6 +2838,30 @@ class _QrPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _QrPainter oldDelegate) =>
       oldDelegate.rows != rows;
+}
+
+List<String> _qrRows(String value) {
+  if (value.isEmpty) return const [];
+  final matrix = Encoder.encode(value, ErrorCorrectionLevel.l).matrix;
+  if (matrix == null) return const [];
+  return [
+    for (var y = 0; y < matrix.height; y++)
+      String.fromCharCodes([
+        for (var x = 0; x < matrix.width; x++) matrix.get(x, y) == 1 ? 49 : 48,
+      ]),
+  ];
+}
+
+Widget _bridgeQrWidget(String value) {
+  if (value.startsWith('data:image/') && value.contains(';base64,')) {
+    try {
+      return Image.memory(base64Decode(value.split(',').last),
+          fit: BoxFit.contain);
+    } on FormatException {
+      return const Icon(Icons.broken_image_outlined, color: Colors.black);
+    }
+  }
+  return CustomPaint(painter: _QrPainter(_qrRows(value)));
 }
 
 class _DisplayNameDialog extends StatefulWidget {
@@ -3773,7 +3962,9 @@ class _ChatScreenState extends State<_ChatScreen>
       }
       if (mounted) setState(() => _sharePresence = enabled);
     } catch (e) {
-      if (mounted) setState(() => _error = 'could not set presence sharing: $e');
+      if (mounted) {
+        setState(() => _error = 'could not set presence sharing: $e');
+      }
     }
   }
 
@@ -4282,12 +4473,14 @@ class _ChatScreenState extends State<_ChatScreen>
   /// Refresh bridge accounts + conversations (and the open bridged chat).
   Future<void> _loadBridges() async {
     try {
-      final accts = _mobileBackend
+      final loadedAccts = _mobileBackend
           ? await _mobile!.bridgeAccounts()
           : await _cli.bridgeAccounts();
-      final convos = _mobileBackend
+      final loadedConvos = _mobileBackend
           ? await _mobile!.bridgeConversations()
           : await _cli.bridgeConversations();
+      final accts = loadedAccts;
+      final convos = loadedConvos;
       if (!mounted) return;
       setState(() {
         _bridgeAccounts = accts;
@@ -4356,25 +4549,46 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
-  Future<void> _createBridgeAccount({
+  Future<bool> _createBridgeAccount({
     required String id,
     required String network,
     required String name,
-    required String config,
     required bool enable,
   }) async {
     try {
       if (_mobileBackend) {
         await _mobile!.addBridgeAccount(
-            id: id, network: network, name: name, config: config, enable: enable);
+            id: id, network: network, name: name, config: '{}', enable: enable);
       } else {
         await _cli.addBridgeAccount(
-            id: id, network: network, name: name, config: config, enable: enable);
+            id: id, network: network, name: name, enable: enable);
       }
       _snack('Bridge "$name" added');
       await _loadBridges();
+      return true;
     } catch (e) {
-      _snack('Add bridge failed: $e');
+      _snack('Could not connect chat app: $e');
+      return false;
+    }
+  }
+
+  Future<void> _startBridgeLogin(String id) async {
+    if (_mobileBackend) {
+      await _mobile!.bridgeLoginStart(id);
+    } else {
+      await _cli.bridgeLoginStart(id);
+    }
+  }
+
+  Future<BridgeLoginStep?> _pollBridgeLogin(String id) =>
+      _mobileBackend ? _mobile!.bridgeLoginPoll(id) : _cli.bridgeLoginPoll(id);
+
+  Future<void> _submitBridgeLogin(
+      String id, String stepId, String value) async {
+    if (_mobileBackend) {
+      await _mobile!.bridgeLoginSubmit(id, stepId, value);
+    } else {
+      await _cli.bridgeLoginSubmit(id, stepId, value);
     }
   }
 
@@ -6922,9 +7136,8 @@ class _ChatScreenState extends State<_ChatScreen>
             padding: EdgeInsets.symmetric(
                 horizontal: inDrawer ? 12 : 0, vertical: 6),
             child: Row(
-              mainAxisAlignment: inDrawer
-                  ? MainAxisAlignment.start
-                  : MainAxisAlignment.center,
+              mainAxisAlignment:
+                  inDrawer ? MainAxisAlignment.start : MainAxisAlignment.center,
               children: [
                 Stack(
                   clipBehavior: Clip.none,
@@ -6987,9 +7200,8 @@ class _ChatScreenState extends State<_ChatScreen>
                         style: TextStyle(
                             color: _t.text,
                             fontSize: 13,
-                            fontWeight: selected
-                                ? FontWeight.w700
-                                : FontWeight.w500)),
+                            fontWeight:
+                                selected ? FontWeight.w700 : FontWeight.w500)),
                   ),
                 ],
               ],
@@ -6998,7 +7210,8 @@ class _ChatScreenState extends State<_ChatScreen>
         ),
       );
       return Padding(
-        padding: EdgeInsets.symmetric(vertical: inDrawer ? 1 : 3, horizontal: 6),
+        padding:
+            EdgeInsets.symmetric(vertical: inDrawer ? 1 : 3, horizontal: 6),
         child: tile,
       );
     }
@@ -7058,12 +7271,13 @@ class _ChatScreenState extends State<_ChatScreen>
         ),
         Divider(color: _t.border, height: 1),
         Padding(
-          padding: EdgeInsets.symmetric(vertical: inDrawer ? 2 : 4, horizontal: 6),
+          padding:
+              EdgeInsets.symmetric(vertical: inDrawer ? 2 : 4, horizontal: 6),
           child: inDrawer
               ? ListTile(
                   dense: true,
                   leading: Icon(Icons.add_link, size: 20, color: _t.primary),
-                  title: Text('Add bridge',
+                  title: Text('Connected apps',
                       style: TextStyle(color: _t.text, fontSize: 13)),
                   onTap: () {
                     Navigator.of(context).maybePop();
@@ -7071,7 +7285,7 @@ class _ChatScreenState extends State<_ChatScreen>
                   },
                 )
               : Tooltip(
-                  message: 'Add bridge',
+                  message: 'Connected apps',
                   child: IconButton(
                     icon: Icon(Icons.add_link, size: 22, color: _t.primary),
                     onPressed: _showBridgesScreen,
@@ -7145,8 +7359,8 @@ class _ChatScreenState extends State<_ChatScreen>
                     width: 40,
                     child: IconButton(
                       padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints.tightFor(
-                          width: 40, height: 44),
+                      constraints:
+                          const BoxConstraints.tightFor(width: 40, height: 44),
                       icon: const Icon(Icons.menu, size: 22),
                       onPressed: () => scaffoldKey.currentState?.openDrawer(),
                       tooltip: 'Networks',
@@ -7246,304 +7460,307 @@ class _ChatScreenState extends State<_ChatScreen>
               ),
             // contacts
             Expanded(
-            child: _error != null && _contacts.isEmpty
-                ? _sidebarError()
-                : _contacts.isEmpty && _groups.isEmpty
-                    ? Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Text(
-                            'No contacts yet.\nUse + or /add <name> <onion> <ed25519> <x25519>.\nCreate groups with the group-add button or /group-create.',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                                color: _t.textDim, fontSize: 12, height: 1.6),
+              child: _error != null && _contacts.isEmpty
+                  ? _sidebarError()
+                  : _contacts.isEmpty && _groups.isEmpty
+                      ? Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(24),
+                            child: Text(
+                              'No contacts yet.\nUse + or /add <name> <onion> <ed25519> <x25519>.\nCreate groups with the group-add button or /group-create.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  color: _t.textDim, fontSize: 12, height: 1.6),
+                            ),
                           ),
-                        ),
-                      )
-                    : ListView.builder(
-                        padding: const EdgeInsets.symmetric(horizontal: 6),
-                        itemCount: _contacts.length +
-                            (_groups.isEmpty ? 0 : _groups.length + 1),
-                        itemBuilder: (_, i) {
-                          if (i >= _contacts.length) {
-                            if (i == _contacts.length) {
-                              return Padding(
-                                padding:
-                                    const EdgeInsets.fromLTRB(14, 14, 14, 6),
-                                child: Text('Groups',
-                                    style: TextStyle(
-                                        color: _t.primary,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w700)),
+                        )
+                      : ListView.builder(
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          itemCount: _contacts.length +
+                              (_groups.isEmpty ? 0 : _groups.length + 1),
+                          itemBuilder: (_, i) {
+                            if (i >= _contacts.length) {
+                              if (i == _contacts.length) {
+                                return Padding(
+                                  padding:
+                                      const EdgeInsets.fromLTRB(14, 14, 14, 6),
+                                  child: Text('Groups',
+                                      style: TextStyle(
+                                          color: _t.primary,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w700)),
+                                );
+                              }
+                              final g = _groups[i - _contacts.length - 1];
+                              return GestureDetector(
+                                onSecondaryTapDown: (details) =>
+                                    _showGroupMenu(g, details.globalPosition),
+                                child: ListTile(
+                                  leading: CircleAvatar(
+                                    radius: 17,
+                                    backgroundColor: _t.surface2,
+                                    child: Icon(Icons.groups,
+                                        size: 17, color: _t.primary),
+                                  ),
+                                  title: Text(g.sidebarLabel,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                          fontSize: 13.5,
+                                          fontWeight: FontWeight.w500,
+                                          color: _t.text)),
+                                  subtitle: Text(g.memberSummary,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                          fontSize: 10.5, color: _t.textDim)),
+                                  trailing: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (_unreadGroups.contains(g.id))
+                                        _unreadDot(),
+                                      PopupMenuButton<String>(
+                                        icon: const Icon(Icons.more_vert,
+                                            size: 17),
+                                        tooltip: 'Group menu',
+                                        color: _t.surface,
+                                        onSelected: (action) async =>
+                                            _handleGroupAction(g, action),
+                                        itemBuilder: (_) => const [
+                                          PopupMenuItem(
+                                              value: 'history',
+                                              child: Text('Show history')),
+                                          PopupMenuItem(
+                                              value: 'clear-history',
+                                              child: Text('Delete history')),
+                                          PopupMenuDivider(),
+                                          PopupMenuItem(
+                                              value: 'edit',
+                                              child: Text('Manage group')),
+                                          PopupMenuItem(
+                                              value: 'delete',
+                                              child: Text('Delete group')),
+                                          PopupMenuDivider(),
+                                          PopupMenuItem(
+                                              value: 'details',
+                                              child: Text('Group details')),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                  selected: _selGroup?.id == g.id,
+                                  onTap: () async {
+                                    try {
+                                      final h = await _historyDispatch(null,
+                                          group: g.id);
+                                      if (!mounted) return;
+                                      setState(() {
+                                        _sel = null;
+                                        _selGroup = g;
+                                        _msgs = _mergePending(h.msgs);
+                                        _unreadGroups.remove(g.id);
+                                      });
+                                      _scrollToBottom();
+                                    } catch (e) {
+                                      if (mounted) {
+                                        setState(() => _error = '$e');
+                                      }
+                                    }
+                                  },
+                                ),
                               );
                             }
-                            final g = _groups[i - _contacts.length - 1];
+                            final c = _contacts[i];
+                            final on = _sel?.name == c.name;
+                            final lastMsg = _lastMsg[c.name];
+                            final presenceText = _presenceLabel(c.name);
                             return GestureDetector(
                               onSecondaryTapDown: (details) =>
-                                  _showGroupMenu(g, details.globalPosition),
+                                  _showContactMenu(c, details.globalPosition),
                               child: ListTile(
-                                leading: CircleAvatar(
-                                  radius: 17,
-                                  backgroundColor: _t.surface2,
-                                  child: Icon(Icons.groups,
-                                      size: 17, color: _t.primary),
+                                selected: on,
+                                leading: Stack(
+                                  clipBehavior: Clip.none,
+                                  children: [
+                                    CircleAvatar(
+                                      radius: 17,
+                                      backgroundColor: c.avatarColor,
+                                      child: Text(c.initial,
+                                          style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w700)),
+                                    ),
+                                    Positioned(
+                                      bottom: -1,
+                                      right: -1,
+                                      child: _presenceDot(c.name),
+                                    ),
+                                  ],
                                 ),
-                                title: Text(g.sidebarLabel,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                        fontSize: 13.5,
-                                        fontWeight: FontWeight.w500,
-                                        color: _t.text)),
-                                subtitle: Text(g.memberSummary,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                        fontSize: 10.5, color: _t.textDim)),
+                                title: Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(c.name,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: 13.5,
+                                            fontWeight: on
+                                                ? FontWeight.w600
+                                                : FontWeight.w500,
+                                            color: on ? _t.primary : _t.text,
+                                          )),
+                                    ),
+                                    if (lastMsg != null)
+                                      Text(
+                                        _hm(lastMsg.ts),
+                                        style: TextStyle(
+                                            fontSize: 10, color: _t.textDim),
+                                      ),
+                                    const SizedBox(width: 6),
+                                    Tooltip(
+                                      message: c.securityDescription,
+                                      child: Icon(_securityIcon(c),
+                                          size: 13, color: _securityColor(c)),
+                                    ),
+                                  ],
+                                ),
+                                subtitle: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    if (lastMsg != null)
+                                      Text(
+                                        _previewText(lastMsg),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                            fontSize: 11, color: _t.textDim),
+                                      )
+                                    else
+                                      Text(
+                                        c.shortOnion,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                            fontSize: 10.5, color: _t.textDim),
+                                      ),
+                                    const SizedBox(height: 1),
+                                    Text(presenceText,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                            fontSize: 10,
+                                            color: _isOnline(c.name)
+                                                ? _t.primary
+                                                : _t.textDim)),
+                                  ],
+                                ),
                                 trailing: Row(
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
-                                    if (_unreadGroups.contains(g.id))
+                                    if (_unreadContacts.contains(c.name))
                                       _unreadDot(),
                                     PopupMenuButton<String>(
+                                      tooltip: 'Contact menu',
                                       icon:
                                           const Icon(Icons.more_vert, size: 17),
-                                      tooltip: 'Group menu',
                                       color: _t.surface,
-                                      onSelected: (action) async =>
-                                          _handleGroupAction(g, action),
-                                      itemBuilder: (_) => const [
-                                        PopupMenuItem(
+                                      onSelected: (action) async {
+                                        switch (action) {
+                                          case 'history':
+                                            await _runSlashCommand(
+                                                '/history ${c.name}');
+                                            return;
+                                          case 'clear-history':
+                                            await _clearHistoryFor(c);
+                                            return;
+                                          case 'ratchet':
+                                            await _startRatchet(c);
+                                            return;
+                                          case 'accept':
+                                            await _acceptContact(c);
+                                            return;
+                                          case 'block':
+                                            await _blockContact(c);
+                                            return;
+                                          case 'unblock':
+                                            await _unblockContact(c);
+                                            return;
+                                          case 'edit':
+                                            await _showEditContactDialog(c);
+                                            return;
+                                          case 'delete':
+                                            await _deleteContact(c);
+                                            return;
+                                          case 'details':
+                                            _showInfo('Contact details',
+                                                '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
+                                            return;
+                                        }
+                                      },
+                                      itemBuilder: (_) => [
+                                        const PopupMenuItem(
                                             value: 'history',
                                             child: Text('Show history')),
-                                        PopupMenuItem(
+                                        const PopupMenuItem(
                                             value: 'clear-history',
                                             child: Text('Delete history')),
-                                        PopupMenuDivider(),
+                                        const PopupMenuDivider(),
                                         PopupMenuItem(
+                                          value: 'ratchet',
+                                          enabled: !c.ratchetActive,
+                                          child: Row(
+                                            children: [
+                                              Icon(Icons.lock_outline,
+                                                  size: 16,
+                                                  color: c.ratchetActive
+                                                      ? _t.primary
+                                                      : _t.textDim),
+                                              const SizedBox(width: 8),
+                                              Text(c.ratchetActive
+                                                  ? 'Forward secrecy active'
+                                                  : 'Enable forward secrecy'),
+                                            ],
+                                          ),
+                                        ),
+                                        const PopupMenuDivider(),
+                                        const PopupMenuItem(
+                                            value: 'accept',
+                                            child: Text('Add pending contact')),
+                                        const PopupMenuItem(
+                                            value: 'block',
+                                            child: Text('Block contact')),
+                                        const PopupMenuItem(
+                                            value: 'unblock',
+                                            child: Text('Unblock contact')),
+                                        const PopupMenuDivider(),
+                                        const PopupMenuItem(
                                             value: 'edit',
-                                            child: Text('Manage group')),
-                                        PopupMenuItem(
+                                            child: Text('Edit contact')),
+                                        const PopupMenuItem(
                                             value: 'delete',
-                                            child: Text('Delete group')),
-                                        PopupMenuDivider(),
-                                        PopupMenuItem(
+                                            child: Text('Delete contact')),
+                                        const PopupMenuDivider(),
+                                        const PopupMenuItem(
                                             value: 'details',
-                                            child: Text('Group details')),
+                                            child: Text('Contact details')),
                                       ],
                                     ),
                                   ],
                                 ),
-                                selected: _selGroup?.id == g.id,
                                 onTap: () async {
-                                  try {
-                                    final h = await _historyDispatch(null,
-                                        group: g.id);
-                                    if (!mounted) return;
-                                    setState(() {
-                                      _sel = null;
-                                      _selGroup = g;
-                                      _msgs = _mergePending(h.msgs);
-                                      _unreadGroups.remove(g.id);
-                                    });
-                                    _scrollToBottom();
-                                  } catch (e) {
-                                    if (mounted) setState(() => _error = '$e');
-                                  }
+                                  setState(() {
+                                    _sel = c;
+                                    _selGroup = null;
+                                    _unreadContacts.remove(c.name);
+                                  });
+                                  await _refresh();
                                 },
                               ),
                             );
-                          }
-                          final c = _contacts[i];
-                          final on = _sel?.name == c.name;
-                          final lastMsg = _lastMsg[c.name];
-                          final presenceText = _presenceLabel(c.name);
-                          return GestureDetector(
-                            onSecondaryTapDown: (details) =>
-                                _showContactMenu(c, details.globalPosition),
-                            child: ListTile(
-                              selected: on,
-                              leading: Stack(
-                                clipBehavior: Clip.none,
-                                children: [
-                                  CircleAvatar(
-                                    radius: 17,
-                                    backgroundColor: c.avatarColor,
-                                    child: Text(c.initial,
-                                        style: const TextStyle(
-                                            color: Colors.white,
-                                            fontSize: 12,
-                                            fontWeight: FontWeight.w700)),
-                                  ),
-                                  Positioned(
-                                    bottom: -1,
-                                    right: -1,
-                                    child: _presenceDot(c.name),
-                                  ),
-                                ],
-                              ),
-                              title: Row(
-                                children: [
-                                  Expanded(
-                                    child: Text(c.name,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: 13.5,
-                                          fontWeight: on
-                                              ? FontWeight.w600
-                                              : FontWeight.w500,
-                                          color: on ? _t.primary : _t.text,
-                                        )),
-                                  ),
-                                  if (lastMsg != null)
-                                    Text(
-                                      _hm(lastMsg.ts),
-                                      style: TextStyle(
-                                          fontSize: 10, color: _t.textDim),
-                                    ),
-                                  const SizedBox(width: 6),
-                                  Tooltip(
-                                    message: c.securityDescription,
-                                    child: Icon(_securityIcon(c),
-                                        size: 13, color: _securityColor(c)),
-                                  ),
-                                ],
-                              ),
-                              subtitle: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (lastMsg != null)
-                                    Text(
-                                      _previewText(lastMsg),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                          fontSize: 11, color: _t.textDim),
-                                    )
-                                  else
-                                    Text(
-                                      c.shortOnion,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                          fontSize: 10.5, color: _t.textDim),
-                                    ),
-                                  const SizedBox(height: 1),
-                                  Text(presenceText,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                          fontSize: 10,
-                                          color: _isOnline(c.name)
-                                              ? _t.primary
-                                              : _t.textDim)),
-                                ],
-                              ),
-                              trailing: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  if (_unreadContacts.contains(c.name))
-                                    _unreadDot(),
-                                  PopupMenuButton<String>(
-                                    tooltip: 'Contact menu',
-                                    icon: const Icon(Icons.more_vert, size: 17),
-                                    color: _t.surface,
-                                    onSelected: (action) async {
-                                      switch (action) {
-                                        case 'history':
-                                          await _runSlashCommand(
-                                              '/history ${c.name}');
-                                          return;
-                                        case 'clear-history':
-                                          await _clearHistoryFor(c);
-                                          return;
-                                        case 'ratchet':
-                                          await _startRatchet(c);
-                                          return;
-                                        case 'accept':
-                                          await _acceptContact(c);
-                                          return;
-                                        case 'block':
-                                          await _blockContact(c);
-                                          return;
-                                        case 'unblock':
-                                          await _unblockContact(c);
-                                          return;
-                                        case 'edit':
-                                          await _showEditContactDialog(c);
-                                          return;
-                                        case 'delete':
-                                          await _deleteContact(c);
-                                          return;
-                                        case 'details':
-                                          _showInfo('Contact details',
-                                              '${c.name}\nsecurity=${c.securityLabel}\nonion=${c.onion}\npubkey=${c.pubkey}\nx25519=${c.x25519Pubkey}');
-                                          return;
-                                      }
-                                    },
-                                    itemBuilder: (_) => [
-                                      const PopupMenuItem(
-                                          value: 'history',
-                                          child: Text('Show history')),
-                                      const PopupMenuItem(
-                                          value: 'clear-history',
-                                          child: Text('Delete history')),
-                                      const PopupMenuDivider(),
-                                      PopupMenuItem(
-                                        value: 'ratchet',
-                                        enabled: !c.ratchetActive,
-                                        child: Row(
-                                          children: [
-                                            Icon(Icons.lock_outline,
-                                                size: 16,
-                                                color: c.ratchetActive
-                                                    ? _t.primary
-                                                    : _t.textDim),
-                                            const SizedBox(width: 8),
-                                            Text(c.ratchetActive
-                                                ? 'Forward secrecy active'
-                                                : 'Enable forward secrecy'),
-                                          ],
-                                        ),
-                                      ),
-                                      const PopupMenuDivider(),
-                                      const PopupMenuItem(
-                                          value: 'accept',
-                                          child: Text('Add pending contact')),
-                                      const PopupMenuItem(
-                                          value: 'block',
-                                          child: Text('Block contact')),
-                                      const PopupMenuItem(
-                                          value: 'unblock',
-                                          child: Text('Unblock contact')),
-                                      const PopupMenuDivider(),
-                                      const PopupMenuItem(
-                                          value: 'edit',
-                                          child: Text('Edit contact')),
-                                      const PopupMenuItem(
-                                          value: 'delete',
-                                          child: Text('Delete contact')),
-                                      const PopupMenuDivider(),
-                                      const PopupMenuItem(
-                                          value: 'details',
-                                          child: Text('Contact details')),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                              onTap: () async {
-                                setState(() {
-                                  _sel = c;
-                                  _selGroup = null;
-                                  _unreadContacts.remove(c.name);
-                                });
-                                await _refresh();
-                              },
-                            ),
-                          );
-                        },
-                      ),
+                          },
+                        ),
             ),
           ],
           // footer
@@ -7628,7 +7845,8 @@ class _ChatScreenState extends State<_ChatScreen>
             child: Container(
               width: badge,
               height: badge,
-              decoration: BoxDecoration(color: ns.color, shape: BoxShape.circle),
+              decoration:
+                  BoxDecoration(color: ns.color, shape: BoxShape.circle),
               child: Icon(ns.icon, size: badge * 0.62, color: Colors.white),
             ),
           ),
@@ -7784,8 +8002,8 @@ class _ChatScreenState extends State<_ChatScreen>
                         style: TextStyle(color: _t.textDim, fontSize: 12)))
                 : ListView.builder(
                     controller: _scroll,
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 10),
                     itemCount: _bridgeMsgs.length,
                     itemBuilder: (_, i) => _bubble(_bridgeMsgs[i]),
                   ),
@@ -7846,8 +8064,9 @@ class _ChatScreenState extends State<_ChatScreen>
 
   // ── Beeper-style bridges: account management ───────────────────────────────
 
-  void _showBridgesScreen() {
-    showDialog<void>(
+  Future<void> _showBridgesScreen() async {
+    if (!mounted) return;
+    await showDialog<void>(
       context: context,
       builder: (ctx) {
         return StatefulBuilder(
@@ -7863,7 +8082,7 @@ class _ChatScreenState extends State<_ChatScreen>
                 children: [
                   Icon(Icons.hub, size: 18, color: _t.primary),
                   const SizedBox(width: 8),
-                  const Text('Bridges'),
+                  const Text('Connected apps'),
                 ],
               ),
               content: SizedBox(
@@ -7878,13 +8097,21 @@ class _ChatScreenState extends State<_ChatScreen>
                       style: TextStyle(
                           color: _t.textDim, fontSize: 11.5, height: 1.4),
                     ),
+                    if (_mobileBackend) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        'Connected apps currently run on desktop. Android '
+                        'support is not available yet.',
+                        style: TextStyle(
+                            color: _t.errorFg, fontSize: 11.5, height: 1.4),
+                      ),
+                    ],
                     const SizedBox(height: 12),
                     if (_bridgeAccounts.isEmpty)
                       Padding(
                         padding: const EdgeInsets.symmetric(vertical: 16),
                         child: Text('No bridges yet.',
-                            style:
-                                TextStyle(color: _t.textDim, fontSize: 12)),
+                            style: TextStyle(color: _t.textDim, fontSize: 12)),
                       )
                     else
                       ConstrainedBox(
@@ -7902,11 +8129,13 @@ class _ChatScreenState extends State<_ChatScreen>
                       alignment: Alignment.centerLeft,
                       child: TextButton.icon(
                         icon: const Icon(Icons.add, size: 18),
-                        label: const Text('Add bridge'),
-                        onPressed: () async {
-                          await _showAddBridgeDialog();
-                          await refresh();
-                        },
+                        label: const Text('Add chat app'),
+                        onPressed: _mobileBackend
+                            ? null
+                            : () async {
+                                await _showAddBridgeDialog();
+                                await refresh();
+                              },
                       ),
                     ),
                   ],
@@ -7941,6 +8170,19 @@ class _ChatScreenState extends State<_ChatScreen>
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          if (a.status != 'connected')
+            IconButton(
+              icon: const Icon(Icons.login, size: 18),
+              tooltip: _mobileBackend
+                  ? 'Login requires the desktop connector'
+                  : 'Continue login',
+              onPressed: _mobileBackend
+                  ? null
+                  : () async {
+                      await _showBridgeLoginDialog(a.id, a.network);
+                      await refresh();
+                    },
+            ),
           Switch(
             value: a.enabled,
             onChanged: (v) async {
@@ -7961,109 +8203,290 @@ class _ChatScreenState extends State<_ChatScreen>
     );
   }
 
-  Future<void> _showAddBridgeDialog() async {
-    const networks = ['demo', 'telegram', 'discord', 'googlechat', 'messenger'];
-    var network = 'demo';
-    final idCtl = TextEditingController();
-    final nameCtl = TextEditingController();
-    final configCtl = TextEditingController(text: '{}');
-    var enable = true;
+  Future<void> _showBridgeLoginDialog(String id, String provider) async {
+    BridgeLoginStep? step;
+    String? failure;
+    var open = true;
+    var submitting = false;
+    StateSetter? updateDialog;
+    final inputCtl = TextEditingController();
+
+    try {
+      await _startBridgeLogin(id);
+    } catch (e) {
+      failure = '$e';
+    }
+
+    Future<void> poll() async {
+      while (open && failure == null) {
+        try {
+          final next = await _pollBridgeLogin(id);
+          if (!open) return;
+          if (next != null) {
+            step = next;
+            updateDialog?.call(() {});
+            if (next.kind == 'success' || next.kind == 'error') return;
+          }
+        } catch (e) {
+          failure = '$e';
+          updateDialog?.call(() {});
+          return;
+        }
+        await Future<void>.delayed(const Duration(seconds: 1));
+      }
+    }
+
+    unawaited(poll());
+    if (!mounted) return;
     await showDialog<void>(
       context: context,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setInner) {
-            return AlertDialog(
-              backgroundColor: _t.surface,
-              title: const Text('Add bridge'),
-              content: SizedBox(
-                width: 360,
-                child: SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      DropdownButtonFormField<String>(
-                        initialValue: network,
-                        dropdownColor: _t.surface,
-                        decoration: const InputDecoration(labelText: 'Network'),
-                        items: [
-                          for (final n in networks)
-                            DropdownMenuItem(
-                                value: n, child: Text(networkStyle(n).label)),
-                        ],
-                        onChanged: (v) => setInner(() => network = v ?? network),
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setInner) {
+          updateDialog = setInner;
+          final current = step;
+          final kind = failure != null ? 'error' : current?.kind ?? '';
+          final prompt = failure ?? current?.prompt ?? '';
+          final terminal = kind == 'success' || kind == 'error';
+          return AlertDialog(
+            backgroundColor: _t.surface,
+            title: Row(
+              children: [
+                Icon(networkStyle(provider).icon,
+                    size: 20, color: networkStyle(provider).color),
+                const SizedBox(width: 8),
+                Text('Sign in to ${networkStyle(provider).label}'),
+              ],
+            ),
+            content: SizedBox(
+              width: 380,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (current == null && failure == null) ...[
+                      const CircularProgressIndicator(),
+                      const SizedBox(height: 16),
+                      const Text('Waiting for the provider…'),
+                    ] else ...[
+                      Icon(
+                        kind == 'success'
+                            ? Icons.check_circle_outline
+                            : kind == 'error'
+                                ? Icons.error_outline
+                                : Icons.login,
+                        color: kind == 'success'
+                            ? Colors.green
+                            : kind == 'error'
+                                ? _t.errorFg
+                                : _t.primary,
+                        size: terminal ? 46 : 28,
                       ),
-                      TextField(
-                        controller: idCtl,
-                        decoration: const InputDecoration(
-                            labelText: 'Account id (unique)'),
-                      ),
-                      TextField(
-                        controller: nameCtl,
-                        decoration: const InputDecoration(
-                            labelText: 'Display name (optional)'),
-                      ),
-                      TextField(
-                        controller: configCtl,
-                        decoration:
-                            const InputDecoration(labelText: 'Config JSON'),
-                        maxLines: 2,
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Checkbox(
-                            value: enable,
-                            onChanged: (v) =>
-                                setInner(() => enable = v ?? true),
+                      if (prompt.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        Text(prompt,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: _t.text, height: 1.4)),
+                      ],
+                      if (current != null &&
+                          kind == 'qr' &&
+                          current.qr.isNotEmpty) ...[
+                        const SizedBox(height: 16),
+                        Container(
+                          color: Colors.white,
+                          padding: const EdgeInsets.all(12),
+                          child: SizedBox.square(
+                            dimension: 220,
+                            child: _bridgeQrWidget(current.qr),
                           ),
-                          const Text('Enable now'),
-                        ],
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.only(top: 6),
-                        child: Text(
-                          network == 'demo'
-                              ? 'The demo bridge is a local echo connector for '
-                                  'testing — no account needed.'
-                              : 'Real networks need the mautrix bridge stack + a '
-                                  'Matrix connector (see docs/BRIDGES.md).',
-                          style: TextStyle(color: _t.textDim, fontSize: 11),
                         ),
-                      ),
+                      ],
+                      if (current != null && current.url.isNotEmpty) ...[
+                        const SizedBox(height: 16),
+                        FilledButton.icon(
+                          icon: const Icon(Icons.open_in_new, size: 18),
+                          label: const Text('Open sign-in page'),
+                          onPressed: () async {
+                            final uri = Uri.tryParse(current.url);
+                            if (uri == null ||
+                                !bridgeLoginUrlAllowed(uri) ||
+                                !await launchUrl(uri,
+                                    mode: LaunchMode.externalApplication)) {
+                              _snack('Could not open ${current.url}');
+                            }
+                          },
+                        ),
+                        const SizedBox(height: 8),
+                        SelectableText(current.url,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: _t.textDim, fontSize: 11)),
+                      ],
+                      if (current != null && current.code.isNotEmpty) ...[
+                        const SizedBox(height: 16),
+                        SelectableText(current.code,
+                            style: TextStyle(
+                                color: _t.primary,
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 2)),
+                        TextButton.icon(
+                          icon: const Icon(Icons.copy, size: 16),
+                          label: const Text('Copy code'),
+                          onPressed: () => Clipboard.setData(
+                              ClipboardData(text: current.code)),
+                        ),
+                      ],
+                      if (current != null &&
+                          (kind == 'text_input' ||
+                              kind == 'password_input')) ...[
+                        const SizedBox(height: 16),
+                        TextField(
+                          controller: inputCtl,
+                          autofocus: true,
+                          enabled: !submitting,
+                          obscureText: kind == 'password_input',
+                          decoration:
+                              const InputDecoration(labelText: 'Response'),
+                          onSubmitted: submitting
+                              ? null
+                              : (_) async {
+                                  final value = inputCtl.text;
+                                  if (value.isEmpty) return;
+                                  setInner(() => submitting = true);
+                                  try {
+                                    await _submitBridgeLogin(
+                                        id, current.stepId, value);
+                                    inputCtl.clear();
+                                  } catch (e) {
+                                    failure = '$e';
+                                  }
+                                  if (ctx.mounted) {
+                                    setInner(() => submitting = false);
+                                  }
+                                },
+                        ),
+                      ],
                     ],
-                  ),
+                  ],
                 ),
               ),
-              actions: [
-                TextButton(
-                    onPressed: () => Navigator.of(ctx).pop(),
-                    child: const Text('Cancel')),
+            ),
+            actions: [
+              if (current != null &&
+                  (kind == 'text_input' || kind == 'password_input'))
                 FilledButton(
-                  onPressed: () async {
-                    final id = idCtl.text.trim().isEmpty
-                        ? '$network-${DateTime.now().millisecondsSinceEpoch}'
-                        : idCtl.text.trim();
-                    Navigator.of(ctx).pop();
-                    await _createBridgeAccount(
-                      id: id,
-                      network: network,
-                      name: nameCtl.text.trim(),
-                      config: configCtl.text.trim().isEmpty
-                          ? '{}'
-                          : configCtl.text.trim(),
-                      enable: enable,
-                    );
-                  },
-                  child: const Text('Add'),
+                  onPressed: submitting
+                      ? null
+                      : () async {
+                          final value = inputCtl.text;
+                          if (value.isEmpty) return;
+                          setInner(() => submitting = true);
+                          try {
+                            await _submitBridgeLogin(id, current.stepId, value);
+                            inputCtl.clear();
+                          } catch (e) {
+                            failure = '$e';
+                          }
+                          if (ctx.mounted) {
+                            setInner(() => submitting = false);
+                          }
+                        },
+                  child: submitting
+                      ? const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Text('Continue'),
+                ),
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: Text(terminal ? 'Done' : 'Cancel'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    open = false;
+    updateDialog = null;
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    inputCtl.dispose();
+    await _loadBridges();
+  }
+
+  Future<void> _showAddBridgeDialog() async {
+    const networks = ['telegram', 'discord', 'googlechat', 'messenger'];
+    var network = networks.first;
+    final nameCtl = TextEditingController();
+    String? createdId;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setInner) => AlertDialog(
+          backgroundColor: _t.surface,
+          title: const Text('Add chat app'),
+          content: SizedBox(
+            width: 360,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButtonFormField<String>(
+                  initialValue: network,
+                  dropdownColor: _t.surface,
+                  decoration: const InputDecoration(labelText: 'Provider'),
+                  items: [
+                    for (final n in networks)
+                      DropdownMenuItem(
+                          value: n, child: Text(networkStyle(n).label)),
+                  ],
+                  onChanged: (value) =>
+                      setInner(() => network = value ?? network),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: nameCtl,
+                  decoration: const InputDecoration(
+                      labelText: 'Display name (optional)'),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'You will sign in with the provider next. Bridged chats are '
+                  'not end-to-end private.',
+                  style: TextStyle(color: _t.textDim, fontSize: 11),
                 ),
               ],
-            );
-          },
-        );
-      },
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () async {
+                final id = '$network-${DateTime.now().millisecondsSinceEpoch}';
+                final name = nameCtl.text.trim().isEmpty
+                    ? networkStyle(network).label
+                    : nameCtl.text.trim();
+                if (await _createBridgeAccount(
+                  id: id,
+                  network: network,
+                  name: name,
+                  enable: true,
+                )) {
+                  createdId = id;
+                  if (ctx.mounted) Navigator.of(ctx).pop();
+                }
+              },
+              child: const Text('Add and sign in'),
+            ),
+          ],
+        ),
+      ),
     );
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    nameCtl.dispose();
+    if (createdId != null && mounted) {
+      await _showBridgeLoginDialog(createdId!, network);
+    }
   }
 
   // ── empty state ──────────────────────────────────────────────────────────
@@ -8787,101 +9210,935 @@ class _ChatScreenState extends State<_ChatScreen>
   // emoji (color) presentation.
   static const Map<String, List<String>> _emojiSections = {
     'Smileys': [
-      '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '🥲', '🥹', '😊', '😇',
-      '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😗', '😙', '😚', '😋', '😛',
-      '😝', '😜', '🤪', '🤨', '🧐', '🤓', '😎', '🥸', '🤩', '🥳', '😏', '😒',
-      '😞', '😔', '😟', '😕', '🙁', '☹️', '😣', '😖', '😫', '😩', '🥺', '😢',
-      '😭', '😤', '😠', '😡', '🤬', '🤯', '😳', '🥵', '🥶', '😱', '😨', '😰',
-      '😥', '😓', '🤗', '🤔', '🫣', '🤭', '🫢', '🫡', '🤫', '🤥', '😶', '😐',
-      '😑', '😬', '🙄', '😯', '😦', '😧', '😮', '😲', '🥱', '😴', '🤤', '😪',
-      '😵', '🤐', '🥴', '🤢', '🤮', '🤧', '😷', '🤒', '🤕', '🤑', '🤠', '😈',
-      '👿', '👹', '👺', '🤡', '💩', '👻', '💀', '☠️', '👽', '👾', '🤖', '🎃',
+      '😀',
+      '😃',
+      '😄',
+      '😁',
+      '😆',
+      '😅',
+      '😂',
+      '🤣',
+      '🥲',
+      '🥹',
+      '😊',
+      '😇',
+      '🙂',
+      '🙃',
+      '😉',
+      '😌',
+      '😍',
+      '🥰',
+      '😘',
+      '😗',
+      '😙',
+      '😚',
+      '😋',
+      '😛',
+      '😝',
+      '😜',
+      '🤪',
+      '🤨',
+      '🧐',
+      '🤓',
+      '😎',
+      '🥸',
+      '🤩',
+      '🥳',
+      '😏',
+      '😒',
+      '😞',
+      '😔',
+      '😟',
+      '😕',
+      '🙁',
+      '☹️',
+      '😣',
+      '😖',
+      '😫',
+      '😩',
+      '🥺',
+      '😢',
+      '😭',
+      '😤',
+      '😠',
+      '😡',
+      '🤬',
+      '🤯',
+      '😳',
+      '🥵',
+      '🥶',
+      '😱',
+      '😨',
+      '😰',
+      '😥',
+      '😓',
+      '🤗',
+      '🤔',
+      '🫣',
+      '🤭',
+      '🫢',
+      '🫡',
+      '🤫',
+      '🤥',
+      '😶',
+      '😐',
+      '😑',
+      '😬',
+      '🙄',
+      '😯',
+      '😦',
+      '😧',
+      '😮',
+      '😲',
+      '🥱',
+      '😴',
+      '🤤',
+      '😪',
+      '😵',
+      '🤐',
+      '🥴',
+      '🤢',
+      '🤮',
+      '🤧',
+      '😷',
+      '🤒',
+      '🤕',
+      '🤑',
+      '🤠',
+      '😈',
+      '👿',
+      '👹',
+      '👺',
+      '🤡',
+      '💩',
+      '👻',
+      '💀',
+      '☠️',
+      '👽',
+      '👾',
+      '🤖',
+      '🎃',
     ],
     'Gestures': [
-      '👋', '🤚', '🖐️', '✋', '🖖', '🫱', '🫲', '🫳', '🫴', '👌', '🤌', '🤏',
-      '✌️', '🤞', '🫰', '🤟', '🤘', '🤙', '👈', '👉', '👆', '🖕', '👇', '☝️',
-      '👍', '👎', '✊', '👊', '🤛', '🤜', '👏', '🙌', '🫶', '👐', '🤲', '🤝',
-      '🙏', '✍️', '💅', '🤳', '💪', '🦾', '🦵', '🦶', '👂', '👃', '🧠', '🫀',
-      '🫁', '🦷', '🦴', '👀', '👁️', '👅', '👄', '🫦',
+      '👋',
+      '🤚',
+      '🖐️',
+      '✋',
+      '🖖',
+      '🫱',
+      '🫲',
+      '🫳',
+      '🫴',
+      '👌',
+      '🤌',
+      '🤏',
+      '✌️',
+      '🤞',
+      '🫰',
+      '🤟',
+      '🤘',
+      '🤙',
+      '👈',
+      '👉',
+      '👆',
+      '🖕',
+      '👇',
+      '☝️',
+      '👍',
+      '👎',
+      '✊',
+      '👊',
+      '🤛',
+      '🤜',
+      '👏',
+      '🙌',
+      '🫶',
+      '👐',
+      '🤲',
+      '🤝',
+      '🙏',
+      '✍️',
+      '💅',
+      '🤳',
+      '💪',
+      '🦾',
+      '🦵',
+      '🦶',
+      '👂',
+      '👃',
+      '🧠',
+      '🫀',
+      '🫁',
+      '🦷',
+      '🦴',
+      '👀',
+      '👁️',
+      '👅',
+      '👄',
+      '🫦',
     ],
     'People': [
-      '👶', '🧒', '👦', '👧', '🧑', '👨', '👩', '🧓', '👴', '👵', '🧔', '🧕',
-      '👮', '🕵️', '💂', '👷', '🤴', '👸', '👳', '🦸', '🦹', '🧙', '🧚', '🧛',
-      '🧜', '🧝', '🧞', '🧟', '💆', '💇', '🚶', '🏃', '💃', '🕺', '👯', '🧖',
-      '🧗', '🤺', '🏇', '🏂', '🏄', '🚣', '🏊', '🚴', '🚵', '🤸', '🤼', '🤽',
-      '🤾', '🤹', '🧘', '👪', '🫂',
+      '👶',
+      '🧒',
+      '👦',
+      '👧',
+      '🧑',
+      '👨',
+      '👩',
+      '🧓',
+      '👴',
+      '👵',
+      '🧔',
+      '🧕',
+      '👮',
+      '🕵️',
+      '💂',
+      '👷',
+      '🤴',
+      '👸',
+      '👳',
+      '🦸',
+      '🦹',
+      '🧙',
+      '🧚',
+      '🧛',
+      '🧜',
+      '🧝',
+      '🧞',
+      '🧟',
+      '💆',
+      '💇',
+      '🚶',
+      '🏃',
+      '💃',
+      '🕺',
+      '👯',
+      '🧖',
+      '🧗',
+      '🤺',
+      '🏇',
+      '🏂',
+      '🏄',
+      '🚣',
+      '🏊',
+      '🚴',
+      '🚵',
+      '🤸',
+      '🤼',
+      '🤽',
+      '🤾',
+      '🤹',
+      '🧘',
+      '👪',
+      '🫂',
     ],
     'Animals & Nature': [
-      '🐶', '🐱', '🐭', '🐹', '🐰', '🦊', '🐻', '🐼', '🐨', '🐯', '🦁', '🐮',
-      '🐷', '🐸', '🐵', '🙈', '🙉', '🙊', '🐒', '🐔', '🐧', '🐦', '🐤', '🐣',
-      '🦆', '🦅', '🦉', '🦇', '🐺', '🐗', '🐴', '🦄', '🐝', '🪲', '🐛', '🦋',
-      '🐌', '🐞', '🐜', '🦟', '🦗', '🕷️', '🦂', '🐢', '🐍', '🦎', '🦖', '🦕',
-      '🐙', '🦑', '🦐', '🦞', '🦀', '🐡', '🐠', '🐟', '🐬', '🐳', '🐋', '🦈',
-      '🐊', '🐅', '🐆', '🦓', '🦍', '🦧', '🐘', '🦣', '🦏', '🦛', '🐪', '🐫',
-      '🦒', '🦘', '🐃', '🐂', '🐄', '🐎', '🐖', '🐏', '🐑', '🐐', '🦌', '🐕',
-      '🐩', '🐈', '🐓', '🦃', '🦚', '🦜', '🦢', '🦩', '🕊️', '🐇', '🦝', '🦨',
-      '🦦', '🦥', '🐁', '🐀', '🐿️', '🦔', '🌵', '🎄', '🌲', '🌳', '🌴', '🌱',
-      '🌿', '☘️', '🍀', '🎍', '🍃', '🍂', '🍁', '🌾', '🌺', '🌻', '🌹', '🥀',
-      '🌷', '🌼', '🌸', '💐', '🍄', '🐚', '🌍', '🌕', '🌙', '⭐', '🌟', '✨',
-      '⚡', '🔥', '🌈', '☀️', '⛅', '☁️', '🌧️', '⛈️', '❄️', '☃️', '⛄', '💧',
-      '💦', '🌊',
+      '🐶',
+      '🐱',
+      '🐭',
+      '🐹',
+      '🐰',
+      '🦊',
+      '🐻',
+      '🐼',
+      '🐨',
+      '🐯',
+      '🦁',
+      '🐮',
+      '🐷',
+      '🐸',
+      '🐵',
+      '🙈',
+      '🙉',
+      '🙊',
+      '🐒',
+      '🐔',
+      '🐧',
+      '🐦',
+      '🐤',
+      '🐣',
+      '🦆',
+      '🦅',
+      '🦉',
+      '🦇',
+      '🐺',
+      '🐗',
+      '🐴',
+      '🦄',
+      '🐝',
+      '🪲',
+      '🐛',
+      '🦋',
+      '🐌',
+      '🐞',
+      '🐜',
+      '🦟',
+      '🦗',
+      '🕷️',
+      '🦂',
+      '🐢',
+      '🐍',
+      '🦎',
+      '🦖',
+      '🦕',
+      '🐙',
+      '🦑',
+      '🦐',
+      '🦞',
+      '🦀',
+      '🐡',
+      '🐠',
+      '🐟',
+      '🐬',
+      '🐳',
+      '🐋',
+      '🦈',
+      '🐊',
+      '🐅',
+      '🐆',
+      '🦓',
+      '🦍',
+      '🦧',
+      '🐘',
+      '🦣',
+      '🦏',
+      '🦛',
+      '🐪',
+      '🐫',
+      '🦒',
+      '🦘',
+      '🐃',
+      '🐂',
+      '🐄',
+      '🐎',
+      '🐖',
+      '🐏',
+      '🐑',
+      '🐐',
+      '🦌',
+      '🐕',
+      '🐩',
+      '🐈',
+      '🐓',
+      '🦃',
+      '🦚',
+      '🦜',
+      '🦢',
+      '🦩',
+      '🕊️',
+      '🐇',
+      '🦝',
+      '🦨',
+      '🦦',
+      '🦥',
+      '🐁',
+      '🐀',
+      '🐿️',
+      '🦔',
+      '🌵',
+      '🎄',
+      '🌲',
+      '🌳',
+      '🌴',
+      '🌱',
+      '🌿',
+      '☘️',
+      '🍀',
+      '🎍',
+      '🍃',
+      '🍂',
+      '🍁',
+      '🌾',
+      '🌺',
+      '🌻',
+      '🌹',
+      '🥀',
+      '🌷',
+      '🌼',
+      '🌸',
+      '💐',
+      '🍄',
+      '🐚',
+      '🌍',
+      '🌕',
+      '🌙',
+      '⭐',
+      '🌟',
+      '✨',
+      '⚡',
+      '🔥',
+      '🌈',
+      '☀️',
+      '⛅',
+      '☁️',
+      '🌧️',
+      '⛈️',
+      '❄️',
+      '☃️',
+      '⛄',
+      '💧',
+      '💦',
+      '🌊',
     ],
     'Food & Drink': [
-      '🍏', '🍎', '🍐', '🍊', '🍋', '🍌', '🍉', '🍇', '🍓', '🫐', '🍈', '🍒',
-      '🍑', '🥭', '🍍', '🥥', '🥝', '🍅', '🍆', '🥑', '🥦', '🥬', '🥒', '🌶️',
-      '🫑', '🌽', '🥕', '🧄', '🧅', '🥔', '🍠', '🥐', '🥯', '🍞', '🥖', '🥨',
-      '🧀', '🥚', '🍳', '🧈', '🥞', '🧇', '🥓', '🥩', '🍗', '🍖', '🌭', '🍔',
-      '🍟', '🍕', '🥪', '🥙', '🧆', '🌮', '🌯', '🥗', '🥘', '🫕', '🍝', '🍜',
-      '🍲', '🍛', '🍣', '🍱', '🥟', '🦪', '🍤', '🍙', '🍚', '🍘', '🍥', '🥠',
-      '🍢', '🍡', '🍧', '🍨', '🍦', '🥧', '🧁', '🍰', '🎂', '🍮', '🍭', '🍬',
-      '🍫', '🍿', '🍩', '🍪', '🌰', '🥜', '🍯', '🥛', '🍼', '☕', '🫖', '🍵',
-      '🧃', '🥤', '🧋', '🍶', '🍺', '🍻', '🥂', '🍷', '🥃', '🍸', '🍹', '🧉',
-      '🍾', '🧊', '🥄', '🍴', '🍽️', '🥢',
+      '🍏',
+      '🍎',
+      '🍐',
+      '🍊',
+      '🍋',
+      '🍌',
+      '🍉',
+      '🍇',
+      '🍓',
+      '🫐',
+      '🍈',
+      '🍒',
+      '🍑',
+      '🥭',
+      '🍍',
+      '🥥',
+      '🥝',
+      '🍅',
+      '🍆',
+      '🥑',
+      '🥦',
+      '🥬',
+      '🥒',
+      '🌶️',
+      '🫑',
+      '🌽',
+      '🥕',
+      '🧄',
+      '🧅',
+      '🥔',
+      '🍠',
+      '🥐',
+      '🥯',
+      '🍞',
+      '🥖',
+      '🥨',
+      '🧀',
+      '🥚',
+      '🍳',
+      '🧈',
+      '🥞',
+      '🧇',
+      '🥓',
+      '🥩',
+      '🍗',
+      '🍖',
+      '🌭',
+      '🍔',
+      '🍟',
+      '🍕',
+      '🥪',
+      '🥙',
+      '🧆',
+      '🌮',
+      '🌯',
+      '🥗',
+      '🥘',
+      '🫕',
+      '🍝',
+      '🍜',
+      '🍲',
+      '🍛',
+      '🍣',
+      '🍱',
+      '🥟',
+      '🦪',
+      '🍤',
+      '🍙',
+      '🍚',
+      '🍘',
+      '🍥',
+      '🥠',
+      '🍢',
+      '🍡',
+      '🍧',
+      '🍨',
+      '🍦',
+      '🥧',
+      '🧁',
+      '🍰',
+      '🎂',
+      '🍮',
+      '🍭',
+      '🍬',
+      '🍫',
+      '🍿',
+      '🍩',
+      '🍪',
+      '🌰',
+      '🥜',
+      '🍯',
+      '🥛',
+      '🍼',
+      '☕',
+      '🫖',
+      '🍵',
+      '🧃',
+      '🥤',
+      '🧋',
+      '🍶',
+      '🍺',
+      '🍻',
+      '🥂',
+      '🍷',
+      '🥃',
+      '🍸',
+      '🍹',
+      '🧉',
+      '🍾',
+      '🧊',
+      '🥄',
+      '🍴',
+      '🍽️',
+      '🥢',
     ],
     'Activity': [
-      '⚽', '🏀', '🏈', '⚾', '🥎', '🎾', '🏐', '🏉', '🥏', '🎱', '🪀', '🏓',
-      '🏸', '🏒', '🏑', '🥍', '🏏', '🥅', '⛳', '🪁', '🎣', '🤿', '🥊', '🥋',
-      '🎽', '🛹', '🛼', '⛸️', '🥌', '🎿', '🎯', '🎳', '🎮', '🎰', '🎲', '🧩',
-      '♟️', '🎭', '🎨', '🧵', '🧶', '🎼', '🎤', '🎧', '🎷', '🎸', '🎹', '🎺',
-      '🎻', '🥁', '🎬', '🏹', '🏆', '🥇', '🥈', '🥉', '🏅', '🎗️', '🎟️', '🎫',
-      '🎪', '🎉', '🎊', '🎈', '🎁', '🎀', '🪄',
+      '⚽',
+      '🏀',
+      '🏈',
+      '⚾',
+      '🥎',
+      '🎾',
+      '🏐',
+      '🏉',
+      '🥏',
+      '🎱',
+      '🪀',
+      '🏓',
+      '🏸',
+      '🏒',
+      '🏑',
+      '🥍',
+      '🏏',
+      '🥅',
+      '⛳',
+      '🪁',
+      '🎣',
+      '🤿',
+      '🥊',
+      '🥋',
+      '🎽',
+      '🛹',
+      '🛼',
+      '⛸️',
+      '🥌',
+      '🎿',
+      '🎯',
+      '🎳',
+      '🎮',
+      '🎰',
+      '🎲',
+      '🧩',
+      '♟️',
+      '🎭',
+      '🎨',
+      '🧵',
+      '🧶',
+      '🎼',
+      '🎤',
+      '🎧',
+      '🎷',
+      '🎸',
+      '🎹',
+      '🎺',
+      '🎻',
+      '🥁',
+      '🎬',
+      '🏹',
+      '🏆',
+      '🥇',
+      '🥈',
+      '🥉',
+      '🏅',
+      '🎗️',
+      '🎟️',
+      '🎫',
+      '🎪',
+      '🎉',
+      '🎊',
+      '🎈',
+      '🎁',
+      '🎀',
+      '🪄',
     ],
     'Travel & Places': [
-      '🚗', '🚕', '🚙', '🚌', '🚎', '🏎️', '🚓', '🚑', '🚒', '🚐', '🛻', '🚚',
-      '🚛', '🚜', '🏍️', '🛵', '🚲', '🛴', '🚨', '🚔', '🚍', '🚘', '🚖', '🚡',
-      '🚠', '🚟', '🚃', '🚋', '🚝', '🚄', '🚅', '🚈', '🚂', '🚆', '🚇', '🚊',
-      '🚉', '✈️', '🛫', '🛬', '🛩️', '💺', '🚀', '🛸', '🚁', '🛶', '⛵', '🚤',
-      '🛥️', '🛳️', '⛴️', '🚢', '⚓', '🚧', '⛽', '🚏', '🗺️', '🗿', '🗽', '🗼',
-      '🏰', '🏯', '🏟️', '🎡', '🎢', '🎠', '⛱️', '🏖️', '🏝️', '⛰️', '🏔️', '🌋',
-      '🏕️', '⛺', '🏠', '🏡', '🏢', '🏬', '🏣', '🏥', '🏦', '🏨', '🏪', '🏫',
-      '💒', '🏛️', '⛪', '🕌', '🕍', '🛕', '🌃', '🌆', '🌇', '🌉', '🌁',
+      '🚗',
+      '🚕',
+      '🚙',
+      '🚌',
+      '🚎',
+      '🏎️',
+      '🚓',
+      '🚑',
+      '🚒',
+      '🚐',
+      '🛻',
+      '🚚',
+      '🚛',
+      '🚜',
+      '🏍️',
+      '🛵',
+      '🚲',
+      '🛴',
+      '🚨',
+      '🚔',
+      '🚍',
+      '🚘',
+      '🚖',
+      '🚡',
+      '🚠',
+      '🚟',
+      '🚃',
+      '🚋',
+      '🚝',
+      '🚄',
+      '🚅',
+      '🚈',
+      '🚂',
+      '🚆',
+      '🚇',
+      '🚊',
+      '🚉',
+      '✈️',
+      '🛫',
+      '🛬',
+      '🛩️',
+      '💺',
+      '🚀',
+      '🛸',
+      '🚁',
+      '🛶',
+      '⛵',
+      '🚤',
+      '🛥️',
+      '🛳️',
+      '⛴️',
+      '🚢',
+      '⚓',
+      '🚧',
+      '⛽',
+      '🚏',
+      '🗺️',
+      '🗿',
+      '🗽',
+      '🗼',
+      '🏰',
+      '🏯',
+      '🏟️',
+      '🎡',
+      '🎢',
+      '🎠',
+      '⛱️',
+      '🏖️',
+      '🏝️',
+      '⛰️',
+      '🏔️',
+      '🌋',
+      '🏕️',
+      '⛺',
+      '🏠',
+      '🏡',
+      '🏢',
+      '🏬',
+      '🏣',
+      '🏥',
+      '🏦',
+      '🏨',
+      '🏪',
+      '🏫',
+      '💒',
+      '🏛️',
+      '⛪',
+      '🕌',
+      '🕍',
+      '🛕',
+      '🌃',
+      '🌆',
+      '🌇',
+      '🌉',
+      '🌁',
     ],
     'Objects': [
-      '⌚', '📱', '💻', '⌨️', '🖥️', '🖨️', '🖱️', '🕹️', '💽', '💾', '💿', '📀',
-      '📼', '📷', '📸', '📹', '🎥', '📽️', '📞', '☎️', '📟', '📠', '📺', '📻',
-      '🎙️', '⏱️', '⏲️', '⏰', '🕰️', '⌛', '⏳', '📡', '🔋', '🔌', '💡', '🔦',
-      '🕯️', '🧯', '🛢️', '💸', '💵', '💰', '💳', '🧾', '💎', '⚖️', '🧰', '🔧',
-      '🔨', '🛠️', '⛏️', '🔩', '⚙️', '🧱', '⛓️', '🧲', '🔫', '💣', '🪓', '🔪',
-      '🗡️', '⚔️', '🛡️', '🚬', '⚰️', '🔮', '📿', '🧿', '💈', '⚗️', '🔭', '🔬',
-      '💊', '💉', '🩸', '🩹', '🩺', '🌡️', '🧬', '🦠', '🧪', '🧹', '🧺', '🧻',
-      '🚽', '🚿', '🛁', '🛀', '🧼', '🪥', '🧴', '🛎️', '🔑', '🗝️', '🚪', '🪑',
-      '🛋️', '🛏️', '🖼️', '🛍️', '🛒', '🎁', '🧸', '📦', '📫', '📮', '📋', '📁',
-      '📂', '🗂️', '📅', '📆', '📝', '📄', '📑', '📊', '📈', '📉', '🗒️', '📌',
-      '📍', '📎', '🖇️', '📏', '📐', '✂️', '🖊️', '🖋️', '✒️', '🖌️', '✏️', '📚',
-      '📖', '📗', '📘', '📙', '📓', '📒', '📕', '🔖', '📛', '🔗', '📰',
+      '⌚',
+      '📱',
+      '💻',
+      '⌨️',
+      '🖥️',
+      '🖨️',
+      '🖱️',
+      '🕹️',
+      '💽',
+      '💾',
+      '💿',
+      '📀',
+      '📼',
+      '📷',
+      '📸',
+      '📹',
+      '🎥',
+      '📽️',
+      '📞',
+      '☎️',
+      '📟',
+      '📠',
+      '📺',
+      '📻',
+      '🎙️',
+      '⏱️',
+      '⏲️',
+      '⏰',
+      '🕰️',
+      '⌛',
+      '⏳',
+      '📡',
+      '🔋',
+      '🔌',
+      '💡',
+      '🔦',
+      '🕯️',
+      '🧯',
+      '🛢️',
+      '💸',
+      '💵',
+      '💰',
+      '💳',
+      '🧾',
+      '💎',
+      '⚖️',
+      '🧰',
+      '🔧',
+      '🔨',
+      '🛠️',
+      '⛏️',
+      '🔩',
+      '⚙️',
+      '🧱',
+      '⛓️',
+      '🧲',
+      '🔫',
+      '💣',
+      '🪓',
+      '🔪',
+      '🗡️',
+      '⚔️',
+      '🛡️',
+      '🚬',
+      '⚰️',
+      '🔮',
+      '📿',
+      '🧿',
+      '💈',
+      '⚗️',
+      '🔭',
+      '🔬',
+      '💊',
+      '💉',
+      '🩸',
+      '🩹',
+      '🩺',
+      '🌡️',
+      '🧬',
+      '🦠',
+      '🧪',
+      '🧹',
+      '🧺',
+      '🧻',
+      '🚽',
+      '🚿',
+      '🛁',
+      '🛀',
+      '🧼',
+      '🪥',
+      '🧴',
+      '🛎️',
+      '🔑',
+      '🗝️',
+      '🚪',
+      '🪑',
+      '🛋️',
+      '🛏️',
+      '🖼️',
+      '🛍️',
+      '🛒',
+      '🎁',
+      '🧸',
+      '📦',
+      '📫',
+      '📮',
+      '📋',
+      '📁',
+      '📂',
+      '🗂️',
+      '📅',
+      '📆',
+      '📝',
+      '📄',
+      '📑',
+      '📊',
+      '📈',
+      '📉',
+      '🗒️',
+      '📌',
+      '📍',
+      '📎',
+      '🖇️',
+      '📏',
+      '📐',
+      '✂️',
+      '🖊️',
+      '🖋️',
+      '✒️',
+      '🖌️',
+      '✏️',
+      '📚',
+      '📖',
+      '📗',
+      '📘',
+      '📙',
+      '📓',
+      '📒',
+      '📕',
+      '🔖',
+      '📛',
+      '🔗',
+      '📰',
     ],
     'Symbols': [
-      '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '❣️', '💕',
-      '💞', '💓', '💗', '💖', '💘', '💝', '💟', '💯', '💢', '💥', '💫', '💦',
-      '💨', '💬', '🗨️', '🗯️', '💭', '💤', '✅', '❌', '❎', '➕', '➖', '➗',
-      '✖️', '♾️', '❓', '❔', '❕', '❗', '‼️', '⁉️', '⚠️', '🚫', '⛔', '🔰',
-      '✔️', '☑️', '⭐', '🌟', '✨', '⚡', '🔥', '💧', '⭕', '🔴', '🟠', '🟡',
-      '🟢', '🔵', '🟣', '🟤', '⚫', '⚪', '🟥', '🟧', '🟨', '🟩', '🟦', '🟪',
-      '🟫', '⬛', '⬜', '◼️', '◻️', '▪️', '▫️', '🔶', '🔷', '🔸', '🔹', '🔺',
-      '🔻', '💠', '🔘', '🏁', '🚩', '🎌', '🏴', '🏳️', '🔒', '🔓', '🔏', '🔐',
-      '™️', '©️', '®️', '➡️', '⬅️', '⬆️', '⬇️', '↔️', '↕️', '↩️', '↪️', '🔀',
-      '🔁', '🔂', '▶️', '⏸️', '⏯️', '⏹️', '⏭️', '⏮️', '🔼', '🔽', '⏫', '⏬',
-      '🔊', '🔇', '📢', '📣', '🔔', '🔕', '➰', '➿', '✳️', '✴️', '❇️',
+      '❤️',
+      '🧡',
+      '💛',
+      '💚',
+      '💙',
+      '💜',
+      '🖤',
+      '🤍',
+      '🤎',
+      '💔',
+      '❣️',
+      '💕',
+      '💞',
+      '💓',
+      '💗',
+      '💖',
+      '💘',
+      '💝',
+      '💟',
+      '💯',
+      '💢',
+      '💥',
+      '💫',
+      '💦',
+      '💨',
+      '💬',
+      '🗨️',
+      '🗯️',
+      '💭',
+      '💤',
+      '✅',
+      '❌',
+      '❎',
+      '➕',
+      '➖',
+      '➗',
+      '✖️',
+      '♾️',
+      '❓',
+      '❔',
+      '❕',
+      '❗',
+      '‼️',
+      '⁉️',
+      '⚠️',
+      '🚫',
+      '⛔',
+      '🔰',
+      '✔️',
+      '☑️',
+      '⭐',
+      '🌟',
+      '✨',
+      '⚡',
+      '🔥',
+      '💧',
+      '⭕',
+      '🔴',
+      '🟠',
+      '🟡',
+      '🟢',
+      '🔵',
+      '🟣',
+      '🟤',
+      '⚫',
+      '⚪',
+      '🟥',
+      '🟧',
+      '🟨',
+      '🟩',
+      '🟦',
+      '🟪',
+      '🟫',
+      '⬛',
+      '⬜',
+      '◼️',
+      '◻️',
+      '▪️',
+      '▫️',
+      '🔶',
+      '🔷',
+      '🔸',
+      '🔹',
+      '🔺',
+      '🔻',
+      '💠',
+      '🔘',
+      '🏁',
+      '🚩',
+      '🎌',
+      '🏴',
+      '🏳️',
+      '🔒',
+      '🔓',
+      '🔏',
+      '🔐',
+      '™️',
+      '©️',
+      '®️',
+      '➡️',
+      '⬅️',
+      '⬆️',
+      '⬇️',
+      '↔️',
+      '↕️',
+      '↩️',
+      '↪️',
+      '🔀',
+      '🔁',
+      '🔂',
+      '▶️',
+      '⏸️',
+      '⏯️',
+      '⏹️',
+      '⏭️',
+      '⏮️',
+      '🔼',
+      '🔽',
+      '⏫',
+      '⏬',
+      '🔊',
+      '🔇',
+      '📢',
+      '📣',
+      '🔔',
+      '🔕',
+      '➰',
+      '➿',
+      '✳️',
+      '✴️',
+      '❇️',
     ],
   };
 
@@ -9109,7 +10366,8 @@ class _ChatScreenState extends State<_ChatScreen>
       for (final emoji in entry.value) {
         if (seen.contains(emoji)) continue;
         final keywords = _emojiKeywords[emoji];
-        final keywordMatch = keywords != null && keywords.any((k) => k.contains(q));
+        final keywordMatch =
+            keywords != null && keywords.any((k) => k.contains(q));
         if (categoryMatch || keywordMatch) {
           seen.add(emoji);
           out.add(emoji);
@@ -9183,8 +10441,8 @@ class _ChatScreenState extends State<_ChatScreen>
 
             return SafeArea(
               child: Padding(
-                padding:
-                    EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+                padding: EdgeInsets.only(
+                    bottom: MediaQuery.of(ctx).viewInsets.bottom),
                 child: SizedBox(
                   width: 400,
                   height: 380,
@@ -9452,7 +10710,8 @@ class _ChatScreenState extends State<_ChatScreen>
     // Treat already-delivered/read outbound messages as prior evidence so only
     // receipts observed *after* startup count toward live presence.
     for (final m in h.msgs) {
-      if (m.direction == 'out' && (m.status == 'delivered' || m.status == 'read')) {
+      if (m.direction == 'out' &&
+          (m.status == 'delivered' || m.status == 'read')) {
         _receiptSeen.add(m.id);
       }
     }

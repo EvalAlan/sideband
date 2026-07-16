@@ -1,0 +1,30 @@
+[package]
+name = "sideband-bridge-provisioning"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Typed client for the mautrix **Bridge v2 provisioning v3** login API
+# (`/_matrix/provision/v3/login/...`). Deliberately isolated from both the
+# Sideband core and the matrix-sdk sidecar so the interactive-login state machine
+# can be exercised deterministically (wiremock) without compiling matrix-sdk.
+#
+# Reference contract (pinned in docs/BRIDGES.md):
+#   https://github.com/mautrix/go/blob/f6531777f56c4a8276b65c1439e991b860c1ecb9/bridgev2/matrix/provisioning.yaml
+
+[lib]
+name = "sideband_bridge_provisioning"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+hex = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

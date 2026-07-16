@@ -1,0 +1,65 @@
+name: sideband-bridges
+
+services:
+  synapse:
+    image: matrixdotorg/synapse:${SYNAPSE_TAG:-v1.156.0}
+    container_name: sideband-synapse
+    restart: unless-stopped
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?set MATRIX_SERVER_NAME in .env}
+      SYNAPSE_REPORT_STATS: ${SYNAPSE_REPORT_STATS:-no}
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${SYNAPSE_BIND_ADDRESS:-127.0.0.1}:${SYNAPSE_PORT:-8008}:8008"
+    volumes:
+      - ./data/synapse:/data
+      # Synapse reads registrations from these paths configured in homeserver.yaml.
+      - ./data/telegram:/bridges/telegram:ro
+      - ./data/discord:/bridges/discord:ro
+      - ./data/meta:/bridges/meta:ro
+      - ./data/googlechat:/bridges/googlechat:ro
+    networks: [matrix]
+
+  telegram:
+    image: dock.mau.dev/mautrix/telegram:${MAUTRIX_TELEGRAM_TAG:-v0.2606.0}
+    container_name: sideband-mautrix-telegram
+    restart: unless-stopped
+    volumes:
+      - ./data/telegram:/data
+    depends_on: [synapse]
+    networks: [matrix]
+
+  discord:
+    image: dock.mau.dev/mautrix/discord:${MAUTRIX_DISCORD_TAG:-v0.7.6}
+    container_name: sideband-mautrix-discord
+    restart: unless-stopped
+    volumes:
+      - ./data/discord:/data
+    depends_on: [synapse]
+    networks: [matrix]
+
+  # Optional/experimental: unofficial Meta web APIs can break or trigger account checks.
+  meta:
+    profiles: [meta]
+    image: dock.mau.dev/mautrix/meta:${MAUTRIX_META_TAG:-v0.2606.0}
+    container_name: sideband-mautrix-meta
+    restart: unless-stopped
+    volumes:
+      - ./data/meta:/data
+    depends_on: [synapse]
+    networks: [matrix]
+
+  # Optional/experimental: legacy Python bridge using browser cookies.
+  googlechat:
+    profiles: [googlechat]
+    image: dock.mau.dev/mautrix/googlechat:${MAUTRIX_GOOGLECHAT_TAG:-v0.5.2}
+    container_name: sideband-mautrix-googlechat
+    restart: unless-stopped
+    volumes:
+      - ./data/googlechat:/data
+    depends_on: [synapse]
+    networks: [matrix]
+
+networks:
+  matrix:
+    name: sideband-matrix

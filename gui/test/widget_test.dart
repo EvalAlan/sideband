@@ -5,6 +5,53 @@ import 'package:sideband_gui/main.dart';
 import 'package:zxing2/qrcode.dart';
 
 void main() {
+  test('bridge add args match the config-free CLI contract', () {
+    final args = bridgeAddAccountArgs(
+      profile: '/tmp/profile',
+      id: 'telegram-main',
+      network: 'telegram',
+      name: 'Telegram',
+      enable: true,
+    );
+    expect(
+        args,
+        containsAllInOrder([
+          'bridge',
+          'add',
+          '--profile',
+          '/tmp/profile',
+          '--id',
+          'telegram-main',
+          '--network',
+          'telegram',
+          '--name',
+          'Telegram',
+          '--enable',
+        ]));
+    expect(args, isNot(contains('--config')));
+  });
+
+  test('bridge login URLs require HTTPS with a real host', () {
+    expect(bridgeLoginUrlAllowed(Uri.parse('https://login.example.org/path')),
+        isTrue);
+    expect(bridgeLoginUrlAllowed(Uri.parse('http://login.example.org/path')),
+        isFalse);
+    expect(bridgeLoginUrlAllowed(Uri.parse('javascript:alert(1)')), isFalse);
+    expect(bridgeLoginUrlAllowed(Uri.parse('https:///missing-host')), isFalse);
+    expect(
+        bridgeLoginUrlAllowed(Uri.parse('https://user@example.com')), isFalse);
+  });
+
+  test('bridge login secrets are supplied over stdin', () {
+    final args = bridgeLoginSubmitArgs(
+      profile: '/tmp/profile',
+      accountId: 'telegram1',
+      stepId: 'password-1',
+    );
+    expect(args, isNot(contains('--value')));
+    expect(args, isNot(contains('hunter2')));
+  });
+
   test('decodeQrImage reads a Sideband contact QR image', () {
     const command =
         '/add Rocky example.onion ed25519-public-key x25519-public-key';
@@ -259,8 +306,7 @@ void main() {
   group('transfer string parsing', () {
     test('parses hash from outbound line', () {
       expect(
-        parseTransferHash(
-            'outbound abc123 -> bob chunk 3/10 file=photo.jpg'),
+        parseTransferHash('outbound abc123 -> bob chunk 3/10 file=photo.jpg'),
         'abc123',
       );
     });
@@ -275,8 +321,8 @@ void main() {
     });
 
     test('classifies outbound vs incoming', () {
-      expect(
-          isOutboundTransfer('outbound abc123 -> bob chunk 1/2 file=x'), isTrue);
+      expect(isOutboundTransfer('outbound abc123 -> bob chunk 1/2 file=x'),
+          isTrue);
       expect(isOutboundTransfer('incoming deadbeef chunks 1/2'), isFalse);
     });
   });
@@ -343,8 +389,7 @@ void main() {
 
     test('rejects traversal escapes', () {
       expect(
-        isUnderDownloadsDir(
-            '$profile/downloads/../../identity.toml', profile),
+        isUnderDownloadsDir('$profile/downloads/../../identity.toml', profile),
         isFalse,
       );
     });

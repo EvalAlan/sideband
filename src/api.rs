@@ -359,9 +359,8 @@ pub fn api_list_bridge_accounts(profile_path: &str) -> Result<Vec<crate::BridgeA
     crate::list_bridge_accounts(&profile)
 }
 
-/// Create or update a bridge account. `enabled` controls whether serve spawns
-/// its connector. `config_json` is connector-specific (may name the connector
-/// command); pass "{}" for the bundled default.
+/// Create or update a supported provider account. `enabled` controls whether
+/// serve spawns its bundled connector. Pass "{}" for default provider config.
 pub fn api_add_bridge_account(
     profile_path: &str,
     id: &str,
@@ -372,6 +371,12 @@ pub fn api_add_bridge_account(
 ) -> Result<bool> {
     if id.trim().is_empty() || network.trim().is_empty() {
         return Err(anyhow!("bridge account id and network are required"));
+    }
+    if matches!(
+        network.trim().to_ascii_lowercase().as_str(),
+        "native" | "sideband"
+    ) {
+        return Err(anyhow!("native Sideband conversations cannot be bridged"));
     }
     let profile = expand_profile(profile_path);
     let config = if config_json.trim().is_empty() {
@@ -397,10 +402,30 @@ pub fn api_delete_bridge_account(profile_path: &str, id: &str) -> Result<bool> {
 /// ensures the account is enabled + connecting; the serve loop's bridge manager
 /// (re)starts the connector on its next tick.
 pub fn api_bridge_login(profile_path: &str, id: &str) -> Result<bool> {
+    api_bridge_login_start(profile_path, id)
+}
+
+pub fn api_bridge_login_start(profile_path: &str, id: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
-    crate::set_bridge_account_enabled(&profile, id, true)?;
-    crate::set_bridge_account_status(&profile, id, "connecting")?;
-    Ok(true)
+    crate::bridge_login_start(&profile, id)
+}
+
+pub fn api_bridge_login_poll(
+    profile_path: &str,
+    id: &str,
+) -> Result<Option<crate::BridgeLoginPromptRow>> {
+    let profile = expand_profile(profile_path);
+    crate::bridge_login_poll(&profile, id)
+}
+
+pub fn api_bridge_login_submit(
+    profile_path: &str,
+    id: &str,
+    step_id: &str,
+    value: &str,
+) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::bridge_login_submit(&profile, id, step_id, value)
 }
 
 /// List bridged conversations. Pass an empty `account_id` for all networks.
@@ -1119,6 +1144,43 @@ pub extern "C" fn sideband_api_bridge_login(
 }
 
 #[no_mangle]
+pub extern "C" fn sideband_api_bridge_login_start(
+    profile_path: *const c_char,
+    id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_bridge_login_start(cstr_arg(profile_path, "profile_path")?, cstr_arg(id, "id")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_bridge_login_poll(
+    profile_path: *const c_char,
+    id: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_bridge_login_poll(cstr_arg(profile_path, "profile_path")?, cstr_arg(id, "id")?)
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_bridge_login_submit(
+    profile_path: *const c_char,
+    id: *const c_char,
+    step_id: *const c_char,
+    value: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_bridge_login_submit(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(id, "id")?,
+            cstr_arg(step_id, "step_id")?,
+            cstr_arg(value, "value")?,
+        )
+    })())
+}
+
+#[no_mangle]
 pub extern "C" fn sideband_api_list_bridge_conversations(
     profile_path: *const c_char,
     account_id: *const c_char,
@@ -1773,6 +1835,83 @@ mod tests {
     const ROCKY_ONION: &str = "qdnx34k2b3fzp3umv7ryvzxtbzjluzkvuvqixvuooy43b5n6lddaspid.onion";
     const ROCKY_ED25519: &str = "fLo7TRtqCxE2wtjTvNvUJjRDBewhYV7bkW3P/F/451w=";
     const ROCKY_X25519: &str = "K4+eWfSYw8TtmsViirLxsNs7zAWzKQ/YtJtQFVcncUk=";
+
+    #[test]
+    fn ffi_bridge_login_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = cs(dir.path().to_str().unwrap());
+        let name = cs("me");
+        let result = take_json(sideband_api_init_profile(profile.as_ptr(), name.as_ptr()));
+        assert_eq!(result["ok"], true, "init_profile failed: {result}");
+
+        let id = cs("telegram-test");
+        let network = cs("telegram");
+        let display = cs("Telegram");
+        let config = cs("{}");
+        let result = take_json(sideband_api_add_bridge_account(
+            profile.as_ptr(),
+            id.as_ptr(),
+            network.as_ptr(),
+            display.as_ptr(),
+            config.as_ptr(),
+            false,
+        ));
+        assert_eq!(result["ok"], true, "add bridge failed: {result}");
+
+        let result = take_json(sideband_api_bridge_login_start(
+            profile.as_ptr(),
+            id.as_ptr(),
+        ));
+        assert_eq!(result["data"], true);
+        crate::store_bridge_login_prompt(
+            dir.path(),
+            "telegram-test",
+            "code-1",
+            "text_input",
+            "Login code",
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+        let result = take_json(sideband_api_bridge_login_poll(
+            profile.as_ptr(),
+            id.as_ptr(),
+        ));
+        assert_eq!(result["data"]["kind"], "text_input");
+        let step = cs("code-1");
+        let value = cs("123456");
+        let result = take_json(sideband_api_bridge_login_submit(
+            profile.as_ptr(),
+            id.as_ptr(),
+            step.as_ptr(),
+            value.as_ptr(),
+        ));
+        assert_eq!(result["data"], true);
+
+        let native = cs("native");
+        let result = take_json(sideband_api_add_bridge_account(
+            profile.as_ptr(),
+            id.as_ptr(),
+            native.as_ptr(),
+            display.as_ptr(),
+            config.as_ptr(),
+            false,
+        ));
+        assert_eq!(result["ok"], false, "native bridge must be rejected");
+
+        let unsafe_id = cs("../escape");
+        let telegram = cs("telegram");
+        let result = take_json(sideband_api_add_bridge_account(
+            profile.as_ptr(),
+            unsafe_id.as_ptr(),
+            telegram.as_ptr(),
+            display.as_ptr(),
+            config.as_ptr(),
+            false,
+        ));
+        assert_eq!(result["ok"], false, "unsafe account id must be rejected");
+    }
 
     #[test]
     fn ffi_add_contact_accepts_standard_base64_keys_and_lists_them() {

@@ -4006,7 +4006,9 @@ dependencies = [
  "tor-rtcompat",
  "tracing",
  "tracing-subscriber",
+ "url",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

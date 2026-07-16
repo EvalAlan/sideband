@@ -1,0 +1,23 @@
+# OPTIONAL/EXPERIMENTAL, PARTIAL EXAMPLE ONLY. Merge into the generated Meta
+# config.yaml. Meta's unofficial web APIs may change and account checks can occur.
+network:
+  mode: messenger
+
+homeserver:
+  address: http://synapse:8008
+  domain: localhost # must equal MATRIX_SERVER_NAME
+
+appservice:
+  address: http://meta:29319
+  hostname: 0.0.0.0
+  port: 29319
+
+database:
+  type: sqlite3-fk-wal
+  uri: file:/data/meta.db?_txlock=immediate
+
+bridge:
+  permissions:
+    "*": relay
+    "localhost": user
+    "@sideband:localhost": admin

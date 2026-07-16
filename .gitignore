@@ -1,4 +1,6 @@
 /target/
+/bridges/matrix-connector/target/
+/bridges/provisioning/target/
 /profiles/
 .tools/
 *.log
@@ -7,4 +9,5 @@
 # CI AppImage artifacts (should never be committed)
 sideband-appimage-*
 dist/Sideband-*.AppImage
+/gui/AppDir/
 gui/android/app/src/main/jniLibs/

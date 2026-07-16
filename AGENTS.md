@@ -144,26 +144,72 @@ everything inline" or "spawn a subagent for each thing."
 
 _Update this section as part of the handoff protocol._
 
-**Beeper-style bridges (Part B, Phase 1 DONE)** — opt-in multi-network bridge
-layer with a hard privacy boundary: Sideband-native (Tor/LAN/BT) stays the
-private E2E core; bridged conversations are `network != 'native'`, isolated from
-the cryptographic `contacts` domain, and always labeled *not private* in the UI.
-Connectors are **sidecar processes** speaking a small JSON-lines protocol
-(`src/bridge.rs`: `CoreToConnector`/`ConnectorToCore`, `BridgeManager` spawns/
-pumps/dispatches on the serve loop's ~1s tick). Core: `bridge_accounts`,
-`bridge_conversations`, `bridge_outbox` tables + `messages.network` column +
-helpers in `main.rs`; a DB **outbox** decouples GUI sends (desktop subprocess /
-Android FFI) from the listener-owned connectors. A loopback **demo connector**
-(`src/bin/sideband-bridge-demo.rs`, bundled in the AppImage) proves the whole
-pipeline with no external accounts — covered by interop test
-`bridge_demo_connector_roundtrips`. FFI `sideband_api_*bridge*` + CLI `bridge
-list|add|enable|disable|delete|conversations|send|history|read`. GUI: provider
-**rail** (desktop) / networks **drawer** (mobile), unified inbox with per-chat
-network badges + a bridged/"not private" indicator, bridged chat with a security
-banner, and a Bridges settings screen. **Phase 2 (NEXT, needs infra):** a real
-`matrix` connector (`matrix-sdk`) + a docker bundle (Conduit + mautrix-{telegram,
-discord,googlechat,meta}) so the four target networks light up; see
-`docs/plans/2026-07-14-briar-like-transports-and-bridges.md` Part B.
+**Beeper-style bridges (Part B, Phase 2 IN PROGRESS)** — the Phase 1 privacy
+boundary remains strict: Sideband-native (Tor/LAN/BT) stays in the private E2E
+core; bridged conversations can never use `network = native`, never become
+cryptographic contacts, and are always labeled *not private*. Connector protocol
+v2 adds SQLite-backed interactive login prompts and inputs with stable `step_id`s
+(QR, URL, text, password/code, success, error), exposed consistently through CLI,
+Rust API, and C FFI. The old demo/config-JSON flow is gone. The desktop Flutter UI
+has a Telegram/Discord/Google Chat/Messenger picker, resumable polling login
+modal, and configurable Matrix homeserver. `src/bin/sideband-bridge-matrix.rs`
+is built as the isolated `bridges/matrix-connector` crate so Matrix SDK E2EE can
+use its own SQLite dependency without colliding with the core; Matrix event IDs
+are deduplicated in the profile DB. `bridges/docker-compose.yml` plus provider
+configs and `docs/BRIDGES.md` provide a Synapse + mautrix deployment, with Meta
+and Google Chat marked experimental. The Matrix connector is currently a desktop
+sidecar; Android exposes the APIs but disables account setup until it has an
+in-APK connector execution path. Deterministic login coverage uses
+`sideband-bridge-login-mock`; no live provider credentials are used in tests.
+
+**Real backend path — internal session DONE; provider login wiring pending.**
+The isolated `bridges/provisioning` crate (reqwest + serde, **no matrix-sdk**;
+`run-tests.sh fast`) now covers two deterministic (wiremock) pieces:
+ 1. `acquire_internal_session` — Synapse shared-secret **register** (GET nonce +
+    HMAC-SHA1 `/_synapse/admin/v1/register`) with fallback to password **login**
+    (`/_matrix/client/v3/login`) → `MatrixCredentials`. No response-body leakage.
+ 2. `ProvisioningClient` + `LoginSession` — Bridge v2 provisioning v3 login state
+    machine (flows → `display_and_wait` QR → long-poll → `user_input` 2FA →
+    `complete`), secret-field flagged, tested for the **Telegram QR** flow.
+
+The connector now **auto-establishes its internal Matrix session** on `Hello`
+(when none is stored) via (1), then persists it `0600` — so the *"Connected Apps
+service is unavailable"* error clears once the backend is reachable, with **zero
+user Matrix setup**. Credentials are app-owned: the core generates a per-profile
+password (`<profile>/bridge-matrix/internal.secret`, `0600`; never shown/entered)
+and injects it plus the homeserver into the connector `Hello` config
+(`bridge_connector_config`). The homeserver `registration_shared_secret` is now
+**app-owned and generated** (`backend_registration_secret`, `<profile>/
+bridge-backend/registration.secret`, `0600`) so there is **zero user setup** —
+env `SIDEBAND_BRIDGE_REG_SECRET` only overrides it for pointing at an external
+homeserver. The core writes the same secret into the managed homeserver config
+(see supervisor below).
+
+**Product direction — one seamless app (Alan, decided):** the user must never run
+or think about a backend. Chosen model: **local, app-managed** — the desktop app
+bundles + silently supervises a single-binary homeserver + mautrix as loopback
+sidecars (same pattern as the connector), auto-configured. No central server, no
+Docker, no Matrix UX. (Android can't run a local homeserver; a phone would later
+attach to the desktop instance — separate track.)
+
+**Still pending (NEXT), in priority order:**
+1. **Backend supervisor + bundling (`src/backend.rs`, blocked on a decision).**
+   Which single-binary homeserver to bundle is unsettled and needs validation
+   against the real binary: **Conduit/conduwuit** (Rust, bundleable, but
+   `registration_token` flow + historically weaker appservice support that
+   mautrix needs); **Synapse** (reference appservice support, but Python — hard to
+   ship as one binary); **Dendrite** (Go single binary, middle ground). **This
+   picks the registration mechanism:** `acquire_internal_session` currently
+   assumes the **Synapse** shared-secret admin API (`/_synapse/admin/v1/register`)
+   and must be adapted to the chosen homeserver. Do not write config-gen/spawn
+   internals before the homeserver is chosen + its config/appservice/registration
+   validated against its actual binary. `build.sh` must then bundle the
+   homeserver + `mautrix-telegram` binaries next to `sideband`.
+2. Wire `LoginSession` (2) into `sideband-bridge-matrix.rs`, replacing the legacy
+   management-bot text path (`classify_login_text`/`relay_login_event`) — needs
+   the per-bridge provisioning base URL + auth (deployment-coupled) + an async
+   wait/submit task + authoritative portal-ownership checks.
+3. Discord/Google-Chat/Meta adapters. Live-provider verification is manual (§6).
 
 **Shipped:** group chats across all clients; QR share overlay (TUI) + QR scan
 (Android); Double-Ratchet "Enable forward secrecy" button; Android foreground

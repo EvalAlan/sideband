@@ -49,5 +49,6 @@ pub trait Transport: Send + Sync {
 pub mod bluetooth;
 pub mod btp;
 pub mod lan;
+pub mod micro;
 pub mod registry;
 pub mod tor;

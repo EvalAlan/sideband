@@ -823,128 +823,125 @@ async fn ratchet_message_roundtrips() {
 
 // ── Beeper-style bridges ─────────────────────────────────────────────────────
 
-/// Path to the `sideband-bridge-demo` binary next to the test executable
-/// (`target/<profile>/sideband-bridge-demo`).
-fn demo_connector_path() -> PathBuf {
+fn login_mock_connector_path() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     let mut dir = exe.parent().expect("exe dir").to_path_buf();
     if dir.ends_with("deps") {
         dir.pop();
     }
-    let mut path = dir.join("sideband-bridge-demo");
+    let mut path = dir.join("sideband-bridge-login-mock");
     if cfg!(windows) {
         path.set_extension("exe");
     }
     path
 }
 
-/// The bridge pipeline round-trips end to end through the loopback demo
-/// connector: spawn → handshake → seed conversations → outbound send → echoed
-/// inbound, all landing in the DB tagged as a bridged (non-native) network —
-/// and never touching the cryptographic contact/native path.
 #[tokio::test]
-async fn bridge_demo_connector_roundtrips() {
+async fn bridge_login_roundtrips_qr_input_and_success_through_db() {
     use crate::bridge::BridgeManager;
 
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path().to_path_buf();
     init_profile_with_name(&profile, "alice").unwrap();
 
-    // Configure a demo bridge account pointing at the built demo connector.
-    // `CARGO_BIN_EXE_*` is only set for integration tests, so resolve the demo
-    // binary from the test executable's target dir (building it if missing).
-    let demo_bin = demo_connector_path();
-    if !demo_bin.exists() {
+    let mock_bin = login_mock_connector_path();
+    if !mock_bin.exists() {
         std::process::Command::new(env!("CARGO"))
-            .args(["build", "--bin", "sideband-bridge-demo"])
+            .args(["build", "--bin", "sideband-bridge-login-mock"])
             .status()
-            .expect("build demo connector");
+            .expect("build login mock connector");
     }
-    assert!(
-        demo_bin.exists(),
-        "demo connector not built at {demo_bin:?}"
-    );
-    let config = format!(
-        "{{\"command\":\"{}\"}}",
-        demo_bin.to_string_lossy().replace('\\', "\\\\")
-    );
-    crate::upsert_bridge_account(&profile, "demo1", "demo", "Demo", &config, true).unwrap();
+    let current_exe = std::env::current_exe().unwrap();
+    let sibling = current_exe
+        .parent()
+        .unwrap()
+        .join("sideband-bridge-login-mock");
+    if sibling != mock_bin {
+        std::fs::copy(&mock_bin, &sibling).unwrap();
+    }
+    crate::upsert_bridge_account(&profile, "telegram1", "login-mock", "Telegram", "{}", false)
+        .unwrap();
 
-    let mut mgr = BridgeManager::new(profile.clone());
-
-    // Drive the manager until the connector's seed conversations arrive.
-    let mut convs = Vec::new();
-    for _ in 0..60 {
-        mgr.reconcile().await;
-        mgr.pump();
-        convs = crate::list_bridge_conversations(&profile, None).unwrap();
-        if convs.len() >= 2 {
+    crate::bridge_login_start(&profile, "telegram1").unwrap();
+    let mut manager = BridgeManager::new(profile.clone());
+    let mut prompt = None;
+    for _ in 0..80 {
+        manager.reconcile().await;
+        manager.pump();
+        manager.dispatch_login_inputs();
+        prompt = crate::bridge_login_poll(&profile, "telegram1").unwrap();
+        if prompt.as_ref().is_some_and(|p| p.kind == "qr") {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    let prompt = prompt.expect("QR login prompt");
+    assert_eq!(prompt.step_id, "scan-1");
+    assert_eq!(prompt.qr, "mock-login-payload");
+    assert_eq!(
+        crate::get_bridge_account(&profile, "telegram1")
+            .unwrap()
+            .unwrap()
+            .status,
+        "login_required"
+    );
+
+    macro_rules! submit_and_wait {
+        ($step:literal, $value:literal, $kind:literal) => {{
+            crate::bridge_login_submit(&profile, "telegram1", $step, $value).unwrap();
+            let mut next = None;
+            for _ in 0..80 {
+                manager.dispatch_login_inputs();
+                manager.pump();
+                next = crate::bridge_login_poll(&profile, "telegram1").unwrap();
+                if next.as_ref().is_some_and(|p| p.kind == $kind) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            next.expect(concat!("expected login prompt kind ", $kind))
+        }};
+    }
+    let url = submit_and_wait!("scan-1", "scanned", "url");
+    assert_eq!(url.url, "https://example.invalid/login");
+    let code = submit_and_wait!("authorize-2", "opened", "text_input");
+    assert_eq!(code.step_id, "code-3");
+    let password = submit_and_wait!("code-3", "123456", "password_input");
+    assert_eq!(password.step_id, "password-4");
+    let success = submit_and_wait!("password-4", "secret", "success");
+    assert_eq!(success.step_id, "terminal");
+    assert_eq!(
+        crate::get_bridge_account(&profile, "telegram1")
+            .unwrap()
+            .unwrap()
+            .status,
+        "connected",
+        "success prompt must mark the account connected"
+    );
+    let terminal = crate::bridge_login_poll(&profile, "telegram1")
+        .unwrap()
+        .expect("connected state is exposed as a terminal result");
+    assert_eq!(terminal.kind, "success");
+    let conn = crate::init_db(&profile).unwrap();
+    let stored: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bridge_login_prompts WHERE account_id = 'telegram1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 0, "terminal login prompts must not persist");
     assert!(
-        convs.iter().any(|c| c.title == "Demo Bot"),
-        "expected the demo connector's seed conversations, got: {convs:?}"
+        load_contacts(&profile).unwrap().is_empty(),
+        "bridge login must not create native contacts"
     );
     assert!(
-        convs.iter().all(|c| c.network == "demo"),
-        "bridged conversations must be tagged with their network, not 'native'"
+        load_history(&profile, None, 50).unwrap().is_empty(),
+        "bridge login must not leak into native history"
     );
-
-    // The connector's greeting should be in history as an inbound bridged message.
-    let bot = crate::bridge_conversation_id("demo1", "demo-bot");
-    let mut greeted = false;
-    for _ in 0..40 {
-        mgr.pump();
-        let hist = crate::list_bridge_history(&profile, &bot, 50).unwrap();
-        if hist
-            .iter()
-            .any(|m| m.direction == "in" && m.body.contains("demo bridge"))
-        {
-            greeted = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(greeted, "expected the demo connector's inbound greeting");
-
-    // Send an outbound message; the demo echoes it back and reports delivery.
-    crate::bridge_send(&profile, &bot, "ping").unwrap();
-    let mut echoed = false;
-    for _ in 0..60 {
-        mgr.dispatch_outbox();
-        mgr.pump();
-        let hist = crate::list_bridge_history(&profile, &bot, 50).unwrap();
-        let has_out = hist
-            .iter()
-            .any(|m| m.direction == "out" && m.body == "ping");
-        let has_echo = hist
-            .iter()
-            .any(|m| m.direction == "in" && m.body == "echo: ping");
-        if has_out && has_echo {
-            echoed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(echoed, "expected the outbound message and its echoed reply");
-
-    // The bridge path must never create native contacts, and the native
-    // contact-history query must never surface bridged rows (it filters
-    // conversation_kind = 'contact').
-    let contacts = load_contacts(&profile).unwrap();
-    assert!(
-        contacts.is_empty(),
-        "bridge traffic must not leak into the cryptographic contact domain"
-    );
-    for sender in ["Demo Bot", "Echo", "demo-bot"] {
-        let native = load_history(&profile, Some(sender), 50).unwrap();
-        assert!(
-            native.is_empty(),
-            "native contact history must not surface bridged rows (sender {sender})"
-        );
-    }
-
-    mgr.shutdown().await;
+    assert!(crate::claim_bridge_event(&profile, "telegram1", "$event-1").unwrap());
+    assert!(!crate::claim_bridge_event(&profile, "telegram1", "$event-1").unwrap());
+    crate::release_bridge_event(&profile, "telegram1", "$event-1");
+    assert!(crate::claim_bridge_event(&profile, "telegram1", "$event-1").unwrap());
+    manager.shutdown().await;
 }

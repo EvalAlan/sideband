@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
 };
 use clap::{Args, Parser, Subcommand};
@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 use arti_client::config::CfgPath;
 use arti_client::{TorClient, TorClientConfig};
@@ -464,15 +465,12 @@ enum BridgeAction {
         /// Unique account id (e.g. "telegram-alice").
         #[arg(long)]
         id: String,
-        /// Network id (e.g. telegram, discord, googlechat, messenger, demo).
+        /// Provider id: telegram, discord, googlechat, or messenger.
         #[arg(long)]
         network: String,
         /// Human-readable name shown in the UI.
         #[arg(long, default_value = "")]
         name: String,
-        /// Connector config as JSON (may set {"command":..,"args":[..]}).
-        #[arg(long, default_value = "{}")]
-        config: String,
         /// Enable the account immediately (serve will start its connector).
         #[arg(long)]
         enable: bool,
@@ -498,6 +496,36 @@ enum BridgeAction {
         #[arg(long)]
         id: String,
     },
+    /// Trigger (or re-trigger) connector login.
+    LoginStart {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Poll the current interactive login prompt as JSON.
+    LoginPoll {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit an answer to the current login prompt.
+    LoginSubmit {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        id: String,
+        #[arg(long, alias = "step")]
+        step_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List bridged conversations (optionally for one account).
     Conversations {
         #[command(flatten)]
@@ -599,7 +627,7 @@ pub struct GroupInfo {
 /// In v2 the `body` field empty on wire, `enc_body` holds ChaCha20-Poly1305 ciphertext.
 /// In v3 `body` and `enc_body` are empty; ratchet_header_b64, ratchet_nonce_hex,
 /// and ratchet_ct_hex carry the Double Ratchet payload.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
     v: u32,
     r#type: String,
@@ -2150,7 +2178,35 @@ fn init_db(profile: &Path) -> Result<Connection> {
             last_error      TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_bridge_outbox_status
-            ON bridge_outbox(status);",
+            ON bridge_outbox(status);
+        CREATE TABLE IF NOT EXISTS bridge_message_events (
+            account_id TEXT NOT NULL,
+            event_id   TEXT NOT NULL,
+            PRIMARY KEY(account_id, event_id)
+        );
+        CREATE TABLE IF NOT EXISTS bridge_login_prompts (
+            account_id    TEXT NOT NULL,
+            step_id       TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            prompt        TEXT NOT NULL DEFAULT '',
+            qr            TEXT NOT NULL DEFAULT '',
+            url           TEXT NOT NULL DEFAULT '',
+            code          TEXT NOT NULL DEFAULT '',
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(account_id, step_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bridge_login_prompts_account
+            ON bridge_login_prompts(account_id, created_at_ms DESC);
+        CREATE TABLE IF NOT EXISTS bridge_login_inputs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id    TEXT NOT NULL,
+            step_id       TEXT NOT NULL,
+            value         TEXT NOT NULL DEFAULT '',
+            created_at_ms INTEGER NOT NULL,
+            UNIQUE(account_id, step_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bridge_login_inputs_account
+            ON bridge_login_inputs(account_id, id);",
     )?;
     Ok(conn)
 }
@@ -2375,6 +2431,24 @@ pub struct BridgeAccountRow {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BridgeLoginPromptRow {
+    pub account_id: String,
+    pub step_id: String,
+    pub kind: String,
+    pub prompt: String,
+    pub qr: String,
+    pub url: String,
+    pub code: String,
+}
+
+pub(crate) struct PendingBridgeLoginInput {
+    pub id: i64,
+    pub account_id: String,
+    pub step_id: String,
+    pub value: String,
+}
+
 /// A bridged conversation row (also the JSON shape exposed over FFI/CLI).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BridgeConversationRow {
@@ -2404,6 +2478,32 @@ pub(crate) fn upsert_bridge_account(
     config_json: &str,
     enabled: bool,
 ) -> Result<()> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(anyhow!("invalid bridge account id"));
+    }
+    let network = network.trim().to_ascii_lowercase();
+    let supported = matches!(
+        network.as_str(),
+        "telegram" | "discord" | "googlechat" | "messenger"
+    );
+    #[cfg(test)]
+    let supported = supported || network == "login-mock";
+    if !supported {
+        return Err(anyhow!("invalid bridge network '{network}'"));
+    }
+    let config: serde_json::Value =
+        serde_json::from_str(config_json).context("bridge config must be a JSON object")?;
+    if !config.is_object() {
+        return Err(anyhow!("bridge config must be a JSON object"));
+    }
+
+    let config_json = serde_json::to_string(&config)?;
     let conn = init_db(profile)?;
     conn.execute(
         "INSERT INTO bridge_accounts (id, network, display_name, config_json, enabled, created_at_ms)
@@ -2415,9 +2515,9 @@ pub(crate) fn upsert_bridge_account(
             enabled = excluded.enabled",
         params![
             id,
-            network,
+            &network,
             display_name,
-            config_json,
+            &config_json,
             enabled as i64,
             now_ms_i64().unwrap_or(0)
         ],
@@ -2477,6 +2577,269 @@ pub(crate) fn set_bridge_account_status(profile: &Path, id: &str, status: &str) 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn store_bridge_login_prompt(
+    profile: &Path,
+    account_id: &str,
+    step_id: &str,
+    kind: &str,
+    prompt: &str,
+    qr: &str,
+    url: &str,
+    code: &str,
+) -> Result<()> {
+    const KINDS: &[&str] = &[
+        "qr",
+        "url",
+        "code_display",
+        "text_input",
+        "password_input",
+        "success",
+        "error",
+    ];
+    if step_id.trim().is_empty() || !KINDS.contains(&kind) {
+        return Err(anyhow!("invalid bridge login prompt"));
+    }
+    let conn = init_db(profile)?;
+    conn.execute(
+        "DELETE FROM bridge_login_prompts WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    conn.execute(
+        "INSERT INTO bridge_login_prompts
+            (account_id, step_id, kind, prompt, qr, url, code, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            account_id,
+            step_id,
+            kind,
+            prompt,
+            qr,
+            url,
+            code,
+            now_ms_i64()?
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn clear_bridge_login_prompts(profile: &Path, account_id: &str) -> Result<()> {
+    init_db(profile)?.execute(
+        "DELETE FROM bridge_login_prompts WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn bridge_login_poll(
+    profile: &Path,
+    account_id: &str,
+) -> Result<Option<BridgeLoginPromptRow>> {
+    let conn = init_db(profile)?;
+    let prompt = conn
+        .query_row(
+            "SELECT account_id, step_id, kind, prompt, qr, url, code
+         FROM bridge_login_prompts WHERE account_id = ?1
+         ORDER BY created_at_ms DESC LIMIT 1",
+            params![account_id],
+            |r| {
+                Ok(BridgeLoginPromptRow {
+                    account_id: r.get(0)?,
+                    step_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    prompt: r.get(3)?,
+                    qr: r.get(4)?,
+                    url: r.get(5)?,
+                    code: r.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    if prompt.is_some() {
+        return Ok(prompt);
+    }
+    let Some(account) = get_bridge_account(profile, account_id)? else {
+        return Ok(None);
+    };
+    let terminal = match account.status.as_str() {
+        "connected" => Some(("success", format!("{} connected", account.display_name))),
+        "error" => Some(("error", format!("{} login failed", account.display_name))),
+        _ => None,
+    };
+    Ok(terminal.map(|(kind, prompt)| BridgeLoginPromptRow {
+        account_id: account_id.to_string(),
+        step_id: "terminal".to_string(),
+        kind: kind.to_string(),
+        prompt,
+        qr: String::new(),
+        url: String::new(),
+        code: String::new(),
+    }))
+}
+
+pub(crate) fn bridge_login_start(profile: &Path, account_id: &str) -> Result<bool> {
+    if get_bridge_account(profile, account_id)?.is_none() {
+        return Ok(false);
+    }
+    clear_bridge_login_prompts(profile, account_id)?;
+    let encrypted_start = encrypt_bridge_login_input(profile, account_id, "__start__", "")?;
+    let conn = init_db(profile)?;
+    conn.execute(
+        "DELETE FROM bridge_login_inputs WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    conn.execute(
+        "INSERT INTO bridge_login_inputs (account_id, step_id, value, created_at_ms)
+         VALUES (?1, '__start__', ?2, ?3)",
+        params![account_id, encrypted_start, now_ms_i64()?],
+    )?;
+    set_bridge_account_enabled(profile, account_id, true)?;
+    set_bridge_account_status(profile, account_id, "connecting")?;
+    Ok(true)
+}
+
+const BRIDGE_LOGIN_INPUT_PREFIX: &str = "enc-v1:";
+
+fn bridge_login_input_key(profile: &Path) -> Result<[u8; 32]> {
+    let signing_key = load_signing_key(profile)?;
+    let mut secret = signing_key.to_bytes();
+    let mut key = [0u8; 32];
+    Hkdf::<Sha256>::new(None, &secret)
+        .expand(b"sideband/bridge-login-input/v1", &mut key)
+        .map_err(|_| anyhow!("derive bridge login input key"))?;
+    secret.zeroize();
+    Ok(key)
+}
+
+fn encrypt_bridge_login_input(
+    profile: &Path,
+    account_id: &str,
+    step_id: &str,
+    value: &str,
+) -> Result<String> {
+    let mut key = bridge_login_input_key(profile)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let mut nonce = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
+    let aad = format!("{account_id}\0{step_id}");
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: value.as_bytes(),
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|_| anyhow!("encrypt bridge login input"))?;
+    key.zeroize();
+    let mut stored = nonce.to_vec();
+    stored.extend_from_slice(&encrypted);
+    Ok(format!("{BRIDGE_LOGIN_INPUT_PREFIX}{}", B64.encode(stored)))
+}
+
+fn decrypt_bridge_login_input(
+    profile: &Path,
+    account_id: &str,
+    step_id: &str,
+    stored: &str,
+) -> Result<String> {
+    let encoded = stored
+        .strip_prefix(BRIDGE_LOGIN_INPUT_PREFIX)
+        .ok_or_else(|| anyhow!("refusing plaintext bridge login input"))?;
+    let payload = B64.decode(encoded)?;
+    if payload.len() < 12 {
+        return Err(anyhow!("invalid encrypted bridge login input"));
+    }
+    let (nonce, ciphertext) = payload.split_at(12);
+    let mut key = bridge_login_input_key(profile)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let aad = format!("{account_id}\0{step_id}");
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|_| anyhow!("decrypt bridge login input"))?;
+    key.zeroize();
+    String::from_utf8(plaintext).context("bridge login input is not UTF-8")
+}
+
+pub(crate) fn bridge_login_submit(
+    profile: &Path,
+    account_id: &str,
+    step_id: &str,
+    value: &str,
+) -> Result<bool> {
+    let Some(prompt) = bridge_login_poll(profile, account_id)? else {
+        return Err(anyhow!(
+            "bridge account '{account_id}' has no active login prompt"
+        ));
+    };
+    if prompt.step_id != step_id {
+        return Err(anyhow!("stale bridge login step '{step_id}'"));
+    }
+    if matches!(prompt.kind.as_str(), "success" | "error") {
+        return Err(anyhow!("bridge login is already complete"));
+    }
+    if value.len() > 16 * 1024 {
+        return Err(anyhow!("bridge login input is too large"));
+    }
+    let encrypted_value = encrypt_bridge_login_input(profile, account_id, step_id, value)?;
+    let mut conn = init_db(profile)?;
+    let tx = conn.transaction()?;
+    let claimed = tx.execute(
+        "DELETE FROM bridge_login_prompts WHERE account_id = ?1 AND step_id = ?2",
+        params![account_id, step_id],
+    )?;
+    if claimed != 1 {
+        return Err(anyhow!("stale bridge login step '{step_id}'"));
+    }
+    tx.execute(
+        "INSERT INTO bridge_login_inputs (account_id, step_id, value, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(account_id, step_id) DO UPDATE SET
+            value = excluded.value, created_at_ms = excluded.created_at_ms",
+        params![account_id, step_id, encrypted_value, now_ms_i64()?],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+pub(crate) fn take_bridge_login_inputs(
+    profile: &Path,
+    limit: usize,
+) -> Result<Vec<PendingBridgeLoginInput>> {
+    let conn = init_db(profile)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, account_id, step_id, value FROM bridge_login_inputs ORDER BY id ASC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |r| {
+            Ok(PendingBridgeLoginInput {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                step_id: r.get(2)?,
+                value: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|mut row| {
+            row.value =
+                decrypt_bridge_login_input(profile, &row.account_id, &row.step_id, &row.value)?;
+            Ok(row)
+        })
+        .collect()
+}
+
+pub(crate) fn delete_bridge_login_input(profile: &Path, id: i64) -> Result<()> {
+    init_db(profile)?.execute("DELETE FROM bridge_login_inputs WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 pub(crate) fn set_bridge_account_enabled(profile: &Path, id: &str, enabled: bool) -> Result<bool> {
     let conn = init_db(profile)?;
     let n = conn.execute(
@@ -2516,6 +2879,18 @@ pub(crate) fn delete_bridge_account(profile: &Path, id: &str) -> Result<bool> {
     }
     conn.execute(
         "DELETE FROM bridge_conversations WHERE account_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM bridge_login_prompts WHERE account_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM bridge_login_inputs WHERE account_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM bridge_message_events WHERE account_id = ?1",
         params![id],
     )?;
     let n = conn.execute("DELETE FROM bridge_accounts WHERE id = ?1", params![id])?;
@@ -2604,6 +2979,28 @@ pub(crate) fn list_bridge_conversations(
             Ok(rows)
         }
     }
+}
+
+/// Atomically claim an upstream event id. Returns false for a replay.
+pub(crate) fn claim_bridge_event(profile: &Path, account_id: &str, event_id: &str) -> Result<bool> {
+    if event_id.is_empty() {
+        return Ok(true);
+    }
+    let changed = init_db(profile)?.execute(
+        "INSERT OR IGNORE INTO bridge_message_events (account_id, event_id) VALUES (?1, ?2)",
+        params![account_id, event_id],
+    )?;
+    Ok(changed == 1)
+}
+
+pub(crate) fn release_bridge_event(profile: &Path, account_id: &str, event_id: &str) {
+    let _ = init_db(profile).and_then(|conn| {
+        conn.execute(
+            "DELETE FROM bridge_message_events WHERE account_id = ?1 AND event_id = ?2",
+            params![account_id, event_id],
+        )?;
+        Ok(())
+    });
 }
 
 /// Append a bridged message to history and bump the conversation's activity.
@@ -2831,17 +3228,16 @@ fn handle_bridge_command(action: BridgeAction) -> Result<()> {
             id,
             network,
             name,
-            config,
             enable,
         } => {
             let profile = profile.path()?;
             ensure_profile(&profile)?;
-            let cfg = if config.trim().is_empty() {
-                "{}"
+            let display = if name.trim().is_empty() {
+                network.clone()
             } else {
-                &config
+                name
             };
-            upsert_bridge_account(&profile, &id, &network, &name, cfg, enable)?;
+            upsert_bridge_account(&profile, &id, &network, &display, "{}", enable)?;
             println!("bridge account '{id}' saved ({network})");
             Ok(())
         }
@@ -2875,6 +3271,43 @@ fn handle_bridge_command(action: BridgeAction) -> Result<()> {
             }
             Ok(())
         }
+        BridgeAction::LoginStart { profile, id, .. } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            if !bridge_login_start(&profile, &id)? {
+                return Err(anyhow!("bridge account '{id}' not found"));
+            }
+            println!("{}", serde_json::json!({"started": true, "id": id}));
+            Ok(())
+        }
+        BridgeAction::LoginPoll { profile, id, .. } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            println!(
+                "{}",
+                serde_json::to_string(&bridge_login_poll(&profile, &id)?)?
+            );
+            Ok(())
+        }
+        BridgeAction::LoginSubmit {
+            profile,
+            id,
+            step_id,
+            ..
+        } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let mut value = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut value)
+                .context("read bridge login input from stdin")?;
+            bridge_login_submit(&profile, &id, &step_id, &value)?;
+            println!(
+                "{}",
+                serde_json::json!({"submitted": true, "step_id": step_id})
+            );
+            Ok(())
+        }
+
         BridgeAction::Conversations {
             profile,
             account,
@@ -3070,6 +3503,157 @@ pub(crate) fn set_setting(profile: &Path, key: &str, value: &str) -> Result<()> 
         params![key, value],
     )?;
     Ok(())
+}
+
+const BRIDGE_BACKEND_URL: &str = match option_env!("SIDEBAND_BRIDGE_BACKEND_URL") {
+    Some(value) => value,
+    None => "http://127.0.0.1:8008",
+};
+
+pub(crate) fn bridge_backend_url() -> Result<String> {
+    let homeserver = BRIDGE_BACKEND_URL.trim().trim_end_matches('/');
+    let parsed = url::Url::parse(homeserver).context("invalid Matrix homeserver URL")?;
+    if parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(anyhow!("invalid Matrix homeserver URL"));
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        return Err(anyhow!(
+            "Matrix homeserver must use HTTPS (HTTP is allowed only for loopback)"
+        ));
+    }
+    Ok(homeserver.to_string())
+}
+
+/// The private per-profile directory holding bridge Matrix session + secret
+/// state. Created `0700`.
+fn bridge_matrix_dir(profile: &Path) -> Result<PathBuf> {
+    let dir = profile.join("bridge-matrix");
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+/// Write `bytes` to `path` with owner-only (`0600`) permissions.
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// App-owned password for Sideband's internal Matrix account. Generated once
+/// per profile and stored `0600`; never shown to or entered by the user. This is
+/// deployment/session state, not user login input — Connected Apps must never
+/// ask for Matrix credentials.
+pub(crate) fn bridge_internal_password(profile: &Path) -> Result<String> {
+    let path = bridge_matrix_dir(profile)?.join("internal.secret");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let bytes: [u8; 32] = rand::random();
+    let secret = hex::encode(bytes);
+    write_private_file(&path, secret.as_bytes())?;
+    Ok(secret)
+}
+
+/// The private per-profile directory holding the app-managed bridge *backend*
+/// (homeserver + bridge process state, generated configs, secrets). Created
+/// `0700`. Kept separate from the connector's `bridge-matrix` session dir.
+pub(crate) fn backend_dir(profile: &Path) -> Result<PathBuf> {
+    let dir = profile.join("bridge-backend");
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+/// The homeserver `registration_shared_secret` the app owns. Generated once per
+/// profile and stored `0600`; the supervisor writes the *same* value into the
+/// managed homeserver's config, so the internal account can be auto-created with
+/// no user involvement. Never compiled into the binary.
+pub(crate) fn backend_registration_secret(profile: &Path) -> Result<String> {
+    let path = backend_dir(profile)?.join("registration.secret");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let bytes: [u8; 32] = rand::random();
+    let secret = hex::encode(bytes);
+    write_private_file(&path, secret.as_bytes())?;
+    Ok(secret)
+}
+
+/// The `registration_shared_secret` the connector should use. The app owns and
+/// generates this by default (seamless: no user setup); an explicit
+/// `SIDEBAND_BRIDGE_REG_SECRET` env var overrides it for pointing at an external
+/// homeserver.
+pub(crate) fn bridge_internal_reg_secret(profile: &Path) -> Result<String> {
+    if let Ok(env) = std::env::var("SIDEBAND_BRIDGE_REG_SECRET") {
+        let env = env.trim().to_string();
+        if !env.is_empty() {
+            return Ok(env);
+        }
+    }
+    backend_registration_secret(profile)
+}
+
+/// Build the connector `Hello` config: the operator's homeserver endpoint plus
+/// the app-owned internal-account credentials the connector uses to establish
+/// its Matrix session. `existing` is the account's stored `config_json`.
+pub(crate) fn bridge_connector_config(profile: &Path, existing: &str) -> Result<serde_json::Value> {
+    let mut config: serde_json::Value =
+        serde_json::from_str(existing).unwrap_or_else(|_| serde_json::json!({}));
+    if !config.is_object() {
+        config = serde_json::json!({});
+    }
+    let obj = config
+        .as_object_mut()
+        .expect("config is a JSON object at this point");
+    obj.insert(
+        "homeserver".into(),
+        serde_json::Value::String(bridge_backend_url()?),
+    );
+    obj.insert(
+        "internal_localpart".into(),
+        serde_json::Value::String("sideband".into()),
+    );
+    obj.insert(
+        "internal_password".into(),
+        serde_json::Value::String(bridge_internal_password(profile)?),
+    );
+    // Always present: the app owns the registration secret (generated), so the
+    // internal account can be created with zero user setup.
+    obj.insert(
+        "registration_shared_secret".into(),
+        serde_json::Value::String(bridge_internal_reg_secret(profile)?),
+    );
+    Ok(config)
 }
 
 /// Default offline-retry window: keep retrying an undelivered message for a day.
@@ -7539,6 +8123,7 @@ pub(crate) async fn serve(
             next_bridge_tick = std::time::Instant::now() + Duration::from_millis(1000);
             bridge_mgr.reconcile().await;
             bridge_mgr.pump();
+            bridge_mgr.dispatch_login_inputs();
             bridge_mgr.dispatch_outbox();
         }
 
@@ -8050,6 +8635,91 @@ fn history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_backend_is_built_in_and_ignores_profile_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path();
+        ensure_profile(profile).unwrap();
+        let built_in = bridge_backend_url().unwrap();
+        set_setting(profile, "bridge_homeserver", "http://example.invalid").unwrap();
+        assert_eq!(bridge_backend_url().unwrap(), built_in);
+    }
+
+    #[test]
+    fn bridge_internal_password_is_generated_once_and_stored_privately() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path();
+        ensure_profile(profile).unwrap();
+
+        let first = bridge_internal_password(profile).unwrap();
+        assert_eq!(first.len(), 64, "32 random bytes, hex-encoded");
+        // Stable across calls (persisted, not regenerated).
+        assert_eq!(bridge_internal_password(profile).unwrap(), first);
+
+        // Injected connector config carries the homeserver + internal creds and
+        // the app-owned registration secret — never anything the user supplies.
+        let config = bridge_connector_config(profile, "{}").unwrap();
+        assert_eq!(config["internal_localpart"], "sideband");
+        assert_eq!(config["internal_password"], first);
+        assert!(config["homeserver"].as_str().unwrap().starts_with("http"));
+
+        // The registration secret is app-owned (no env needed), stable, and
+        // distinct from the account password.
+        let reg = backend_registration_secret(profile).unwrap();
+        assert_eq!(reg.len(), 64);
+        assert_ne!(reg, first);
+        assert_eq!(backend_registration_secret(profile).unwrap(), reg);
+        assert_eq!(config["registration_shared_secret"], reg);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for (dir, file, want) in [
+                ("bridge-matrix", "internal.secret", 0o600),
+                ("bridge-backend", "registration.secret", 0o600),
+            ] {
+                let path = profile.join(dir).join(file);
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, want, "{file} must be owner-only");
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_login_prompt_accepts_only_one_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path();
+        init_profile_with_name(profile, "alice").unwrap();
+        upsert_bridge_account(profile, "telegram1", "telegram", "Telegram", "{}", false).unwrap();
+        store_bridge_login_prompt(
+            profile,
+            "telegram1",
+            "code-1",
+            "password_input",
+            "Enter code",
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+
+        assert!(bridge_login_submit(profile, "telegram1", "code-1", "123456").unwrap());
+        let stored: String = init_db(profile)
+            .unwrap()
+            .query_row("SELECT value FROM bridge_login_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(stored.starts_with(BRIDGE_LOGIN_INPUT_PREFIX));
+        assert!(!stored.contains("123456"));
+        let pending = take_bridge_login_inputs(profile, 1).unwrap();
+        assert_eq!(pending[0].value, "123456");
+        assert!(
+            bridge_login_submit(profile, "telegram1", "code-1", "654321").is_err(),
+            "a submitted prompt must become inactive"
+        );
+    }
 
     // -- profile paths --
 
