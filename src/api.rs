@@ -346,6 +346,35 @@ pub fn api_set_status(profile_path: &str, status: &str) -> Result<bool> {
     Ok(true)
 }
 
+// ── At-rest DB encryption / app lock ─────────────────────────────────────────
+
+/// `{ "encrypted": bool, "unlocked": bool }` for this profile.
+pub fn api_db_status(profile_path: &str) -> Result<serde_json::Value> {
+    let profile = expand_profile(profile_path);
+    Ok(serde_json::json!({
+        "encrypted": crate::db_is_encrypted(&profile),
+        "unlocked": crate::db_is_unlocked(),
+    }))
+}
+
+/// Verify the app passphrase and unlock this process (in-process key holder).
+pub fn api_db_unlock(profile_path: &str, passphrase: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::unlock_db_with_passphrase(&profile, passphrase)?;
+    Ok(true)
+}
+
+/// Set or change the app passphrase, encrypting the DB at rest, and leave this
+/// process unlocked.
+pub fn api_db_set_passphrase(profile_path: &str, passphrase: &str) -> Result<bool> {
+    if passphrase.is_empty() {
+        return Err(anyhow!("passphrase must not be empty"));
+    }
+    let profile = expand_profile(profile_path);
+    crate::set_db_passphrase(&profile, passphrase)?;
+    Ok(true)
+}
+
 /// Whether LAN discovery + delivery is enabled (default off).
 pub fn api_get_lan_enabled(profile_path: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
@@ -929,6 +958,39 @@ pub extern "C" fn sideband_api_set_status(
         api_set_status(
             cstr_arg(profile_path, "profile_path")?,
             cstr_arg(status, "status")?,
+        )
+    })())
+}
+
+// ── At-rest DB encryption / app lock: FFI ────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn sideband_api_db_status(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| api_db_status(cstr_arg(profile_path, "profile_path")?))())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_db_unlock(
+    profile_path: *const c_char,
+    passphrase: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_db_unlock(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(passphrase, "passphrase")?,
+        )
+    })())
+}
+
+#[no_mangle]
+pub extern "C" fn sideband_api_db_set_passphrase(
+    profile_path: *const c_char,
+    passphrase: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_db_set_passphrase(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(passphrase, "passphrase")?,
         )
     })())
 }

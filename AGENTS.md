@@ -144,6 +144,25 @@ everything inline" or "spawn a subagent for each thing."
 
 _Update this section as part of the handoff protocol._
 
+**Direction note (2026-07-16):** the Beeper-style **Connected Apps / Matrix
+bridges** and the **LoRa** work were both **parked** on the `bridges-parked`
+branch and removed from `main` (which is therefore reset to `e9a798f` and
+diverged from `origin/main` — a force-push or revert is pending a decision).
+Focus is back on the core private-messaging app.
+
+**At-rest encryption (opt-in, message history) — in progress.** `messages.db` is
+now **SQLCipher**-encrypted when an app passphrase is set (`rusqlite`
+`bundled-sqlcipher-vendored-openssl`; Android 4-ABI cross-compile verified). Key
+= Argon2id(passphrase, per-profile `db.salt`); never stored, stdin-only. `open_db`
+applies it; with no key, SQLCipher reads plaintext DBs unchanged (**opt-in, zero
+regression**). Process key holder (Android/serve) or `SIDEBAND_DB_KEY` env
+(desktop CLI subprocesses). CLI `db-status`/`db-unlock`/`db-set-passphrase`; FFI
+`sideband_api_db_status`/`_db_unlock`/`_db_set_passphrase`. Test:
+`db_encryption_at_rest_round_trips_and_rejects_wrong_passphrase`. **Still
+plaintext (NEXT): `identity.toml` (private keys) + `contacts.toml`.** **No GUI
+unlock screen yet** — do not set a passphrase on a GUI-used profile or the GUI
+can't open the encrypted DB. See tasks: extend to identity/contacts; GUI unlock.
+
 **Shipped:** group chats across all clients; QR share overlay (TUI) + QR scan
 (Android); Double-Ratchet "Enable forward secrecy" button; Android foreground
 service, message notifications, and mobile-appropriate settings; offline retry

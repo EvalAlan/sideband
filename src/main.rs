@@ -232,6 +232,25 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
+    /// Show at-rest encryption status ({"encrypted":bool,"unlocked":bool}).
+    DbStatus {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify the app passphrase (read from stdin) and print the derived DB key
+    /// (hex) on success. Callers pass it back via the SIDEBAND_DB_KEY env var.
+    DbUnlock {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Set or change the app passphrase (read from stdin), encrypting the DB at
+    /// rest. To change an existing passphrase, run with SIDEBAND_DB_KEY set.
+    DbSetPassphrase {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     Contact {
         #[command(subcommand)]
         action: ContactAction,
@@ -1695,11 +1714,167 @@ fn db_path(profile: &Path) -> PathBuf {
 /// for the lock instead of failing with SQLITE_BUSY (which many call sites
 /// silently swallow).
 fn open_db(profile: &Path) -> Result<Connection> {
+    open_db_keyed(profile, db_key_hex().as_deref())
+}
+
+/// Open the DB applying an explicit SQLCipher key (or none). At-rest encryption:
+/// with no key, SQLCipher reads a plaintext database exactly like stock SQLite,
+/// so encryption is fully opt-in and existing profiles keep working untouched.
+fn open_db_keyed(profile: &Path, hex_key: Option<&str>) -> Result<Connection> {
     let conn = Connection::open(db_path(profile))?;
+    // The key must be applied *before* any other statement.
+    if let Some(hex_key) = hex_key {
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))?;
+    }
     // journal_mode returns a row, so use query_row rather than execute.
     conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
     Ok(conn)
+}
+
+/// The 32-byte database key for this process, hex-encoded, if the profile is
+/// unlocked. Resolved from an in-process holder (Android FFI unlock) or the
+/// `SIDEBAND_DB_KEY` env var (passed to short-lived desktop CLI subprocesses).
+fn db_key_hex() -> Option<String> {
+    if let Some(key) = DB_KEY.lock().ok().and_then(|k| k.clone()) {
+        return Some(key);
+    }
+    std::env::var("SIDEBAND_DB_KEY")
+        .ok()
+        .map(|k| k.trim().to_ascii_lowercase())
+        .filter(|k| k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Process-wide unlocked database key (hex). Set by `unlock_db`; used by
+/// `open_db`. In-process so the Android FFI + serve thread share one unlock.
+static DB_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+// ── At-rest database encryption (SQLCipher) ──────────────────────────────────
+//
+// Opt-in per profile: the message DB is plaintext until the user sets an app
+// passphrase, at which point it is re-exported encrypted and every open applies
+// the Argon2id-derived key. The passphrase is never stored; a 16-byte salt is.
+// Desktop CLI subprocesses receive the derived key via `SIDEBAND_DB_KEY`; the
+// Android FFI + in-process serve share the `DB_KEY` holder.
+
+/// Read a secret (passphrase) piped on stdin, trimming a trailing newline but
+/// preserving internal spaces. Keeps the passphrase out of argv/process listings.
+fn read_secret_from_stdin() -> Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf.trim_end_matches(['\n', '\r']).to_string())
+}
+
+fn db_salt_path(profile: &Path) -> PathBuf {
+    profile.join("db.salt")
+}
+
+fn db_encrypted_marker(profile: &Path) -> PathBuf {
+    profile.join("db.encrypted")
+}
+
+/// Whether this profile's message DB is encrypted at rest.
+pub(crate) fn db_is_encrypted(profile: &Path) -> bool {
+    db_encrypted_marker(profile).exists()
+}
+
+/// Whether the current process holds a usable DB key (unlocked).
+pub(crate) fn db_is_unlocked() -> bool {
+    db_key_hex().is_some()
+}
+
+fn load_or_create_db_salt(profile: &Path) -> Result<[u8; 16]> {
+    let path = db_salt_path(profile);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 16 {
+            let mut salt = [0u8; 16];
+            salt.copy_from_slice(&bytes);
+            return Ok(salt);
+        }
+    }
+    let salt: [u8; 16] = rand::random();
+    write_private(&path, salt)?;
+    Ok(salt)
+}
+
+/// Argon2id-derive the 32-byte SQLCipher key from a passphrase + the profile
+/// salt, returning it hex-encoded (the form `PRAGMA key = "x'…'"` expects).
+pub(crate) fn db_key_hex_from_passphrase(profile: &Path, passphrase: &str) -> Result<String> {
+    if passphrase.is_empty() {
+        return Err(anyhow!("passphrase must not be empty"));
+    }
+    let salt = load_or_create_db_salt(profile)?;
+    Ok(hex::encode(derive_export_key(passphrase, &salt)?))
+}
+
+/// Set / clear the process-wide unlocked DB key (hex).
+pub(crate) fn set_process_db_key(hex_key: Option<String>) {
+    if let Ok(mut guard) = DB_KEY.lock() {
+        *guard = hex_key;
+    }
+}
+
+/// Derive the key from `passphrase` and verify it opens the DB, returning the
+/// hex key. Does **not** touch the process-global key (side-effect-free, so it
+/// is safe under parallel tests).
+pub(crate) fn verify_db_passphrase(profile: &Path, passphrase: &str) -> Result<String> {
+    let hex = db_key_hex_from_passphrase(profile, passphrase)?;
+    let conn = open_db_keyed(profile, Some(&hex))?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+        .map_err(|_| anyhow!("incorrect passphrase"))?;
+    Ok(hex)
+}
+
+/// Verify `passphrase` and, on success, unlock this process (sets the global
+/// key). Returns the hex key so a desktop GUI can propagate it to its
+/// subprocesses via `SIDEBAND_DB_KEY`.
+pub(crate) fn unlock_db_with_passphrase(profile: &Path, passphrase: &str) -> Result<String> {
+    let hex = verify_db_passphrase(profile, passphrase)?;
+    set_process_db_key(Some(hex.clone()));
+    Ok(hex)
+}
+
+/// Re-encrypt the DB under `new_hex`: rekey if already encrypted (needs the
+/// current key), else export the plaintext DB into a fresh encrypted file and
+/// swap it in. Explicit keys only — does not read or set the process global.
+fn encrypt_db(profile: &Path, current_hex: Option<&str>, new_hex: &str) -> Result<()> {
+    let db = db_path(profile);
+    if db_is_encrypted(profile) {
+        let conn = open_db_keyed(profile, current_hex)?;
+        conn.execute_batch(&format!("PRAGMA rekey = \"x'{new_hex}'\";"))?;
+        return Ok(());
+    }
+    let enc = profile.join("messages.db.enc");
+    let _ = std::fs::remove_file(&enc);
+    {
+        let conn = open_db_keyed(profile, None)?; // source opens as plaintext
+                                                  // Fold any WAL back into the main file so the export is complete.
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        conn.execute_batch(&format!(
+            "ATTACH DATABASE '{}' AS enc KEY \"x'{}'\";\
+             SELECT sqlcipher_export('enc');\
+             DETACH DATABASE enc;",
+            enc.display(),
+            new_hex
+        ))?;
+    }
+    std::fs::rename(&enc, &db)?;
+    let _ = std::fs::remove_file(profile.join("messages.db-wal"));
+    let _ = std::fs::remove_file(profile.join("messages.db-shm"));
+    write_private(&db_encrypted_marker(profile), b"1")?;
+    Ok(())
+}
+
+/// Enable at-rest encryption (plaintext → encrypted) or change the passphrase on
+/// an already-encrypted DB, then leave this process unlocked with the new key.
+pub(crate) fn set_db_passphrase(profile: &Path, new_passphrase: &str) -> Result<()> {
+    let _ = init_db(profile)?; // ensure the DB + schema exist first
+    let new_hex = db_key_hex_from_passphrase(profile, new_passphrase)?;
+    let current = db_key_hex();
+    encrypt_db(profile, current.as_deref(), &new_hex)?;
+    set_process_db_key(Some(new_hex));
+    Ok(())
 }
 
 fn init_db(profile: &Path) -> Result<Connection> {
@@ -4297,6 +4472,41 @@ async fn main() -> Result<()> {
             } else {
                 println!("bluetooth: {}", if enabled { "on" } else { "off" });
             }
+            Ok(())
+        }
+        CommandKind::DbStatus { profile, json } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let encrypted = db_is_encrypted(&profile);
+            let unlocked = db_is_unlocked();
+            if json {
+                println!("{{\"encrypted\":{encrypted},\"unlocked\":{unlocked}}}");
+            } else {
+                println!(
+                    "at-rest encryption: {}",
+                    if encrypted { "on" } else { "off" }
+                );
+            }
+            Ok(())
+        }
+        CommandKind::DbUnlock { profile } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let passphrase = read_secret_from_stdin()?;
+            // Print only the derived key (hex) on success; the caller captures it.
+            let hex = unlock_db_with_passphrase(&profile, &passphrase)?;
+            println!("{hex}");
+            Ok(())
+        }
+        CommandKind::DbSetPassphrase { profile } => {
+            let profile = profile.path()?;
+            ensure_profile(&profile)?;
+            let passphrase = read_secret_from_stdin()?;
+            if passphrase.is_empty() {
+                return Err(anyhow!("passphrase must not be empty"));
+            }
+            set_db_passphrase(&profile, &passphrase)?;
+            println!("ok");
             Ok(())
         }
         CommandKind::Contact { action } => match action {
@@ -7284,6 +7494,74 @@ fn history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- at-rest DB encryption (SQLCipher) --
+
+    #[test]
+    fn db_encryption_at_rest_round_trips_and_rejects_wrong_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path();
+        init_profile_with_name(profile, "alice").unwrap();
+        // A message with a distinctive plaintext body in the (plaintext) DB.
+        store_message(
+            profile,
+            "in",
+            "bob",
+            "onion",
+            "secret-plaintext-xyzzy",
+            1,
+            DeliveryStatus::Sent,
+        )
+        .unwrap();
+        assert!(!db_is_encrypted(profile));
+
+        // Enable encryption with an explicit key (never touches the process key).
+        let hex = db_key_hex_from_passphrase(profile, "correct horse battery").unwrap();
+        encrypt_db(profile, None, &hex).unwrap();
+        assert!(db_is_encrypted(profile));
+
+        // The right key opens it and the data survives (explicit key: no global).
+        {
+            let conn = open_db_keyed(profile, Some(&hex)).unwrap();
+            let body: String = conn
+                .query_row(
+                    "SELECT body FROM messages WHERE contact = 'bob' LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(body, "secret-plaintext-xyzzy");
+        }
+
+        // verify_db_passphrase returns the key for the right one, errors otherwise.
+        assert_eq!(
+            verify_db_passphrase(profile, "correct horse battery").unwrap(),
+            hex
+        );
+        assert!(verify_db_passphrase(profile, "wrong passphrase").is_err());
+
+        // Opening the encrypted DB as plaintext must fail.
+        let plaintext_open = open_db_keyed(profile, None).and_then(|c| {
+            c.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+                .map_err(Into::into)
+        });
+        assert!(
+            plaintext_open.is_err(),
+            "no-key open of encrypted DB must fail"
+        );
+
+        // The raw file is opaque: no SQLite header, no plaintext body on disk.
+        let raw = std::fs::read(profile.join("messages.db")).unwrap();
+        assert!(
+            !raw.starts_with(b"SQLite format 3\0"),
+            "encrypted DB must not expose a plaintext SQLite header"
+        );
+        assert!(
+            !raw.windows("secret-plaintext-xyzzy".len())
+                .any(|w| w == b"secret-plaintext-xyzzy"),
+            "message body must not appear in plaintext on disk"
+        );
+    }
 
     // -- profile paths --
 
