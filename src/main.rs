@@ -1325,7 +1325,7 @@ pub(crate) fn build_outbound_message(
     let use_ratchet = message_type == "msg" && ratchet_path.exists();
 
     let msg = if use_ratchet {
-        let state_bytes = fs::read(&ratchet_path)?;
+        let state_bytes = read_encryptable(&ratchet_path)?;
         let mut state: RatchetState =
             bincode::deserialize(&state_bytes).context("deserialize ratchet state")?;
         let (header_b64, nonce_hex, ct_hex) =
@@ -1955,6 +1955,16 @@ pub(crate) fn set_db_passphrase(profile: &Path, new_passphrase: &str) -> Result<
     // sensitive profile files so they match.
     reencrypt_profile_file(&identity_path(profile))?;
     reencrypt_profile_file(&contacts_path(profile))?;
+    // Double Ratchet session state is per-contact under <profile>/ratchet/.
+    let rdir = profile.join("ratchet");
+    if rdir.is_dir() {
+        for entry in fs::read_dir(&rdir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                reencrypt_profile_file(&path)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5001,22 +5011,53 @@ fn derive_export_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
+/// Read the profile's message DB as plaintext bytes for an export archive. If
+/// the DB is encrypted at rest, decrypt it via `sqlcipher_export` into a
+/// temporary plaintext copy (the profile must be unlocked). Exports always carry
+/// plaintext content re-encrypted under the *export* passphrase, so an archive
+/// restores cleanly onto a fresh profile regardless of the source's app-lock.
+fn export_messages_db_plaintext(profile: &Path) -> Result<Option<Vec<u8>>> {
+    let db = db_path(profile);
+    if !db.exists() {
+        return Ok(None);
+    }
+    if !db_is_encrypted(profile) {
+        return Ok(Some(fs::read(&db).context("read messages.db")?));
+    }
+    let key = db_key_hex()
+        .ok_or_else(|| anyhow!("unlock the profile before exporting an encrypted database"))?;
+    let plain = profile.join("messages.db.export-tmp");
+    let _ = fs::remove_file(&plain);
+    {
+        let conn = open_db_keyed(profile, Some(&key))?;
+        conn.execute_batch(&format!(
+            "ATTACH DATABASE '{}' AS plaintext KEY '';\
+             SELECT sqlcipher_export('plaintext');\
+             DETACH DATABASE plaintext;",
+            plain.display()
+        ))
+        .context("decrypt messages.db for export")?;
+    }
+    let bytes = fs::read(&plain).context("read exported plaintext db");
+    let _ = fs::remove_file(&plain);
+    Ok(Some(bytes?))
+}
+
 /// Serialize the profile's durable state into a passphrase-encrypted archive.
 pub(crate) fn export_profile_bytes(profile: &Path, passphrase: &str) -> Result<Vec<u8>> {
     if passphrase.is_empty() {
         return Err(anyhow!("export passphrase must not be empty"));
     }
-    let identity_toml =
-        fs::read_to_string(identity_path(profile)).context("profile has no identity to export")?;
-    let contacts_toml = fs::read_to_string(contacts_path(profile)).ok();
-    let messages_db_b64 = {
-        let p = db_path(profile);
-        if p.exists() {
-            Some(B64.encode(fs::read(&p).context("read messages.db")?))
-        } else {
-            None
-        }
-    };
+    // Read every piece decrypted, so the archive holds plaintext content that is
+    // then re-encrypted under the export passphrase (not the at-rest key).
+    let identity_toml = String::from_utf8(
+        read_encryptable(&identity_path(profile)).context("profile has no identity to export")?,
+    )
+    .context("identity is not valid UTF-8")?;
+    let contacts_toml = read_encryptable(&contacts_path(profile))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok());
+    let messages_db_b64 = export_messages_db_plaintext(profile)?.map(|b| B64.encode(b));
     let mut ratchet = std::collections::BTreeMap::new();
     let rdir = profile.join("ratchet");
     if rdir.is_dir() {
@@ -5024,7 +5065,7 @@ pub(crate) fn export_profile_bytes(profile: &Path, passphrase: &str) -> Result<V
             let path = entry?.path();
             if path.is_file() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    ratchet.insert(name.to_string(), B64.encode(fs::read(&path)?));
+                    ratchet.insert(name.to_string(), B64.encode(read_encryptable(&path)?));
                 }
             }
         }
@@ -5760,7 +5801,7 @@ impl RatchetState {
     ) -> Result<(Self, Vec<u8>, Vec<u8>)> {
         let path = Self::path(profile, std::path::Path::new(contact_name));
         if path.exists() {
-            let bytes = fs::read(&path)?;
+            let bytes = read_encryptable(&path)?;
             let state: Self = bincode::deserialize(&bytes).context("deserialize ratchet state")?;
             return Ok((state, Vec::new(), Vec::new()));
         }
@@ -5806,7 +5847,7 @@ impl RatchetState {
     ) -> Result<Self> {
         let path = Self::path(profile, std::path::Path::new(contact_name));
         if path.exists() {
-            let bytes = fs::read(&path)?;
+            let bytes = read_encryptable(&path)?;
             restrict_file(&path);
             return bincode::deserialize(&bytes).context("deserialize ratchet state");
         }
@@ -5817,7 +5858,7 @@ impl RatchetState {
         let path = Self::path(profile, std::path::Path::new(contact_name));
         create_private_dir(path.parent().unwrap())?;
         let bytes = bincode::serialize(self)?;
-        write_private(&path, bytes).context("write ratchet state")?;
+        write_encryptable(&path, &bytes).context("write ratchet state")?;
         Ok(())
     }
 }
@@ -6208,7 +6249,7 @@ pub(crate) fn decrypt_and_verify(
             .unwrap_or_else(|| msg.from.clone());
         let ratchet_path = RatchetState::path(our_profile, std::path::Path::new(&contact_name));
         let mut state = if ratchet_path.exists() {
-            let bytes = fs::read(&ratchet_path)?;
+            let bytes = read_encryptable(&ratchet_path)?;
             bincode::deserialize(&bytes).context("deserialize ratchet state")?
         } else {
             // First v3 message from this contact: initialize receiver state
@@ -7322,7 +7363,7 @@ pub(crate) async fn send_in_conversation(
 
     let msg = if use_ratchet {
         // v3: Double Ratchet encrypt.
-        let state_bytes = fs::read(&ratchet_path)?;
+        let state_bytes = read_encryptable(&ratchet_path)?;
         let mut state: RatchetState =
             bincode::deserialize(&state_bytes).context("deserialize ratchet state")?;
         let (header_b64, nonce_hex, ct_hex) =
@@ -7684,6 +7725,37 @@ mod tests {
             read_encryptable_with(&plain, Some(key)).unwrap(),
             b"just text".to_vec()
         );
+    }
+
+    #[test]
+    fn export_import_round_trips_identity_contacts_and_ratchet() {
+        // Plaintext profile: exercises the export read path (encryptable
+        // passthrough) and confirms ratchet session state is carried + restored.
+        let src = tempfile::tempdir().unwrap();
+        init_profile(src.path()).unwrap();
+        fs::write(contacts_path(src.path()), "example = \"value\"\n").unwrap();
+        let rdir = src.path().join("ratchet");
+        create_private_dir(&rdir).unwrap();
+        let ratchet_blob = vec![1u8, 2, 3, 4, 5];
+        write_private(&rdir.join("bob.bin"), &ratchet_blob).unwrap();
+
+        let archive = export_profile_bytes(src.path(), "export-pass").unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        import_profile_bytes(dst.path(), &archive, "export-pass", false).unwrap();
+        assert!(identity_path(dst.path()).exists());
+        assert_eq!(
+            std::fs::read_to_string(contacts_path(dst.path())).unwrap(),
+            "example = \"value\"\n"
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join("ratchet").join("bob.bin")).unwrap(),
+            ratchet_blob
+        );
+
+        // Wrong export passphrase is rejected.
+        let dst2 = tempfile::tempdir().unwrap();
+        assert!(import_profile_bytes(dst2.path(), &archive, "wrong", false).is_err());
     }
 
     // -- profile paths --

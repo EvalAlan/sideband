@@ -2829,7 +2829,34 @@ class _ChatScreenState extends State<_ChatScreen>
       await _mobile!.dbSetPassphrase(passphrase);
     } else {
       await _cli.dbSetPassphrase(passphrase);
+      // The background listener was spawned before the profile was encrypted,
+      // so it holds no DB key and can no longer read the now-encrypted
+      // profile files. Restart it so the fresh process inherits
+      // SIDEBAND_DB_KEY and can decrypt contacts/identity/ratchet again.
+      await _restartListener();
     }
+  }
+
+  /// Tear down the current listener process and start a fresh one. Used after
+  /// the DB key changes (enabling app lock / changing the passphrase) so the
+  /// serve process picks up the new SIDEBAND_DB_KEY.
+  Future<void> _restartListener() async {
+    final existing = _listener;
+    if (existing != null) {
+      existing.kill(ProcessSignal.sigterm);
+      try {
+        await existing.exitCode.timeout(const Duration(seconds: 2));
+      } catch (_) {}
+      _listener = null;
+    }
+    if (mounted) {
+      setState(() {
+        _listenerRunning = false;
+        _listenerStatus = 'listener restarting';
+        _error = null;
+      });
+    }
+    await _startListener();
   }
 
   Widget _unlockScreen() =>
