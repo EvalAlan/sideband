@@ -2417,6 +2417,9 @@ class _ChatScreenState extends State<_ChatScreen>
 
   List<Contact> _contacts = [];
   List<GroupInfo> _groups = [];
+  // Conversation-list search (filters contacts + groups by name).
+  final TextEditingController _convSearch = TextEditingController();
+  String _convQuery = '';
   final _unreadContacts = <String>{};
   final _unreadGroups = <String>{};
   final _refreshSeenIds = <int>{};
@@ -2818,6 +2821,7 @@ class _ChatScreenState extends State<_ChatScreen>
     unawaited(_stopForegroundService());
     _input.dispose();
     _scroll.dispose();
+    _convSearch.dispose();
     super.dispose();
   }
 
@@ -6350,6 +6354,15 @@ class _ChatScreenState extends State<_ChatScreen>
   // ── sidebar ──────────────────────────────────────────────────────────────
 
   Widget _sidebar() {
+    final q = _convQuery.trim().toLowerCase();
+    final contacts = q.isEmpty
+        ? _contacts
+        : _contacts.where((c) => c.name.toLowerCase().contains(q)).toList();
+    final groups = q.isEmpty
+        ? _groups
+        : _groups
+            .where((g) => g.sidebarLabel.toLowerCase().contains(q))
+            .toList();
     return Material(
       color: _t.surface,
       child: Column(
@@ -6357,7 +6370,7 @@ class _ChatScreenState extends State<_ChatScreen>
         children: [
           // header
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 14, 10),
+            padding: const EdgeInsets.fromLTRB(16, 14, 6, 6),
             child: Row(
               children: [
                 Expanded(
@@ -6367,100 +6380,113 @@ class _ChatScreenState extends State<_ChatScreen>
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: _t.text,
-                      fontSize: 17,
+                      fontSize:
+                          MediaQuery.of(context).size.width < 720 ? 24 : 18,
                       fontWeight: FontWeight.w700,
                       letterSpacing: 0.2,
                     ),
                   ),
                 ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.person_add_alt_1, size: 20),
-                    onPressed: _showAddContactDialog,
-                    tooltip: 'Add contact',
-                  ),
+                IconButton(
+                  icon: const Icon(Icons.person_add_alt_1, size: 22),
+                  onPressed: _showAddContactDialog,
+                  tooltip: 'Add contact',
                 ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.group_add, size: 20),
-                    onPressed: _showCreateGroupDialog,
-                    tooltip: 'Create group',
-                  ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: Icon(
-                      _canUseMobileBackend
-                          ? Icons.qr_code_scanner
-                          : Icons.upload_file,
-                      size: 20,
-                    ),
-                    onPressed: _canUseMobileBackend
-                        ? _scanContactQr
-                        : _uploadContactQr,
-                    tooltip: _canUseMobileBackend
-                        ? 'Scan contact QR'
-                        : 'Upload QR code image',
-                  ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.qr_code, size: 20),
-                    onPressed: _showShareDialog,
-                    tooltip: 'Share contact',
-                  ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.settings, size: 20),
-                    onPressed: _showSettings,
-                    tooltip: 'Settings',
-                  ),
-                ),
-                SizedBox(
-                  width: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints.tightFor(width: 44, height: 44),
-                    icon: const Icon(Icons.refresh, size: 20),
-                    onPressed: _refresh,
-                    tooltip: 'Refresh',
-                  ),
+                PopupMenuButton<String>(
+                  icon: const Icon(Icons.more_vert, size: 22),
+                  tooltip: 'Menu',
+                  color: _t.surface,
+                  onSelected: (v) {
+                    if (v == 'group') {
+                      _showCreateGroupDialog();
+                    } else if (v == 'scan') {
+                      if (_canUseMobileBackend) {
+                        _scanContactQr();
+                      } else {
+                        _uploadContactQr();
+                      }
+                    } else if (v == 'share') {
+                      _showShareDialog();
+                    } else if (v == 'settings') {
+                      _showSettings();
+                    } else if (v == 'refresh') {
+                      _refresh();
+                    }
+                  },
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(
+                        value: 'group', child: Text('New group')),
+                    PopupMenuItem(
+                        value: 'scan',
+                        child: Text(_canUseMobileBackend
+                            ? 'Scan contact QR'
+                            : 'Upload QR image')),
+                    const PopupMenuItem(
+                        value: 'share', child: Text('Share my code')),
+                    const PopupMenuDivider(),
+                    const PopupMenuItem(
+                        value: 'settings', child: Text('Settings')),
+                    const PopupMenuItem(
+                        value: 'refresh', child: Text('Refresh')),
+                  ],
                 ),
               ],
+            ),
+          ),
+          // search
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            child: Container(
+              decoration: BoxDecoration(
+                color: _t.surface2,
+                borderRadius: BorderRadius.circular(24),
+              ),
+              padding: const EdgeInsets.only(left: 14, right: 4),
+              child: Row(
+                children: [
+                  Icon(Icons.search, size: 20, color: _t.textDim),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: _convSearch,
+                      onChanged: (v) => setState(() => _convQuery = v),
+                      style: TextStyle(color: _t.text, fontSize: 14),
+                      decoration: InputDecoration(
+                        isDense: true,
+                        border: InputBorder.none,
+                        filled: false,
+                        hintText: 'Search conversations',
+                        hintStyle: TextStyle(color: _t.textDim),
+                        contentPadding:
+                            const EdgeInsets.symmetric(vertical: 11),
+                      ),
+                    ),
+                  ),
+                  if (_convQuery.isNotEmpty)
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 18),
+                      onPressed: () {
+                        _convSearch.clear();
+                        setState(() => _convQuery = '');
+                      },
+                      splashRadius: 16,
+                    ),
+                ],
+              ),
             ),
           ),
           // contacts
           Expanded(
             child: _error != null && _contacts.isEmpty
                 ? _sidebarError()
-                : _contacts.isEmpty && _groups.isEmpty
+                : contacts.isEmpty && groups.isEmpty
                     ? Center(
                         child: Padding(
                           padding: const EdgeInsets.all(24),
                           child: Text(
-                            'No contacts yet.\nUse + or /add <name> <onion> <ed25519> <x25519>.\nCreate groups with the group-add button or /group-create.',
+                            _convQuery.isNotEmpty
+                                ? 'No conversations match “$_convQuery”.'
+                                : 'No contacts yet.\nUse + or /add <name> <onion> <ed25519> <x25519>.\nCreate groups with the group-add button or /group-create.',
                             textAlign: TextAlign.center,
                             style: TextStyle(
                                 color: _t.textDim, fontSize: 12, height: 1.6),
@@ -6469,11 +6495,11 @@ class _ChatScreenState extends State<_ChatScreen>
                       )
                     : ListView.builder(
                         padding: const EdgeInsets.symmetric(horizontal: 6),
-                        itemCount: _contacts.length +
-                            (_groups.isEmpty ? 0 : _groups.length + 1),
+                        itemCount: contacts.length +
+                            (groups.isEmpty ? 0 : groups.length + 1),
                         itemBuilder: (_, i) {
-                          if (i >= _contacts.length) {
-                            if (i == _contacts.length) {
+                          if (i >= contacts.length) {
+                            if (i == contacts.length) {
                               return Padding(
                                 padding:
                                     const EdgeInsets.fromLTRB(14, 14, 14, 6),
@@ -6484,23 +6510,25 @@ class _ChatScreenState extends State<_ChatScreen>
                                         fontWeight: FontWeight.w700)),
                               );
                             }
-                            final g = _groups[i - _contacts.length - 1];
+                            final g = groups[i - contacts.length - 1];
                             return GestureDetector(
                               onSecondaryTapDown: (details) =>
                                   _showGroupMenu(g, details.globalPosition),
                               child: ListTile(
+                                contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 10, vertical: 4),
                                 leading: CircleAvatar(
-                                  radius: 17,
+                                  radius: 22,
                                   backgroundColor: _t.surface2,
                                   child: Icon(Icons.groups,
-                                      size: 17, color: _t.primary),
+                                      size: 21, color: _t.primary),
                                 ),
                                 title: Text(g.sidebarLabel,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
                                     style: TextStyle(
-                                        fontSize: 13.5,
-                                        fontWeight: FontWeight.w500,
+                                        fontSize: 15.5,
+                                        fontWeight: FontWeight.w600,
                                         color: _t.text)),
                                 subtitle: Text(g.memberSummary,
                                     maxLines: 1,
@@ -6561,7 +6589,7 @@ class _ChatScreenState extends State<_ChatScreen>
                               ),
                             );
                           }
-                          final c = _contacts[i];
+                          final c = contacts[i];
                           final on = _sel?.name == c.name;
                           final lastMsg = _lastMsg[c.name];
                           final presenceText = _presenceLabel(c.name);
@@ -6570,16 +6598,18 @@ class _ChatScreenState extends State<_ChatScreen>
                                 _showContactMenu(c, details.globalPosition),
                             child: ListTile(
                               selected: on,
+                              contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 4),
                               leading: Stack(
                                 clipBehavior: Clip.none,
                                 children: [
                                   CircleAvatar(
-                                    radius: 17,
+                                    radius: 22,
                                     backgroundColor: c.avatarColor,
                                     child: Text(c.initial,
                                         style: const TextStyle(
                                             color: Colors.white,
-                                            fontSize: 12,
+                                            fontSize: 15,
                                             fontWeight: FontWeight.w700)),
                                   ),
                                   Positioned(
@@ -6596,10 +6626,10 @@ class _ChatScreenState extends State<_ChatScreen>
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
                                         style: TextStyle(
-                                          fontSize: 13.5,
+                                          fontSize: 15.5,
                                           fontWeight: on
-                                              ? FontWeight.w600
-                                              : FontWeight.w500,
+                                              ? FontWeight.w700
+                                              : FontWeight.w600,
                                           color: on ? _t.primary : _t.text,
                                         )),
                                   ),
@@ -6626,7 +6656,7 @@ class _ChatScreenState extends State<_ChatScreen>
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
-                                          fontSize: 11, color: _t.textDim),
+                                          fontSize: 12.5, color: _t.textDim),
                                     )
                                   else
                                     Text(
@@ -6634,7 +6664,7 @@ class _ChatScreenState extends State<_ChatScreen>
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
-                                          fontSize: 10.5, color: _t.textDim),
+                                          fontSize: 11.5, color: _t.textDim),
                                     ),
                                   const SizedBox(height: 1),
                                   Text(presenceText,
@@ -7248,73 +7278,71 @@ class _ChatScreenState extends State<_ChatScreen>
     final showGroupSender = _selGroup != null;
     final displayText = _displayText(m);
     final attachment = parseAttachmentText(displayText);
-    final timeLabel = Padding(
-      padding: const EdgeInsets.only(bottom: 2),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(_hm(m.ts),
-              style: TextStyle(
-                  fontSize: 11,
-                  color: _t.textDim,
-                  fontWeight: FontWeight.w500)),
-          if (right) ...[
-            const SizedBox(width: 4),
-            _statusIcon(m),
-          ],
+    final narrow = MediaQuery.of(context).size.width < 720;
+
+    // Time + delivery ticks tuck under the text, inside the bubble
+    // (Google Messages style) rather than off in the margin.
+    final meta = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(_hm(m.ts),
+            style: TextStyle(fontSize: 10.5, color: _t.textDim)),
+        if (right) ...[
+          const SizedBox(width: 4),
+          _statusIcon(m),
         ],
-      ),
+      ],
     );
 
     final content = Container(
-      constraints:
-          BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.62),
-      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+      constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * (narrow ? 0.72 : 0.55)),
+      padding: const EdgeInsets.fromLTRB(14, 8, 12, 6),
       decoration: BoxDecoration(
         color: right ? _t.bubbleOut : _t.bubbleIn,
         borderRadius: BorderRadius.only(
-          topLeft: const Radius.circular(14),
-          topRight: const Radius.circular(14),
-          bottomLeft: Radius.circular(right ? 14 : 3),
-          bottomRight: Radius.circular(right ? 3 : 14),
+          topLeft: const Radius.circular(20),
+          topRight: const Radius.circular(20),
+          bottomLeft: Radius.circular(right ? 20 : 6),
+          bottomRight: Radius.circular(right ? 6 : 20),
         ),
         border: attachment != null
             ? Border.all(color: _t.primary.withAlpha(70))
             : null,
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (showGroupSender) ...[
-            Text(right ? 'You' : m.contact,
-                style: TextStyle(
-                    color: right ? _t.primary : _t.textDim,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700)),
-            const SizedBox(height: 3),
+      // IntrinsicWidth so the bubble shrinks to its content (short messages stay
+      // short) instead of stretching to the max width.
+      child: IntrinsicWidth(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (showGroupSender) ...[
+              Text(right ? 'You' : m.contact,
+                  style: TextStyle(
+                      color: right ? _t.primary : _t.textDim,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w700)),
+              const SizedBox(height: 3),
+            ],
+            if (attachment == null)
+              SelectableText(displayText,
+                  style:
+                      TextStyle(color: _t.text, fontSize: 15, height: 1.35))
+            else
+              _attachmentBubble(attachment),
+            const SizedBox(height: 2),
+            Align(alignment: Alignment.centerRight, child: meta),
           ],
-          if (attachment == null)
-            SelectableText(displayText,
-                style: TextStyle(color: _t.text, fontSize: 14, height: 1.35))
-          else
-            _attachmentBubble(attachment),
-        ],
+        ),
       ),
     );
 
-    // Timestamp sits to the left of the bubble in both directions, so it stays
-    // out of the way of the message text and is easy to scan down the margin.
     final bubble = Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2.5),
       child: Row(
         mainAxisAlignment:
             right ? MainAxisAlignment.end : MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          timeLabel,
-          const SizedBox(width: 8),
-          Flexible(child: content),
-        ],
+        children: [Flexible(child: content)],
       ),
     );
 
@@ -8096,80 +8124,99 @@ class _ChatScreenState extends State<_ChatScreen>
           Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              // emoji button
-              Padding(
-                padding: const EdgeInsets.only(bottom: 2),
-                child: IconButton(
-                  icon: const Text('😊', style: TextStyle(fontSize: 20)),
-                  onPressed: _showEmojiPicker,
-                  padding: EdgeInsets.zero,
-                  constraints:
-                      const BoxConstraints(minWidth: 32, minHeight: 32),
-                  splashRadius: 18,
-                ),
-              ),
-              const SizedBox(width: 4),
-              // attachment button
-              Padding(
-                padding: const EdgeInsets.only(bottom: 2),
-                child: IconButton(
-                  icon: Icon(
-                    hasAttach ? Icons.attach_file : Icons.attach_file_outlined,
-                    size: 18,
-                    color: hasAttach ? _t.primary : _t.textDim,
-                  ),
-                  onPressed: _showFileDialog,
-                  padding: EdgeInsets.zero,
-                  constraints:
-                      const BoxConstraints(minWidth: 32, minHeight: 32),
-                  splashRadius: 18,
-                ),
-              ),
-              const SizedBox(width: 4),
+              // Rounded input pill with inline emoji + attach buttons.
               Expanded(
-                child: Shortcuts(
-                  shortcuts: const <ShortcutActivator, Intent>{
-                    SingleActivator(LogicalKeyboardKey.enter):
-                        _SendMessageIntent(),
-                  },
-                  child: Actions(
-                    actions: <Type, Action<Intent>>{
-                      _SendMessageIntent: CallbackAction<_SendMessageIntent>(
-                        onInvoke: (_) {
-                          if (canSend) unawaited(_send());
-                          return null;
-                        },
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: _t.surface2,
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(color: _t.border),
+                  ),
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      IconButton(
+                        icon: const Text('😊', style: TextStyle(fontSize: 20)),
+                        onPressed: _showEmojiPicker,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                            minWidth: 36, minHeight: 40),
+                        splashRadius: 18,
+                        tooltip: 'Emoji',
                       ),
-                    },
-                    child: TextField(
-                      controller: _input,
-                      enabled: canSend,
-                      minLines: 1,
-                      maxLines: 4,
-                      keyboardType: TextInputType.multiline,
-                      style: TextStyle(fontSize: 14, color: _t.text),
-                      decoration: InputDecoration(
-                        hintText: hasAttach
-                            ? 'Add a message or send as-is…'
-                            : contactBlocked
-                                ? 'Contact is blocked'
-                                : contactPending
-                                    ? 'Add or block this contact first'
-                                    : 'Message or /help for commands…',
-                        contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 8),
+                      Expanded(
+                        child: Shortcuts(
+                          shortcuts: const <ShortcutActivator, Intent>{
+                            SingleActivator(LogicalKeyboardKey.enter):
+                                _SendMessageIntent(),
+                          },
+                          child: Actions(
+                            actions: <Type, Action<Intent>>{
+                              _SendMessageIntent:
+                                  CallbackAction<_SendMessageIntent>(
+                                onInvoke: (_) {
+                                  if (canSend) unawaited(_send());
+                                  return null;
+                                },
+                              ),
+                            },
+                            child: TextField(
+                              controller: _input,
+                              enabled: canSend,
+                              minLines: 1,
+                              maxLines: 4,
+                              keyboardType: TextInputType.multiline,
+                              style: TextStyle(fontSize: 15, color: _t.text),
+                              decoration: InputDecoration(
+                                isDense: true,
+                                border: InputBorder.none,
+                                enabledBorder: InputBorder.none,
+                                focusedBorder: InputBorder.none,
+                                filled: false,
+                                hintText: hasAttach
+                                    ? 'Add a message or send as-is…'
+                                    : contactBlocked
+                                        ? 'Contact is blocked'
+                                        : contactPending
+                                            ? 'Add or block this contact first'
+                                            : 'Message…',
+                                hintStyle: TextStyle(color: _t.textDim),
+                                contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 2, vertical: 11),
+                              ),
+                              textInputAction: TextInputAction.newline,
+                            ),
+                          ),
+                        ),
                       ),
-                      textInputAction: TextInputAction.newline,
-                    ),
+                      IconButton(
+                        icon: Icon(
+                          hasAttach
+                              ? Icons.attach_file
+                              : Icons.attach_file_outlined,
+                          size: 20,
+                          color: hasAttach ? _t.primary : _t.textDim,
+                        ),
+                        onPressed: _showFileDialog,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                            minWidth: 36, minHeight: 40),
+                        splashRadius: 18,
+                        tooltip: 'Attach file',
+                      ),
+                    ],
                   ),
                 ),
               ),
               const SizedBox(width: 8),
+              // Circular send button.
               FilledButton(
                 onPressed: canSend ? _send : null,
                 style: FilledButton.styleFrom(
-                  minimumSize: const Size(42, 42),
+                  minimumSize: const Size(46, 46),
                   padding: EdgeInsets.zero,
+                  shape: const CircleBorder(),
                 ),
                 child: _sending
                     ? SizedBox(
@@ -8178,7 +8225,7 @@ class _ChatScreenState extends State<_ChatScreen>
                         child: CircularProgressIndicator(
                             strokeWidth: 2, color: _t.bg.withAlpha(140)),
                       )
-                    : const Icon(Icons.send_rounded, size: 17),
+                    : const Icon(Icons.send_rounded, size: 19),
               ),
             ],
           ),
