@@ -1866,14 +1866,95 @@ fn encrypt_db(profile: &Path, current_hex: Option<&str>, new_hex: &str) -> Resul
     Ok(())
 }
 
+/// The 32-byte at-rest key for this process, if unlocked.
+fn db_key_bytes() -> Option<[u8; 32]> {
+    let hex = db_key_hex()?;
+    let mut key = [0u8; 32];
+    hex::decode_to_slice(&hex, &mut key).ok()?;
+    Some(key)
+}
+
+/// Magic prefix marking a profile file encrypted at rest.
+const ENC_AT_REST_MAGIC: &[u8] = b"SBFENC1\n";
+
+fn encrypt_at_rest(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let mut nonce = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .map_err(|_| anyhow!("encrypt at rest"))?;
+    let mut out = Vec::with_capacity(ENC_AT_REST_MAGIC.len() + nonce.len() + ct.len());
+    out.extend_from_slice(ENC_AT_REST_MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn decrypt_at_rest(key: &[u8; 32], raw: &[u8]) -> Result<Vec<u8>> {
+    let body = &raw[ENC_AT_REST_MAGIC.len()..];
+    if body.len() < 12 {
+        return Err(anyhow!("truncated encrypted file"));
+    }
+    let (nonce, ct) = body.split_at(12);
+    ChaCha20Poly1305::new(Key::from_slice(key))
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|_| anyhow!("could not decrypt profile file (locked or wrong key)"))
+}
+
+/// Read a possibly-encrypted profile file. Files with the magic prefix are
+/// decrypted with `key`; plaintext files are returned as-is (so unencrypted
+/// profiles keep working and encryption is opt-in).
+fn read_encryptable_with(path: &Path, key: Option<[u8; 32]>) -> Result<Vec<u8>> {
+    let raw = fs::read(path)?;
+    if raw.starts_with(ENC_AT_REST_MAGIC) {
+        let key = key.ok_or_else(|| anyhow!("profile is locked"))?;
+        decrypt_at_rest(&key, &raw)
+    } else {
+        Ok(raw)
+    }
+}
+
+fn read_encryptable(path: &Path) -> Result<Vec<u8>> {
+    read_encryptable_with(path, db_key_bytes())
+}
+
+/// Write a profile file, encrypting at rest when `key` is present (owner-only).
+fn write_encryptable_with(path: &Path, bytes: &[u8], key: Option<[u8; 32]>) -> Result<()> {
+    match key {
+        Some(key) => write_private(path, encrypt_at_rest(&key, bytes)?),
+        None => write_private(path, bytes),
+    }
+}
+
+fn write_encryptable(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_encryptable_with(path, bytes, db_key_bytes())
+}
+
+/// Re-encrypt a profile file under the current process key (used during the
+/// enable-encryption migration). No-op if the file does not exist.
+fn reencrypt_profile_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes = read_encryptable(path)?;
+    write_encryptable(path, &bytes)
+}
+
 /// Enable at-rest encryption (plaintext → encrypted) or change the passphrase on
 /// an already-encrypted DB, then leave this process unlocked with the new key.
+/// Also (re-)encrypts the private key + contacts files so the whole profile —
+/// not just message history — is protected at rest.
 pub(crate) fn set_db_passphrase(profile: &Path, new_passphrase: &str) -> Result<()> {
     let _ = init_db(profile)?; // ensure the DB + schema exist first
     let new_hex = db_key_hex_from_passphrase(profile, new_passphrase)?;
     let current = db_key_hex();
     encrypt_db(profile, current.as_deref(), &new_hex)?;
     set_process_db_key(Some(new_hex));
+    // Now that the process is unlocked with the new key, (re-)encrypt the other
+    // sensitive profile files so they match.
+    reencrypt_profile_file(&identity_path(profile))?;
+    reencrypt_profile_file(&contacts_path(profile))?;
     Ok(())
 }
 
@@ -4871,15 +4952,20 @@ fn create_private_dir(path: &Path) -> Result<()> {
 
 fn load_identity(profile: &Path) -> Result<IdentityFile> {
     let path = identity_path(profile);
-    let text = fs::read_to_string(&path).context("read identity.toml")?;
+    let bytes = read_encryptable(&path).context("read identity.toml")?;
     // Correct permissions on existing profiles created before we started
     // restricting the identity file.
     restrict_file(&path);
+    let text = String::from_utf8(bytes).context("identity.toml is not valid UTF-8")?;
     Ok(toml::from_str(&text)?)
 }
 
 fn save_identity(profile: &Path, id: &IdentityFile) -> Result<()> {
-    write_private(&identity_path(profile), toml::to_string_pretty(id)?).context("write identity")
+    write_encryptable(
+        &identity_path(profile),
+        toml::to_string_pretty(id)?.as_bytes(),
+    )
+    .context("write identity")
 }
 
 // ---------------------------------------------------------------------------
@@ -5301,14 +5387,16 @@ pub fn load_contacts(profile: &Path) -> Result<ContactsMap> {
     if !p.exists() {
         return Ok(HashMap::new());
     }
-    let text = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+    let bytes = read_encryptable(&p).with_context(|| format!("read {}", p.display()))?;
+    let text =
+        String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", p.display()))?;
     let map: ContactsMap = toml::from_str(&text)?;
     Ok(map)
 }
 
 pub fn save_contacts(profile: &Path, contacts: &ContactsMap) -> Result<()> {
     let p = contacts_path(profile);
-    fs::write(&p, toml::to_string_pretty(contacts)?)
+    write_encryptable(&p, toml::to_string_pretty(contacts)?.as_bytes())
         .with_context(|| format!("write {}", p.display()))?;
     Ok(())
 }
@@ -7560,6 +7648,41 @@ mod tests {
             !raw.windows("secret-plaintext-xyzzy".len())
                 .any(|w| w == b"secret-plaintext-xyzzy"),
             "message body must not appear in plaintext on disk"
+        );
+    }
+
+    #[test]
+    fn encryptable_files_round_trip_and_stay_opaque() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.toml");
+        let key = [7u8; 32];
+        let secret = b"ed25519 = \"SUPER-SECRET-KEY-MATERIAL\"";
+
+        // Encrypted write, then read back with the key.
+        write_encryptable_with(&path, secret, Some(key)).unwrap();
+        assert_eq!(
+            read_encryptable_with(&path, Some(key)).unwrap(),
+            secret.to_vec()
+        );
+
+        // On disk it is opaque: magic prefix, no plaintext key material.
+        let raw = std::fs::read(&path).unwrap();
+        assert!(raw.starts_with(ENC_AT_REST_MAGIC));
+        assert!(!raw
+            .windows("SUPER-SECRET".len())
+            .any(|w| w == b"SUPER-SECRET"));
+
+        // Locked (no key) and wrong-key reads both fail.
+        assert!(read_encryptable_with(&path, None).is_err());
+        assert!(read_encryptable_with(&path, Some([9u8; 32])).is_err());
+
+        // A plaintext file (no magic) is passed through unchanged, key or not.
+        let plain = dir.path().join("plain.toml");
+        write_encryptable_with(&plain, b"just text", None).unwrap();
+        assert_eq!(std::fs::read(&plain).unwrap(), b"just text".to_vec());
+        assert_eq!(
+            read_encryptable_with(&plain, Some(key)).unwrap(),
+            b"just text".to_vec()
         );
     }
 
