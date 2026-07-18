@@ -777,6 +777,114 @@ List<String> groupMemberMutationArgs({
       '--json',
     ];
 
+/// Full-screen app-lock: prompts for the passphrase and unlocks the profile.
+class _UnlockScreen extends StatefulWidget {
+  const _UnlockScreen({required this.theme, required this.onUnlock});
+  final ThemeDef theme;
+  final Future<void> Function(String) onUnlock;
+
+  @override
+  State<_UnlockScreen> createState() => _UnlockScreenState();
+}
+
+class _UnlockScreenState extends State<_UnlockScreen> {
+  final _pass = TextEditingController();
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _pass.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_busy || _pass.text.isEmpty) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.onUnlock(_pass.text);
+      // On success the parent rebuilds and disposes this screen.
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _error = 'Incorrect passphrase';
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.theme;
+    return Scaffold(
+      backgroundColor: t.bg,
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 360),
+          child: Padding(
+            padding: const EdgeInsets.all(28),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.lock_outline, size: 56, color: t.primary),
+                const SizedBox(height: 16),
+                Text('Sideband is locked',
+                    style: TextStyle(
+                        color: t.text,
+                        fontSize: 20,
+                        fontWeight: FontWeight.w700)),
+                const SizedBox(height: 8),
+                Text('Enter your app passphrase to unlock this device.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: t.textDim, fontSize: 13)),
+                const SizedBox(height: 24),
+                TextField(
+                  controller: _pass,
+                  obscureText: true,
+                  autofocus: true,
+                  enabled: !_busy,
+                  onSubmitted: (_) => _submit(),
+                  style: TextStyle(color: t.text),
+                  decoration: InputDecoration(
+                    labelText: 'Passphrase',
+                    labelStyle: TextStyle(color: t.textDim),
+                    filled: true,
+                    fillColor: t.surface2,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                    errorText: _error,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: _busy ? null : _submit,
+                    style: FilledButton.styleFrom(
+                        minimumSize: const Size.fromHeight(48)),
+                    child: _busy
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Text('Unlock'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _Cli {
   _Cli();
 
@@ -803,6 +911,13 @@ class _Cli {
   final String profile =
       Platform.environment['SIDEBAND_PROFILE'] ?? '~/.sideband';
 
+  /// The unlocked at-rest DB key (hex), passed to every subprocess via
+  /// SIDEBAND_DB_KEY once the profile is unlocked. Null = plaintext / locked.
+  String? dbKey;
+
+  Map<String, String>? get _dbEnv =>
+      dbKey != null ? {'SIDEBAND_DB_KEY': dbKey!} : null;
+
   String expandedProfilePath() {
     final p = profile;
     if (p == '~') return Platform.environment['HOME'] ?? p;
@@ -826,7 +941,7 @@ class _Cli {
   }
 
   Future<String> _run(List<String> args) async {
-    final r = await Process.run(_bin, args);
+    final r = await Process.run(_bin, args, environment: _dbEnv);
     if (r.exitCode != 0) {
       final err = (r.stderr as String).trim();
       final out = (r.stdout as String).trim();
@@ -834,6 +949,44 @@ class _Cli {
       throw Exception(detail.isEmpty ? '$_bin exited ${r.exitCode}' : detail);
     }
     return (r.stdout as String).trim();
+  }
+
+  // ── At-rest encryption / app lock ──────────────────────────────────────────
+
+  Future<Map<String, dynamic>> dbStatus() async {
+    final raw = await _run(['db-status', '--profile', profile, '--json']);
+    final d = jsonDecode(raw);
+    return d is Map ? Map<String, dynamic>.from(d) : <String, dynamic>{};
+  }
+
+  /// Verify the passphrase (piped on stdin), capture + hold the derived key.
+  Future<void> dbUnlock(String passphrase) async {
+    final proc = await Process.start(_bin, ['db-unlock', '--profile', profile]);
+    proc.stdin.write(passphrase);
+    await proc.stdin.flush();
+    await proc.stdin.close();
+    final out = (await proc.stdout.transform(utf8.decoder).join()).trim();
+    final err = (await proc.stderr.transform(utf8.decoder).join()).trim();
+    if (await proc.exitCode != 0) {
+      throw Exception(err.isEmpty ? 'unlock failed' : err);
+    }
+    if (out.length != 64) throw Exception('unexpected key response');
+    dbKey = out;
+  }
+
+  /// Set/change the app passphrase (piped on stdin), then hold the new key.
+  Future<void> dbSetPassphrase(String passphrase) async {
+    final proc = await Process.start(
+        _bin, ['db-set-passphrase', '--profile', profile],
+        environment: _dbEnv);
+    proc.stdin.write(passphrase);
+    await proc.stdin.flush();
+    await proc.stdin.close();
+    final err = (await proc.stderr.transform(utf8.decoder).join()).trim();
+    if (await proc.exitCode != 0) {
+      throw Exception(err.isEmpty ? 'set passphrase failed' : err);
+    }
+    await dbUnlock(passphrase);
   }
 
   Future<String> identity() => _run(['identity', '--profile', profile]);
@@ -1621,6 +1774,23 @@ class _MobileApi {
   _Ptr1 get _listTransfers => _lookup1('sideband_api_list_transfers');
   _Ptr2 get _resumeTransfer => _lookup2('sideband_api_resume_transfer');
   _Ptr2 get _cancelTransfer => _lookup2('sideband_api_cancel_transfer');
+  _Ptr1 get _dbStatus => _lookup1('sideband_api_db_status');
+  _Ptr2 get _dbUnlock => _lookup2('sideband_api_db_unlock');
+  _Ptr2 get _dbSetPassphrase => _lookup2('sideband_api_db_set_passphrase');
+
+  Future<Map<String, dynamic>> dbStatus() async {
+    final m =
+        _withCString1<Map<dynamic, dynamic>>(await profilePath(), _dbStatus);
+    return Map<String, dynamic>.from(m);
+  }
+
+  Future<void> dbUnlock(String passphrase) async {
+    _withCString2<Object?>(await profilePath(), passphrase, _dbUnlock);
+  }
+
+  Future<void> dbSetPassphrase(String passphrase) async {
+    _withCString2<Object?>(await profilePath(), passphrase, _dbSetPassphrase);
+  }
 
   String? _profilePath;
 
@@ -2411,6 +2581,10 @@ class _ChatScreenState extends State<_ChatScreen>
   _MobileApi? _mobile;
   bool _mobileApiAvailable = false;
   String? _mobileOnion;
+  // At-rest encryption: true when the profile is encrypted and not yet unlocked
+  // this session (the unlock screen gates the rest of the app).
+  bool _locked = false;
+  bool _appLockEnabled = false;
   final _input = TextEditingController();
   final _scroll = ScrollController();
   final scaffoldKey = GlobalKey<ScaffoldState>();
@@ -2608,12 +2782,164 @@ class _ChatScreenState extends State<_ChatScreen>
     windowManager.addListener(_windowHandler);
   }
 
+  bool get _mobileReady => _canUseMobileBackend && _mobile != null;
+
+  /// If the profile is encrypted and not unlocked this session, show the unlock
+  /// screen and stop bootstrap. Returns true when gated.
+  Future<bool> _gateOnLock() async {
+    try {
+      final s = _mobileReady ? await _mobile!.dbStatus() : await _cli.dbStatus();
+      final encrypted = s['encrypted'] == true;
+      final haveKey =
+          _canUseMobileBackend ? (s['unlocked'] == true) : (_cli.dbKey != null);
+      if (encrypted && !haveKey) {
+        if (mounted) {
+          setState(() {
+            _locked = true;
+            _loading = false;
+          });
+        }
+        return true;
+      }
+    } catch (_) {
+      // If status can't be read, fall through and let normal errors surface.
+    }
+    return false;
+  }
+
+  /// Verify the passphrase, unlock, and (re)run bootstrap. Throws on wrong
+  /// passphrase so the unlock screen can show an error.
+  Future<void> _submitUnlock(String passphrase) async {
+    if (_mobileReady) {
+      await _mobile!.dbUnlock(passphrase);
+    } else {
+      await _cli.dbUnlock(passphrase);
+    }
+    if (!mounted) return;
+    setState(() {
+      _locked = false;
+      _loading = true;
+    });
+    await _bootstrap();
+  }
+
+  /// Set or change the app passphrase (encrypting the profile at rest).
+  Future<void> _setAppPassphrase(String passphrase) async {
+    if (_mobileReady) {
+      await _mobile!.dbSetPassphrase(passphrase);
+    } else {
+      await _cli.dbSetPassphrase(passphrase);
+    }
+  }
+
+  Widget _unlockScreen() =>
+      _UnlockScreen(theme: _t, onUnlock: _submitUnlock);
+
+  Future<void> _showAppLockDialog() async {
+    final passCtl = TextEditingController();
+    final confirmCtl = TextEditingController();
+    bool busy = false;
+    String? error;
+    final changing = _appLockEnabled;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setInner) {
+          Future<void> submit() async {
+            final p = passCtl.text;
+            if (p.length < 4) {
+              setInner(() => error = 'Use at least 4 characters');
+              return;
+            }
+            if (p != confirmCtl.text) {
+              setInner(() => error = 'Passphrases don’t match');
+              return;
+            }
+            setInner(() {
+              busy = true;
+              error = null;
+            });
+            try {
+              await _setAppPassphrase(p);
+              if (mounted) setState(() => _appLockEnabled = true);
+              if (ctx.mounted) Navigator.of(ctx).pop();
+              _snack(changing ? 'Passphrase changed' : 'App lock enabled');
+            } catch (e) {
+              setInner(() {
+                busy = false;
+                error = '$e';
+              });
+            }
+          }
+
+          return AlertDialog(
+            backgroundColor: _t.surface,
+            title: Text(changing ? 'Change passphrase' : 'Enable app lock',
+                style: TextStyle(color: _t.text)),
+            content: SizedBox(
+              width: _canUseMobileBackend ? double.maxFinite : 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'Encrypts your messages, contacts, and keys on this device '
+                    'with a passphrase. There is no recovery — if you forget it, '
+                    'the data is unreadable.',
+                    style: TextStyle(color: _t.textDim, fontSize: 12),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: passCtl,
+                    obscureText: true,
+                    autofocus: true,
+                    enabled: !busy,
+                    style: TextStyle(color: _t.text),
+                    decoration: InputDecoration(
+                        labelText: changing ? 'New passphrase' : 'Passphrase',
+                        errorText: error),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: confirmCtl,
+                    obscureText: true,
+                    enabled: !busy,
+                    onSubmitted: (_) => submit(),
+                    style: TextStyle(color: _t.text),
+                    decoration:
+                        const InputDecoration(labelText: 'Confirm passphrase'),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: busy ? null : () => Navigator.of(ctx).pop(),
+                  child: const Text('Cancel')),
+              FilledButton(
+                onPressed: busy ? null : submit,
+                child: busy
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : Text(changing ? 'Change' : 'Enable'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    passCtl.dispose();
+    confirmCtl.dispose();
+  }
+
   Future<void> _bootstrap() async {
     try {
       if (_canUseMobileBackend) {
         await _bootstrapMobile();
         return;
       }
+      if (await _gateOnLock()) return;
       if (!_cli.identityConfigured()) {
         final name = await _promptDisplayName();
         if (name == null || name.trim().isEmpty) {
@@ -2668,6 +2994,7 @@ class _ChatScreenState extends State<_ChatScreen>
     final mobile = _mobile;
     if (mobile == null) throw Exception('Android backend unavailable');
     _mobileProfilePath = await mobile.profilePath();
+    if (await _gateOnLock()) return;
     if (!await mobile.identityConfigured()) {
       final name = await _promptDisplayName();
       if (name == null || name.trim().isEmpty) {
@@ -3100,6 +3427,9 @@ class _ChatScreenState extends State<_ChatScreen>
       final p = await Process.start(
         _cli.bin,
         ['serve', '--profile', _cli.profile],
+        environment: _cli.dbKey != null
+            ? {'SIDEBAND_DB_KEY': _cli.dbKey!}
+            : null,
         mode: ProcessStartMode.normal,
       );
       _listener = p;
@@ -5929,6 +6259,11 @@ class _ChatScreenState extends State<_ChatScreen>
         if (mounted) setState(() => _bluetoothEnabled = enabled);
       } catch (_) {}
     }
+    // Load the at-rest encryption / app-lock state.
+    try {
+      final s = _mobileReady ? await _mobile!.dbStatus() : await _cli.dbStatus();
+      if (mounted) setState(() => _appLockEnabled = s['encrypted'] == true);
+    } catch (_) {}
     if (!mounted) return;
     await showDialog<void>(
       context: context,
@@ -5944,6 +6279,19 @@ class _ChatScreenState extends State<_ChatScreen>
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  ListTile(
+                    leading: Icon(
+                        _appLockEnabled ? Icons.lock : Icons.lock_open_outlined),
+                    title: const Text('App lock'),
+                    subtitle: Text(_appLockEnabled
+                        ? 'Encrypted at rest — tap to change passphrase'
+                        : 'Encrypt this profile with a passphrase'),
+                    trailing: const Icon(Icons.chevron_right, size: 20),
+                    onTap: () async {
+                      Navigator.of(dialogContext).pop();
+                      await _showAppLockDialog();
+                    },
+                  ),
                   SwitchListTile(
                     secondary: const Icon(Icons.notifications_active_outlined),
                     title: Text(_canUseMobileBackend
@@ -6289,6 +6637,7 @@ class _ChatScreenState extends State<_ChatScreen>
 
   @override
   Widget build(BuildContext context) {
+    if (_locked) return _unlockScreen();
     return Scaffold(
       key: scaffoldKey,
       body: SafeArea(
