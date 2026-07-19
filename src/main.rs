@@ -1955,13 +1955,16 @@ pub(crate) fn set_db_passphrase(profile: &Path, new_passphrase: &str) -> Result<
     // sensitive profile files so they match.
     reencrypt_profile_file(&identity_path(profile))?;
     reencrypt_profile_file(&contacts_path(profile))?;
-    // Double Ratchet session state is per-contact under <profile>/ratchet/.
-    let rdir = profile.join("ratchet");
-    if rdir.is_dir() {
-        for entry in fs::read_dir(&rdir)? {
-            let path = entry?.path();
-            if path.is_file() {
-                reencrypt_profile_file(&path)?;
+    // Double Ratchet session state (per-contact under <profile>/ratchet/) and
+    // stored contact device lists (per-contact under <profile>/contact-devices/).
+    for sub in ["ratchet", "contact-devices"] {
+        let dir = profile.join(sub);
+        if dir.is_dir() {
+            for entry in fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_file() {
+                    reencrypt_profile_file(&path)?;
+                }
             }
         }
     }
@@ -5607,6 +5610,88 @@ fn build_self_device_list(profile: &Path, onion: &str, version: u64) -> Result<D
     Ok(list)
 }
 
+// ── Multi-device: a contact's device endpoints ──────────────────────────────
+//
+// A contact's known devices are stored as a signed `DeviceList` in an encrypted
+// sidecar file, keyed by contact name (like ratchet state) — separate from the
+// `ContactFile` record so legacy single-onion contacts need no format change. A
+// contact with no stored list (or an unverifiable one) resolves to a single
+// legacy endpoint (device 0 == the contact's account key), so single-device
+// contacts behave exactly as before.
+
+/// One reachable endpoint of a contact (one of their devices).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContactEndpoint {
+    device_pubkey_b64: String,
+    onion: String,
+    x25519_pubkey_b64: String,
+}
+
+fn contact_devices_dir(profile: &Path) -> PathBuf {
+    profile.join("contact-devices")
+}
+
+fn contact_device_list_path(profile: &Path, contact_name: &str) -> PathBuf {
+    // Strip any path components in the (user-set) contact name for safety.
+    let file = Path::new(contact_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| contact_name.to_string());
+    contact_devices_dir(profile).join(format!("{file}.toml"))
+}
+
+#[allow(dead_code)] // written by Phase 3 device linking / device-list push
+fn save_contact_device_list(profile: &Path, contact_name: &str, list: &DeviceList) -> Result<()> {
+    create_private_dir(&contact_devices_dir(profile))?;
+    let toml = toml::to_string_pretty(list).context("serialize contact device list")?;
+    write_encryptable(
+        &contact_device_list_path(profile, contact_name),
+        toml.as_bytes(),
+    )
+}
+
+fn load_contact_device_list(profile: &Path, contact_name: &str) -> Result<Option<DeviceList>> {
+    let path = contact_device_list_path(profile, contact_name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = read_encryptable(&path)?;
+    let s = String::from_utf8(bytes).context("contact device list not utf-8")?;
+    Ok(Some(
+        toml::from_str(&s).context("parse contact device list")?,
+    ))
+}
+
+/// The contact's reachable device endpoints. Uses a stored, verified device
+/// list when present; otherwise falls back to the single legacy endpoint so
+/// single-device contacts are unchanged. A stored list that does not verify
+/// against the contact's account key is ignored (never trusted).
+#[allow(dead_code)] // wired into the send path in step 2c
+fn contact_endpoints(profile: &Path, contact: &ContactFile) -> Vec<ContactEndpoint> {
+    if let Ok(Some(list)) = load_contact_device_list(profile, &contact.name) {
+        if verify_device_list(&list, &contact.pubkey_b64).is_ok() {
+            return list
+                .devices
+                .iter()
+                .map(|d| ContactEndpoint {
+                    device_pubkey_b64: d.device_pubkey_b64.clone(),
+                    onion: d.onion.clone(),
+                    x25519_pubkey_b64: d.x25519_pubkey_b64.clone(),
+                })
+                .collect();
+        }
+        tracing::warn!(
+            contact = %contact.name,
+            "stored device list failed verification; using legacy endpoint"
+        );
+    }
+    vec![ContactEndpoint {
+        device_pubkey_b64: contact.pubkey_b64.clone(),
+        onion: contact.onion.clone(),
+        x25519_pubkey_b64: contact.x25519_pubkey_b64.clone().unwrap_or_default(),
+    }]
+}
+
 pub(crate) fn share_command(profile: &Path, onion: &str) -> Result<String> {
     if onion.trim().is_empty() || onion.starts_with('(') {
         anyhow::bail!("onion address is not ready yet");
@@ -8116,6 +8201,89 @@ mod tests {
         let loaded = load_device_list(dir.path()).unwrap().unwrap();
         assert_eq!(loaded, list);
         assert!(verify_device_list(&loaded, &acct_pub).is_ok());
+    }
+
+    fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {
+        ContactFile {
+            name: name.to_string(),
+            onion: onion.to_string(),
+            pubkey_b64: pubkey_b64.to_string(),
+            x25519_pubkey_b64: Some(x.to_string()),
+            pending: false,
+            blocked: false,
+        }
+    }
+
+    #[test]
+    fn contact_endpoints_fall_back_to_legacy_when_no_device_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = test_contact("bob", "bob.onion", "PUB", "X");
+        let eps = contact_endpoints(dir.path(), &c);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].onion, "bob.onion");
+        assert_eq!(eps[0].device_pubkey_b64, "PUB");
+        assert_eq!(eps[0].x25519_pubkey_b64, "X");
+    }
+
+    #[test]
+    fn contact_endpoints_use_stored_verified_device_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = SigningKey::generate(&mut OsRng);
+        let acct_pub = B64.encode(account.verifying_key().to_bytes());
+        let d0 = sign_device_cert(
+            &account,
+            &acct_pub,
+            "primary.onion",
+            &B64.encode([1u8; 32]),
+            1,
+            &["msg".to_string()],
+        );
+        let d2pub = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let d1 = sign_device_cert(
+            &account,
+            &d2pub,
+            "laptop.onion",
+            &B64.encode([2u8; 32]),
+            2,
+            &["msg".to_string()],
+        );
+        let list = sign_device_list(&account, 3, vec![d0, d1]);
+        save_contact_device_list(dir.path(), "bob", &list).unwrap();
+
+        let c = test_contact("bob", "primary.onion", &acct_pub, &B64.encode([1u8; 32]));
+        let mut onions: Vec<String> = contact_endpoints(dir.path(), &c)
+            .into_iter()
+            .map(|e| e.onion)
+            .collect();
+        onions.sort();
+        assert_eq!(
+            onions,
+            vec!["laptop.onion".to_string(), "primary.onion".to_string()]
+        );
+    }
+
+    #[test]
+    fn contact_endpoints_ignore_device_list_not_signed_by_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        // A device list signed by an attacker key (not the contact's account
+        // key) must be ignored; we keep the trusted legacy endpoint.
+        let attacker = SigningKey::generate(&mut OsRng);
+        let att_pub = B64.encode(attacker.verifying_key().to_bytes());
+        let forged = sign_device_cert(
+            &attacker,
+            &att_pub,
+            "evil.onion",
+            &B64.encode([9u8; 32]),
+            1,
+            &["msg".to_string()],
+        );
+        let bad = sign_device_list(&attacker, 1, vec![forged]);
+        save_contact_device_list(dir.path(), "bob", &bad).unwrap();
+
+        let c = test_contact("bob", "bob.onion", "REALPUB", "X");
+        let eps = contact_endpoints(dir.path(), &c);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].onion, "bob.onion");
     }
 
     // -- profile paths --
