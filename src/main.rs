@@ -1379,6 +1379,140 @@ pub(crate) fn build_outbound_message(
     Ok(msg)
 }
 
+fn x25519_pubkey_from_b64(b64: &str) -> Result<X25519PublicKey> {
+    let raw = B64
+        .decode(b64.as_bytes())
+        .context("decode x25519 pubkey base64")?;
+    let arr: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("invalid x25519 pubkey length"))?;
+    Ok(X25519PublicKey::from(arr))
+}
+
+/// Build a message encrypted for one specific device of a contact: the ratchet
+/// state and X25519 key come from that device's endpoint, not the contact's
+/// primary. Device 0 uses the legacy per-contact ratchet + the contact's key,
+/// so it is byte-for-byte the current single-device behavior.
+#[allow(dead_code)] // wired into send_in_conversation delivery loop in step 2c-send
+#[allow(clippy::too_many_arguments)]
+fn build_outbound_message_for_endpoint(
+    profile: &Path,
+    contact_name: &str,
+    endpoint: &ContactEndpoint,
+    account_pubkey_b64: &str,
+    message_type: &str,
+    plaintext: &str,
+    sender_onion: &str,
+    expires_at_ms: Option<u128>,
+) -> Result<ChatMessage> {
+    let key = load_signing_key(profile)?;
+    let our_ed25519_pub = B64.encode(key.verifying_key().to_bytes());
+    let sender_name = load_display_name(profile).unwrap_or_else(|_| String::new());
+    let sender_x25519_pubkey_b64 = load_x25519_public(profile)
+        .map(|pk| B64.encode(pk.as_bytes()))
+        .unwrap_or_default();
+    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+
+    let ratchet_path = RatchetState::path_for_device(
+        profile,
+        contact_name,
+        &endpoint.device_pubkey_b64,
+        account_pubkey_b64,
+    );
+    let use_ratchet = message_type == "msg" && ratchet_path.exists();
+
+    let msg = if use_ratchet {
+        let state_bytes = read_encryptable(&ratchet_path)?;
+        let mut state: RatchetState =
+            bincode::deserialize(&state_bytes).context("deserialize ratchet state")?;
+        let (header_b64, nonce_hex, ct_hex) =
+            ratchet_encrypt(&mut state, plaintext.as_bytes(), &our_ed25519_pub)?;
+        state.save_to(&ratchet_path)?;
+        let mut sign_msg = ChatMessage {
+            v: 3,
+            r#type: message_type.into(),
+            from: our_ed25519_pub.clone(),
+            sender_name: sender_name.clone(),
+            sender_onion: sender_onion.to_string(),
+            sender_x25519_pubkey_b64: sender_x25519_pubkey_b64.clone(),
+            timestamp_ms,
+            body: plaintext.to_string(),
+            sig_b64: String::new(),
+            enc_body: String::new(),
+            ratchet_header_b64: header_b64,
+            ratchet_nonce_hex: nonce_hex,
+            ratchet_ct_hex: ct_hex,
+            expires_at_ms,
+        };
+        sign_message(&key, &mut sign_msg)?;
+        sign_msg.body.clear();
+        sign_msg
+    } else {
+        let mut msg = ChatMessage {
+            v: 2,
+            r#type: message_type.into(),
+            from: our_ed25519_pub.clone(),
+            sender_name: sender_name.clone(),
+            sender_onion: sender_onion.to_string(),
+            sender_x25519_pubkey_b64: sender_x25519_pubkey_b64.clone(),
+            timestamp_ms,
+            body: plaintext.to_string(),
+            sig_b64: String::new(),
+            enc_body: String::new(),
+            ratchet_header_b64: String::new(),
+            ratchet_nonce_hex: String::new(),
+            ratchet_ct_hex: String::new(),
+            expires_at_ms,
+        };
+        sign_message(&key, &mut msg)?;
+        let our_x25519 = load_x25519_secret(profile)?;
+        let their_x25519 = x25519_pubkey_from_b64(&endpoint.x25519_pubkey_b64)?;
+        let shared_key = derive_shared_key(&our_x25519, &their_x25519)?;
+        msg.enc_body = encrypt_body(&shared_key, plaintext)?;
+        msg.body.clear();
+        msg
+    };
+
+    Ok(msg)
+}
+
+/// Fan-out: build one message per device of the contact (each encrypted to that
+/// device). A single-device contact yields exactly one message, identical to
+/// `build_outbound_message`. Returned pairs carry the endpoint so the caller
+/// delivers each to the right onion.
+#[allow(dead_code)] // wired into send_in_conversation delivery loop in step 2c-send
+fn build_outbound_messages_fanout(
+    profile: &Path,
+    contact_name: &str,
+    message_type: &str,
+    plaintext: &str,
+    sender_onion: &str,
+    expires_at_ms: Option<u128>,
+) -> Result<Vec<(ContactEndpoint, ChatMessage)>> {
+    let contacts = load_contacts(profile)?;
+    let contact = contacts
+        .get(contact_name)
+        .with_context(|| format!("unknown contact '{contact_name}'"))?;
+    let account_pubkey_b64 = contact.pubkey_b64.clone();
+    let endpoints = contact_endpoints(profile, contact);
+    let mut out = Vec::with_capacity(endpoints.len());
+    for ep in endpoints {
+        let msg = build_outbound_message_for_endpoint(
+            profile,
+            contact_name,
+            &ep,
+            &account_pubkey_b64,
+            message_type,
+            plaintext,
+            sender_onion,
+            expires_at_ms,
+        )?;
+        out.push((ep, msg));
+    }
+    Ok(out)
+}
+
 async fn send_typed_message(
     profile: &Path,
     to_onion: &str,
@@ -6131,6 +6265,30 @@ impl RatchetState {
             .join(format!("{}.bin", contact.display()))
     }
 
+    /// Ratchet state path for a specific device of a contact. Device 0 — the
+    /// device whose key IS the contact's account key — keeps the legacy
+    /// per-contact path, so existing single-device sessions are unchanged;
+    /// additional devices get a nested per-device file keyed by a short hash of
+    /// the device pubkey (base64 pubkeys aren't filesystem-safe).
+    fn path_for_device(
+        profile: &Path,
+        contact_name: &str,
+        device_pubkey_b64: &str,
+        account_pubkey_b64: &str,
+    ) -> PathBuf {
+        if device_pubkey_b64 == account_pubkey_b64 {
+            return Self::path(profile, std::path::Path::new(contact_name));
+        }
+        use sha2::Digest;
+        let mut hasher = Sha256::new();
+        hasher.update(device_pubkey_b64.as_bytes());
+        let short = hex::encode(&hasher.finalize()[..8]);
+        profile
+            .join("ratchet")
+            .join(contact_name)
+            .join(format!("{short}.bin"))
+    }
+
     /// Whether a Double Ratchet session exists for `contact_name` (state file
     /// present on disk). This is the same truth the desktop GUI reads directly.
     #[allow(dead_code)]
@@ -6201,10 +6359,14 @@ impl RatchetState {
     }
 
     fn save(&self, profile: &Path, contact_name: &str) -> Result<()> {
-        let path = Self::path(profile, std::path::Path::new(contact_name));
+        self.save_to(&Self::path(profile, std::path::Path::new(contact_name)))
+    }
+
+    /// Persist to an explicit ratchet state path (used for per-device sessions).
+    fn save_to(&self, path: &Path) -> Result<()> {
         create_private_dir(path.parent().unwrap())?;
         let bytes = bincode::serialize(self)?;
-        write_encryptable(&path, &bytes).context("write ratchet state")?;
+        write_encryptable(path, &bytes).context("write ratchet state")?;
         Ok(())
     }
 }
@@ -8284,6 +8446,90 @@ mod tests {
         let eps = contact_endpoints(dir.path(), &c);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].onion, "bob.onion");
+    }
+
+    #[test]
+    fn fanout_builds_one_encrypted_message_per_device() {
+        use x25519_dalek::StaticSecret;
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+
+        // Bob's account key + two device X25519 keypairs (device 0 == account,
+        // device 1 == a linked device).
+        let bob_account = SigningKey::generate(&mut OsRng);
+        let bob_acct_pub = B64.encode(bob_account.verifying_key().to_bytes());
+
+        let d0_secret = StaticSecret::random_from_rng(OsRng);
+        let d0_x_b64 = B64.encode(X25519PublicKey::from(&d0_secret).as_bytes());
+
+        let d1_dev_pub = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let d1_secret = StaticSecret::random_from_rng(OsRng);
+        let d1_x_b64 = B64.encode(X25519PublicKey::from(&d1_secret).as_bytes());
+
+        // Store bob as a contact whose primary endpoint is device 0.
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert(
+            "bob".to_string(),
+            test_contact("bob", "bob-d0.onion", &bob_acct_pub, &d0_x_b64),
+        );
+        save_contacts(dir.path(), &contacts).unwrap();
+
+        // Bob's signed 2-device list.
+        let cert0 = sign_device_cert(
+            &bob_account,
+            &bob_acct_pub,
+            "bob-d0.onion",
+            &d0_x_b64,
+            1,
+            &["msg".to_string()],
+        );
+        let cert1 = sign_device_cert(
+            &bob_account,
+            &d1_dev_pub,
+            "bob-d1.onion",
+            &d1_x_b64,
+            2,
+            &["msg".to_string()],
+        );
+        let list = sign_device_list(&bob_account, 2, vec![cert0, cert1]);
+        save_contact_device_list(dir.path(), "bob", &list).unwrap();
+
+        let msgs = build_outbound_messages_fanout(
+            dir.path(),
+            "bob",
+            "msg",
+            "hello devices",
+            "sender.onion",
+            None,
+        )
+        .unwrap();
+        assert_eq!(msgs.len(), 2, "one message per device");
+
+        // Each message decrypts under the right device's X25519 secret + our
+        // (sender's) X25519 public — proving per-device encryption.
+        let our_x_pub = load_x25519_public(dir.path()).unwrap();
+        for (ep, msg) in &msgs {
+            assert_eq!(msg.v, 2);
+            let secret = if ep.onion == "bob-d0.onion" {
+                &d0_secret
+            } else {
+                &d1_secret
+            };
+            let shared = derive_shared_key(secret, &our_x_pub).unwrap();
+            assert_eq!(
+                decrypt_body(&shared, &msg.enc_body).unwrap(),
+                "hello devices"
+            );
+        }
+        // Distinct ciphertext (encrypted to different device keys).
+        assert_ne!(msgs[0].1.enc_body, msgs[1].1.enc_body);
+
+        let mut onions: Vec<String> = msgs.iter().map(|(e, _)| e.onion.clone()).collect();
+        onions.sort();
+        assert_eq!(
+            onions,
+            vec!["bob-d0.onion".to_string(), "bob-d1.onion".to_string()]
+        );
     }
 
     // -- profile paths --
