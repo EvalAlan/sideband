@@ -5346,6 +5346,267 @@ fn print_identity(profile: &Path) -> Result<()> {
     Ok(())
 }
 
+// ── Multi-device: account identity + device certificates ────────────────────
+//
+// An account = an Ed25519 *account identity key* (AIK, the identity.toml key) +
+// a set of devices. Each device has its own device key (on the primary, the
+// device key IS the AIK — "device 0"), its own onion, and its own X25519 key.
+// The AIK signs a DeviceCert per device; the collection is a versioned,
+// list-signed DeviceList. Trust flows: contact trusts the AIK → the AIK vouches
+// for each device → a message's device key must appear in the signed list.
+// See docs/plans/2026-07-17-multi-device-independent-peers.md. Phase 1 is the
+// pure crypto + persisted self device list; nothing is wired into send/receive
+// yet, and a single-device account is just a device list of length 1.
+
+const DEVICE_CAP_MESSAGING: &str = "msg";
+
+/// One authorized device, signed by the account identity key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DeviceCert {
+    /// Ed25519 account identity pubkey (b64) this device belongs to.
+    account_pubkey_b64: String,
+    /// This device's own Ed25519 signing pubkey (b64). Equals the account key
+    /// on the primary ("device 0").
+    device_pubkey_b64: String,
+    /// This device's Tor onion address (its reachability).
+    onion: String,
+    /// This device's X25519 public key (b64) for ratchet / static ECDH.
+    x25519_pubkey_b64: String,
+    /// When the account authorized this device (ms since epoch).
+    added_at_ms: u64,
+    /// Forward-compatible capability tags.
+    caps: Vec<String>,
+    /// Ed25519 signature by the ACCOUNT key over `device_cert_signing_bytes`.
+    account_sig_b64: String,
+}
+
+/// The account's full, signed set of devices. `devices` is declared last so the
+/// scalar fields serialize before the TOML array-of-tables.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DeviceList {
+    account_pubkey_b64: String,
+    /// Monotonic version; bumped whenever a device is added or revoked.
+    version: u64,
+    /// Ed25519 signature by the account key over `device_list_signing_bytes`.
+    /// Covers (account, version, sorted device pubkeys) so a device cannot be
+    /// silently dropped nor an old list replayed without re-signing.
+    account_sig_b64: String,
+    devices: Vec<DeviceCert>,
+}
+
+fn push_len_prefixed(buf: &mut Vec<u8>, field: &[u8]) {
+    buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    buf.extend_from_slice(field);
+}
+
+/// Canonical, domain-separated bytes a DeviceCert signs over. Length-prefixing
+/// each field makes the encoding unambiguous (no field-boundary confusion).
+fn device_cert_signing_bytes(
+    account_pubkey_b64: &str,
+    device_pubkey_b64: &str,
+    onion: &str,
+    x25519_pubkey_b64: &str,
+    added_at_ms: u64,
+    caps: &[String],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"sideband-device-cert-v1");
+    push_len_prefixed(&mut buf, account_pubkey_b64.as_bytes());
+    push_len_prefixed(&mut buf, device_pubkey_b64.as_bytes());
+    push_len_prefixed(&mut buf, onion.as_bytes());
+    push_len_prefixed(&mut buf, x25519_pubkey_b64.as_bytes());
+    buf.extend_from_slice(&added_at_ms.to_le_bytes());
+    buf.extend_from_slice(&(caps.len() as u64).to_le_bytes());
+    for c in caps {
+        push_len_prefixed(&mut buf, c.as_bytes());
+    }
+    buf
+}
+
+/// Canonical bytes a DeviceList signs over: account, version, and the sorted
+/// device pubkeys (sorted so the signature is order-independent).
+fn device_list_signing_bytes(
+    account_pubkey_b64: &str,
+    version: u64,
+    device_pubkeys_sorted: &[String],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"sideband-device-list-v1");
+    push_len_prefixed(&mut buf, account_pubkey_b64.as_bytes());
+    buf.extend_from_slice(&version.to_le_bytes());
+    buf.extend_from_slice(&(device_pubkeys_sorted.len() as u64).to_le_bytes());
+    for pk in device_pubkeys_sorted {
+        push_len_prefixed(&mut buf, pk.as_bytes());
+    }
+    buf
+}
+
+#[allow(dead_code)] // wired into send/receive in Phase 2
+fn verifying_key_from_b64(b64: &str) -> Result<VerifyingKey> {
+    let bytes = B64
+        .decode(b64.as_bytes())
+        .context("decode ed25519 pubkey")?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("bad ed25519 pubkey length"))?;
+    VerifyingKey::from_bytes(&arr).context("invalid ed25519 pubkey")
+}
+
+#[allow(dead_code)] // wired into send/receive in Phase 2
+fn signature_from_b64(b64: &str) -> Result<Signature> {
+    let bytes = B64.decode(b64.as_bytes()).context("decode signature")?;
+    let arr: [u8; 64] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("bad signature length"))?;
+    Ok(Signature::from_bytes(&arr))
+}
+
+fn sign_device_cert(
+    account_key: &SigningKey,
+    device_pubkey_b64: &str,
+    onion: &str,
+    x25519_pubkey_b64: &str,
+    added_at_ms: u64,
+    caps: &[String],
+) -> DeviceCert {
+    let account_pubkey_b64 = B64.encode(account_key.verifying_key().to_bytes());
+    let msg = device_cert_signing_bytes(
+        &account_pubkey_b64,
+        device_pubkey_b64,
+        onion,
+        x25519_pubkey_b64,
+        added_at_ms,
+        caps,
+    );
+    let sig = account_key.sign(&msg);
+    DeviceCert {
+        account_pubkey_b64,
+        device_pubkey_b64: device_pubkey_b64.to_string(),
+        onion: onion.to_string(),
+        x25519_pubkey_b64: x25519_pubkey_b64.to_string(),
+        added_at_ms,
+        caps: caps.to_vec(),
+        account_sig_b64: B64.encode(sig.to_bytes()),
+    }
+}
+
+/// Verify a cert is self-consistent: its signature validates under the account
+/// pubkey embedded in it. Binding that account to a *trusted* one is the
+/// caller's job (see `verify_device_list`).
+#[allow(dead_code)] // wired into receive verification in Phase 2
+fn verify_device_cert(cert: &DeviceCert) -> Result<()> {
+    let vk = verifying_key_from_b64(&cert.account_pubkey_b64)?;
+    let sig = signature_from_b64(&cert.account_sig_b64)?;
+    let msg = device_cert_signing_bytes(
+        &cert.account_pubkey_b64,
+        &cert.device_pubkey_b64,
+        &cert.onion,
+        &cert.x25519_pubkey_b64,
+        cert.added_at_ms,
+        &cert.caps,
+    );
+    vk.verify_strict(&msg, &sig)
+        .context("device cert signature invalid")?;
+    Ok(())
+}
+
+fn sign_device_list(
+    account_key: &SigningKey,
+    version: u64,
+    devices: Vec<DeviceCert>,
+) -> DeviceList {
+    let account_pubkey_b64 = B64.encode(account_key.verifying_key().to_bytes());
+    let mut pks: Vec<String> = devices
+        .iter()
+        .map(|d| d.device_pubkey_b64.clone())
+        .collect();
+    pks.sort();
+    let msg = device_list_signing_bytes(&account_pubkey_b64, version, &pks);
+    let sig = account_key.sign(&msg);
+    DeviceList {
+        account_pubkey_b64,
+        version,
+        account_sig_b64: B64.encode(sig.to_bytes()),
+        devices,
+    }
+}
+
+/// Fully verify a device list against the account the caller *trusts*: the list
+/// claims that account, every cert belongs to and is signed by it, and the
+/// list-level signature is valid (so no dropped/replayed/injected device).
+#[allow(dead_code)] // wired into contact/receive verification in Phase 2
+fn verify_device_list(list: &DeviceList, expected_account_pubkey_b64: &str) -> Result<()> {
+    if list.account_pubkey_b64 != expected_account_pubkey_b64 {
+        return Err(anyhow!(
+            "device list account does not match expected account"
+        ));
+    }
+    let vk = verifying_key_from_b64(&list.account_pubkey_b64)?;
+    for cert in &list.devices {
+        if cert.account_pubkey_b64 != list.account_pubkey_b64 {
+            return Err(anyhow!("device cert account mismatch"));
+        }
+        verify_device_cert(cert)?;
+    }
+    let mut pks: Vec<String> = list
+        .devices
+        .iter()
+        .map(|d| d.device_pubkey_b64.clone())
+        .collect();
+    pks.sort();
+    let msg = device_list_signing_bytes(&list.account_pubkey_b64, list.version, &pks);
+    let sig = signature_from_b64(&list.account_sig_b64)?;
+    vk.verify_strict(&msg, &sig)
+        .context("device list signature invalid")?;
+    Ok(())
+}
+
+fn device_list_path(profile: &Path) -> PathBuf {
+    profile.join("devicelist.toml")
+}
+
+fn save_device_list(profile: &Path, list: &DeviceList) -> Result<()> {
+    let toml = toml::to_string_pretty(list).context("serialize device list")?;
+    write_encryptable(&device_list_path(profile), toml.as_bytes())
+}
+
+#[allow(dead_code)] // wired into contact storage in Phase 2
+fn load_device_list(profile: &Path) -> Result<Option<DeviceList>> {
+    let path = device_list_path(profile);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = read_encryptable(&path)?;
+    let s = String::from_utf8(bytes).context("device list not utf-8")?;
+    let list: DeviceList = toml::from_str(&s).context("parse device list")?;
+    Ok(Some(list))
+}
+
+/// Build and persist this profile's self device list. On the primary the device
+/// key is the account identity key ("device 0"), so a fresh account yields a
+/// length-1 list. `onion` is this device's current reachability.
+#[allow(dead_code)]
+fn build_self_device_list(profile: &Path, onion: &str, version: u64) -> Result<DeviceList> {
+    let account_key = load_signing_key(profile)?;
+    let x25519_pub = load_x25519_public(profile)?;
+    let device_pubkey_b64 = B64.encode(account_key.verifying_key().to_bytes());
+    let x25519_pubkey_b64 = B64.encode(x25519_pub.as_bytes());
+    let added_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+    let cert = sign_device_cert(
+        &account_key,
+        &device_pubkey_b64,
+        onion,
+        &x25519_pubkey_b64,
+        added_at_ms,
+        &[DEVICE_CAP_MESSAGING.to_string()],
+    );
+    let list = sign_device_list(&account_key, version, vec![cert]);
+    save_device_list(profile, &list)?;
+    Ok(list)
+}
+
 pub(crate) fn share_command(profile: &Path, onion: &str) -> Result<String> {
     if onion.trim().is_empty() || onion.starts_with('(') {
         anyhow::bail!("onion address is not ready yet");
@@ -7756,6 +8017,105 @@ mod tests {
         // Wrong export passphrase is rejected.
         let dst2 = tempfile::tempdir().unwrap();
         assert!(import_profile_bytes(dst2.path(), &archive, "wrong", false).is_err());
+    }
+
+    // -- multi-device: account/device certs --
+
+    #[test]
+    fn device_cert_signs_verifies_and_rejects_tampering() {
+        let account = SigningKey::generate(&mut OsRng);
+        let acct_pub = B64.encode(account.verifying_key().to_bytes());
+        let x = B64.encode([9u8; 32]);
+        let cert = sign_device_cert(
+            &account,
+            &acct_pub,
+            "abc.onion",
+            &x,
+            111,
+            &["msg".to_string()],
+        );
+        assert!(verify_device_cert(&cert).is_ok());
+
+        // Any signed field change breaks the signature.
+        let mut bad_onion = cert.clone();
+        bad_onion.onion = "evil.onion".to_string();
+        assert!(verify_device_cert(&bad_onion).is_err());
+
+        let mut bad_x = cert.clone();
+        bad_x.x25519_pubkey_b64 = B64.encode([1u8; 32]);
+        assert!(verify_device_cert(&bad_x).is_err());
+    }
+
+    #[test]
+    fn device_list_verifies_and_detects_drop_replay_and_injection() {
+        let account = SigningKey::generate(&mut OsRng);
+        let acct_pub = B64.encode(account.verifying_key().to_bytes());
+        let d1 = sign_device_cert(
+            &account,
+            &acct_pub,
+            "one.onion",
+            &B64.encode([1u8; 32]),
+            1,
+            &["msg".to_string()],
+        );
+        let d2pub = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let d2 = sign_device_cert(
+            &account,
+            &d2pub,
+            "two.onion",
+            &B64.encode([2u8; 32]),
+            2,
+            &["msg".to_string()],
+        );
+        let list = sign_device_list(&account, 5, vec![d1.clone(), d2]);
+        assert!(verify_device_list(&list, &acct_pub).is_ok());
+
+        // Verified against the wrong account → rejected.
+        let other_pub = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        assert!(verify_device_list(&list, &other_pub).is_err());
+
+        // Dropping a device without re-signing → list signature fails.
+        let mut dropped = list.clone();
+        dropped.devices.pop();
+        assert!(verify_device_list(&dropped, &acct_pub).is_err());
+
+        // A cert signed by a foreign key can't be smuggled in, even if the list
+        // itself is re-signed by the real account.
+        let evil = SigningKey::generate(&mut OsRng);
+        let evil_cert = sign_device_cert(
+            &evil,
+            &d2pub,
+            "evil.onion",
+            &B64.encode([3u8; 32]),
+            3,
+            &["msg".to_string()],
+        );
+        let reinjected = sign_device_list(&account, 6, vec![d1, evil_cert]);
+        assert!(verify_device_list(&reinjected, &acct_pub).is_err());
+    }
+
+    #[test]
+    fn self_device_list_builds_persists_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        let acct_pub = B64.encode(
+            load_signing_key(dir.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+
+        let list = build_self_device_list(dir.path(), "myonion.onion", 1).unwrap();
+        assert_eq!(list.devices.len(), 1);
+        assert_eq!(list.devices[0].onion, "myonion.onion");
+        // Primary: device 0 is the account identity key itself.
+        assert_eq!(list.devices[0].device_pubkey_b64, acct_pub);
+        assert!(verify_device_list(&list, &acct_pub).is_ok());
+
+        // Round-trips through disk unchanged and still verifies.
+        let loaded = load_device_list(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded, list);
+        assert!(verify_device_list(&loaded, &acct_pub).is_ok());
     }
 
     // -- profile paths --

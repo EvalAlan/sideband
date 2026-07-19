@@ -144,24 +144,39 @@ everything inline" or "spawn a subagent for each thing."
 
 _Update this section as part of the handoff protocol._
 
-**Direction note (2026-07-16):** the Beeper-style **Connected Apps / Matrix
-bridges** and the **LoRa** work were both **parked** on the `bridges-parked`
-branch and removed from `main` (which is therefore reset to `e9a798f` and
-diverged from `origin/main` — a force-push or revert is pending a decision).
-Focus is back on the core private-messaging app.
+**Direction note (2026-07-17):** the Beeper-style **Connected Apps / Matrix
+bridges** and the **LoRa** work are **parked** on the `bridges-parked` branch
+(now also pushed to `origin`); `main` was resolved by **force-push** so local ==
+`origin/main` (bridge commit `436ef38` preserved on `bridges-parked`). Focus is
+the core private-messaging app.
 
-**At-rest encryption (opt-in, message history) — in progress.** `messages.db` is
-now **SQLCipher**-encrypted when an app passphrase is set (`rusqlite`
-`bundled-sqlcipher-vendored-openssl`; Android 4-ABI cross-compile verified). Key
-= Argon2id(passphrase, per-profile `db.salt`); never stored, stdin-only. `open_db`
-applies it; with no key, SQLCipher reads plaintext DBs unchanged (**opt-in, zero
-regression**). Process key holder (Android/serve) or `SIDEBAND_DB_KEY` env
-(desktop CLI subprocesses). CLI `db-status`/`db-unlock`/`db-set-passphrase`; FFI
-`sideband_api_db_status`/`_db_unlock`/`_db_set_passphrase`. Test:
-`db_encryption_at_rest_round_trips_and_rejects_wrong_passphrase`. **Still
-plaintext (NEXT): `identity.toml` (private keys) + `contacts.toml`.** **No GUI
-unlock screen yet** — do not set a passphrase on a GUI-used profile or the GUI
-can't open the encrypted DB. See tasks: extend to identity/contacts; GUI unlock.
+**NEXT EPIC — multi-device (independent peers).** Decided 2026-07-17: one account
+across many devices, Signal-style (every device standalone, works when any subset
+is online). Full design + 6-phase plan in
+`docs/plans/2026-07-17-multi-device-independent-peers.md`. Model: account =
+Ed25519 **AIK** (the `identity.toml` key) + a **signed device list**; each device
+has its own device key / onion / X25519 / ratchet sessions; contacts store your
+device list and **fan out** sends to every device; own devices **self-sync**.
+**Phase 1 (account/device core: `DeviceCert`/`DeviceList` sign/verify + persisted
+self device list, encrypted at rest) is in progress.** Single-device accounts
+must keep working unchanged (device list of length 1) at every phase.
+
+**At-rest encryption (opt-in app lock) — DONE.** `messages.db` is **SQLCipher**
+(`rusqlite bundled-sqlcipher-vendored-openssl`; Android 4-ABI verified);
+`identity.toml`, `contacts.toml`, and `ratchet/*.bin` are ChaCha20-Poly1305
+encrypted at rest (`SBFENC1` magic; `read/write_encryptable`, plaintext files
+pass through so it's opt-in/zero-regression). Key = Argon2id(passphrase,
+per-profile `db.salt`), never stored, stdin-only. Process key holder
+(Android/serve) or `SIDEBAND_DB_KEY` env (desktop CLI subprocesses). CLI
+`db-status`/`db-unlock`/`db-set-passphrase`; FFI `sideband_api_db_status`/
+`_db_unlock`/`_db_set_passphrase`. **GUI app-lock shipped**: unlock screen +
+Settings→App lock; desktop restarts the `serve` listener after enabling so it
+inherits the key. **Export/import decrypts on export** (identity/contacts/ratchet
+via `read_encryptable`, DB via `sqlcipher_export` to a temp plaintext copy) so
+archives restore onto a fresh profile regardless of source app-lock. Tests:
+`db_encryption_at_rest_round_trips_and_rejects_wrong_passphrase`,
+`encryptable_files_round_trip_and_stay_opaque`,
+`export_import_round_trips_identity_contacts_and_ratchet`.
 
 **Shipped:** group chats across all clients; QR share overlay (TUI) + QR scan
 (Android); Double-Ratchet "Enable forward secrecy" button; Android foreground
