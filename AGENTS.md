@@ -157,9 +157,18 @@ is online). Full design + 6-phase plan in
 Ed25519 **AIK** (the `identity.toml` key) + a **signed device list**; each device
 has its own device key / onion / X25519 / ratchet sessions; contacts store your
 device list and **fan out** sends to every device; own devices **self-sync**.
-**Phase 1 (account/device core: `DeviceCert`/`DeviceList` sign/verify + persisted
-self device list, encrypted at rest) is in progress.** Single-device accounts
-must keep working unchanged (device list of length 1) at every phase.
+**Progress:** Phase 1 (account/device core: `DeviceCert`/`DeviceList` sign/verify
++ persisted self device list) **done** (`4182afc`). Phase 2 **done** for the send
+side: 2a contact device endpoints via encrypted sidecar
+`<profile>/contact-devices/<name>.toml` + `contact_endpoints()` w/ legacy
+fallback (`58bd329`); 2c per-`(contact,device)` ratchet (`path_for_device`, device
+0 keeps legacy path) + `build_outbound_messages_fanout` (`a4e5a5a`); 2c-send
+`send_in_conversation` best-effort fan-out to a contact's extra devices
+(`362e873`). **2b (share/QR carries device list) + 2d (receive verifies sender
+device) are folded into Phase 3** (only meaningful once linking distributes device
+lists). **NEXT: Phase 3 — device linking/provisioning (QR link, push device list,
+2b, 2d, revoke).** Single-device accounts keep working unchanged (device list of
+length 1) at every phase; all fan-out is a no-op until a contact has >1 device.
 
 **At-rest encryption (opt-in app lock) — DONE.** `messages.db` is **SQLCipher**
 (`rusqlite bundled-sqlcipher-vendored-openssl`; Android 4-ABI verified);

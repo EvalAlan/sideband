@@ -88,23 +88,44 @@ Each phase = TDD, green tree, single-device still works.
   injected non-account cert rejected; build+load round-trips and verifies.
 - No behavior change; nothing wired into send/receive yet.
 
-### Phase 2 — Contact = many device-endpoints
-- Contact storage moves from single `onion` to a device list (back-compat:
-  legacy single-onion contacts become a 1-device list).
-- Share code / QR carries the signed device list.
-- **Send path fans out** to all a contact's devices; ratchet path becomes
-  per-`(contact, device)`.
-- Receive path verifies the sender's device against the sender's stored list.
-- Interop test: a 2-device contact receives a message on both devices.
+### Phase 2 — Contact = many device-endpoints  ← 2a + 2c DONE
+- **[done] 2a** — a contact's devices live in an encrypted per-contact sidecar
+  (`<profile>/contact-devices/<name>.toml`), separate from `ContactFile` so
+  legacy single-onion contacts need no format change. `contact_endpoints()`
+  returns the verified list's endpoints or a single legacy endpoint (device 0
+  == the contact's account key). Commit `58bd329`.
+- **[done] 2c-core** — per-`(contact, device)` ratchet keying
+  (`RatchetState::path_for_device`, device 0 keeps the legacy path),
+  `build_outbound_message_for_endpoint`, `build_outbound_messages_fanout`;
+  interop test proves a 2-device contact yields two correctly-encrypted
+  messages. Commit `a4e5a5a`.
+- **[done] 2c-send** — `send_in_conversation` fans a message out to a contact's
+  *extra* devices best-effort (device 0 still drives status/history/retry;
+  extras are fire-and-forget, skipped on retries). No-op for single-device
+  contacts. Commit `362e873`.
+- **[moved to Phase 3] 2b** — share code / QR carrying the signed device list.
+  Redundant for single-device (legacy fallback already synthesizes device 0);
+  only meaningful once linking exists.
+- **[moved to Phase 3] 2d** — receive-side verification of a sender's device
+  against their stored list. Only reachable once device lists are distributed
+  (a contact must have >1 device and the receiver must know the list), which is
+  Phase 3 work.
 
-### Phase 3 — Device linking / provisioning
+### Phase 3 — Device linking / provisioning (now also carries 2b + 2d)
 - QR link flow: primary signs the new device's cert, transfers state (contacts +
   device list + history seed via the encrypted export archive) over an
   authenticated LAN/Tor channel.
-- Push updated device list to all contacts (control message).
+- **(2b)** share code / QR carries the signed device list; contact-add parses +
+  verifies it.
+- Push updated device list to all contacts (control message); store it via
+  `save_contact_device_list` (already built in 2a).
+- **(2d)** receive path accepts a message whose `from` is any device in the
+  sender's verified list (not only the account key), and rejects devices not in
+  the list.
 - Unlink / revoke (remove device, bump version, re-sign, push).
 - Resolve the "who can link" decision above.
-- Tests: link a 2nd device in-harness; contacts learn it; revoke removes it.
+- Tests: link a 2nd device in-harness; contacts learn it; a message from a
+  linked device verifies; revoke removes it.
 
 ### Phase 4 — Self-sync replication (hardest)
 - Device-to-device encrypted sync channel: sent-message echo, read receipts,
