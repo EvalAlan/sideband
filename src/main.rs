@@ -5157,6 +5157,28 @@ pub(crate) fn resolve_contact_name_by_pubkey(
         .ok_or_else(|| anyhow!("unknown contact for pubkey"))
 }
 
+/// Resolve the contact a message came from. `from` is the sender's *device*
+/// signing key; for a linked device it differs from the contact's account key.
+/// Match the account key first (device 0 / single-device — unchanged), then any
+/// contact whose verified device list authorizes this device. Returns None for
+/// an unknown sender. For single-device senders this is exactly
+/// `find(|c| c.pubkey_b64 == from)`.
+#[allow(dead_code)] // wired into decrypt_and_verify with the per-device receive ratchet
+fn resolve_contact_by_sender<'a>(
+    profile: &Path,
+    contacts: &'a std::collections::HashMap<String, ContactFile>,
+    from: &str,
+) -> Option<&'a ContactFile> {
+    if let Some(c) = contacts.values().find(|c| c.pubkey_b64 == from) {
+        return Some(c);
+    }
+    contacts.values().find(|c| {
+        matches!(load_contact_device_list(profile, &c.name), Ok(Some(list))
+            if verify_device_list(&list, &c.pubkey_b64).is_ok()
+                && list.devices.iter().any(|d| d.device_pubkey_b64 == from))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Profile / Identity
 // ---------------------------------------------------------------------------
@@ -6121,7 +6143,6 @@ fn is_secondary_device(profile: &Path) -> bool {
 
 /// This profile's account (identity) public key, base64. On the primary this is
 /// the device signing key; on a secondary it is the stored account key.
-#[allow(dead_code)] // wired into share/from/contact-matching (Phase 3c continued)
 fn account_pubkey(profile: &Path) -> Result<String> {
     let path = account_path(profile);
     if path.exists() {
@@ -6228,15 +6249,18 @@ pub(crate) fn share_command(profile: &Path, onion: &str) -> Result<String> {
     if onion.trim().is_empty() || onion.starts_with('(') {
         anyhow::bail!("onion address is not ready yet");
     }
-    let key = load_signing_key(profile)?;
-    let verify: VerifyingKey = key.verifying_key();
+    // Advertise the ACCOUNT identity key (equals the device key on a primary),
+    // so contacts add the account, not a single device. The onion + x25519 are
+    // this device's own reachability; the rest of the account's devices arrive
+    // via the device-list push.
+    let ed25519_b64 = account_pubkey(profile)?;
     let x25519_pub = load_x25519_public(profile)?;
     let display_name = load_display_name(profile)?;
     Ok(format!(
         "/add {} {} {} {}",
         display_name,
         onion,
-        B64.encode(verify.to_bytes()),
+        ed25519_b64,
         B64.encode(x25519_pub.as_bytes())
     ))
 }
@@ -9013,6 +9037,56 @@ mod tests {
         let fresh = tempfile::tempdir().unwrap();
         init_profile(fresh.path()).unwrap();
         assert!(apply_link_seed(fresh.path(), &seed, "wrong-code").is_err());
+    }
+
+    #[test]
+    fn resolve_contact_by_sender_matches_account_key_and_linked_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = SigningKey::generate(&mut OsRng);
+        let acct_pub = B64.encode(account.verifying_key().to_bytes());
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert(
+            "bob".to_string(),
+            test_contact("bob", "bob.onion", &acct_pub, &B64.encode([1u8; 32])),
+        );
+
+        // Account key (device 0 / single-device) resolves — the fast path.
+        assert_eq!(
+            resolve_contact_by_sender(dir.path(), &contacts, &acct_pub)
+                .unwrap()
+                .name,
+            "bob"
+        );
+        // An unknown key resolves to nobody.
+        let stranger = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        assert!(resolve_contact_by_sender(dir.path(), &contacts, &stranger).is_none());
+
+        // Store bob's signed 2-device list; his linked device now resolves to bob.
+        let d0 = sign_device_cert(
+            &account,
+            &acct_pub,
+            "bob.onion",
+            &B64.encode([1u8; 32]),
+            1,
+            &["msg".to_string()],
+        );
+        let linked = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let d1 = sign_device_cert(
+            &account,
+            &linked,
+            "bob2.onion",
+            &B64.encode([2u8; 32]),
+            2,
+            &["msg".to_string()],
+        );
+        let list = sign_device_list(&account, 2, vec![d0, d1]);
+        save_contact_device_list(dir.path(), "bob", &list).unwrap();
+        assert_eq!(
+            resolve_contact_by_sender(dir.path(), &contacts, &linked)
+                .unwrap()
+                .name,
+            "bob"
+        );
     }
 
     fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {
