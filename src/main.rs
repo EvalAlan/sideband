@@ -5804,6 +5804,73 @@ fn build_self_device_list(profile: &Path, onion: &str, version: u64) -> Result<D
     Ok(list)
 }
 
+/// Primary-only: append a newly-linked device to this account's self device
+/// list, bump the version, re-sign with the account key, and persist. Requires
+/// the account identity key (present only on the primary). Errors if the device
+/// is already present. The self list must already exist (the primary
+/// initializes it once its onion is known).
+#[allow(dead_code)] // wired into the device CLI + link flow (Phase 3 continued)
+fn add_device_to_self_list(
+    profile: &Path,
+    device_pubkey_b64: &str,
+    onion: &str,
+    x25519_pubkey_b64: &str,
+    caps: &[String],
+) -> Result<DeviceList> {
+    let account_key = load_signing_key(profile)?;
+    let account_pubkey_b64 = B64.encode(account_key.verifying_key().to_bytes());
+    let current = load_device_list(profile)?
+        .ok_or_else(|| anyhow!("no self device list; the primary must initialize it first"))?;
+    if current.account_pubkey_b64 != account_pubkey_b64 {
+        return Err(anyhow!("self device list belongs to a different account"));
+    }
+    if current
+        .devices
+        .iter()
+        .any(|d| d.device_pubkey_b64 == device_pubkey_b64)
+    {
+        return Err(anyhow!("device already linked"));
+    }
+    let added_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+    let cert = sign_device_cert(
+        &account_key,
+        device_pubkey_b64,
+        onion,
+        x25519_pubkey_b64,
+        added_at_ms,
+        caps,
+    );
+    let mut devices = current.devices;
+    devices.push(cert);
+    let list = sign_device_list(&account_key, current.version + 1, devices);
+    save_device_list(profile, &list)?;
+    Ok(list)
+}
+
+/// Primary-only: remove a linked device (revoke), bump the version, re-sign, and
+/// persist. Device 0 (the primary itself) cannot be revoked.
+#[allow(dead_code)] // wired into the device CLI + link flow (Phase 3 continued)
+fn revoke_device_from_self_list(profile: &Path, device_pubkey_b64: &str) -> Result<DeviceList> {
+    let account_key = load_signing_key(profile)?;
+    let account_pubkey_b64 = B64.encode(account_key.verifying_key().to_bytes());
+    if device_pubkey_b64 == account_pubkey_b64 {
+        return Err(anyhow!("cannot revoke the primary device (device 0)"));
+    }
+    let current = load_device_list(profile)?.ok_or_else(|| anyhow!("no self device list"))?;
+    let before = current.devices.len();
+    let devices: Vec<_> = current
+        .devices
+        .into_iter()
+        .filter(|d| d.device_pubkey_b64 != device_pubkey_b64)
+        .collect();
+    if devices.len() == before {
+        return Err(anyhow!("device not found in list"));
+    }
+    let list = sign_device_list(&account_key, current.version + 1, devices);
+    save_device_list(profile, &list)?;
+    Ok(list)
+}
+
 // ── Multi-device: a contact's device endpoints ──────────────────────────────
 //
 // A contact's known devices are stored as a signed `DeviceList` in an encrypted
@@ -8472,6 +8539,61 @@ mod tests {
         let loaded = load_device_list(dir.path()).unwrap().unwrap();
         assert_eq!(loaded, list);
         assert!(verify_device_list(&loaded, &acct_pub).is_ok());
+    }
+
+    #[test]
+    fn primary_adds_and_revokes_devices_bumping_version() {
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        let acct_pub = B64.encode(
+            load_signing_key(dir.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+
+        // Primary initializes its length-1 self list (device 0 == account).
+        let base = build_self_device_list(dir.path(), "primary.onion", 1).unwrap();
+        assert_eq!(base.devices.len(), 1);
+        assert_eq!(base.version, 1);
+
+        // Link a second device.
+        let d1_pub = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let after_add = add_device_to_self_list(
+            dir.path(),
+            &d1_pub,
+            "laptop.onion",
+            &B64.encode([2u8; 32]),
+            &["msg".to_string()],
+        )
+        .unwrap();
+        assert_eq!(after_add.devices.len(), 2);
+        assert_eq!(after_add.version, 2, "version bumps on add");
+        assert!(verify_device_list(&after_add, &acct_pub).is_ok());
+        // Persisted.
+        assert_eq!(load_device_list(dir.path()).unwrap().unwrap(), after_add);
+
+        // Re-adding the same device is rejected.
+        assert!(add_device_to_self_list(
+            dir.path(),
+            &d1_pub,
+            "laptop.onion",
+            &B64.encode([2u8; 32]),
+            &["msg".to_string()],
+        )
+        .is_err());
+
+        // The primary (device 0) cannot be revoked.
+        assert!(revoke_device_from_self_list(dir.path(), &acct_pub).is_err());
+
+        // Revoke the linked device.
+        let after_revoke = revoke_device_from_self_list(dir.path(), &d1_pub).unwrap();
+        assert_eq!(after_revoke.devices.len(), 1);
+        assert_eq!(after_revoke.version, 3, "version bumps on revoke");
+        assert!(verify_device_list(&after_revoke, &acct_pub).is_ok());
+
+        // Revoking an unknown device is rejected.
+        assert!(revoke_device_from_self_list(dir.path(), &B64.encode([9u8; 32])).is_err());
     }
 
     fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {
