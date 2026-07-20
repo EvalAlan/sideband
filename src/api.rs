@@ -375,6 +375,14 @@ pub fn api_db_set_passphrase(profile_path: &str, passphrase: &str) -> Result<boo
     Ok(true)
 }
 
+/// Irreversibly wipe this profile — identity, contacts, history, keys, all of
+/// it. There is no undo. The caller should reset to first-run afterwards.
+pub fn api_panic_wipe(profile_path: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::panic_wipe_profile(&profile)?;
+    Ok(true)
+}
+
 /// Whether LAN discovery + delivery is enabled (default off).
 pub fn api_get_lan_enabled(profile_path: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
@@ -993,6 +1001,12 @@ pub extern "C" fn sideband_api_db_set_passphrase(
             cstr_arg(passphrase, "passphrase")?,
         )
     })())
+}
+
+/// Irreversibly wipe this profile. There is no undo.
+#[no_mangle]
+pub extern "C" fn sideband_api_panic_wipe(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| api_panic_wipe(cstr_arg(profile_path, "profile_path")?))())
 }
 
 /// Whether LAN discovery + delivery is enabled (default off).

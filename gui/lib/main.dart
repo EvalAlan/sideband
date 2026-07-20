@@ -1128,6 +1128,10 @@ class _Cli {
   Future<String> ratchet(String contact) =>
       _run(['ratchet', '--profile', profile, contact]);
 
+  /// Irreversibly wipe the profile (identity, contacts, history, keys).
+  Future<String> panicWipe() =>
+      _run(['panic-wipe', '--profile', profile, '--yes']);
+
   Future<void> exportProfile(
       {required String outPath, required String passphrase}) async {
     await _run([
@@ -1775,6 +1779,7 @@ class _MobileApi {
   _Ptr2 get _resumeTransfer => _lookup2('sideband_api_resume_transfer');
   _Ptr2 get _cancelTransfer => _lookup2('sideband_api_cancel_transfer');
   _Ptr1 get _dbStatus => _lookup1('sideband_api_db_status');
+  _Ptr1 get _panicWipe => _lookup1('sideband_api_panic_wipe');
   _Ptr2 get _dbUnlock => _lookup2('sideband_api_db_unlock');
   _Ptr2 get _dbSetPassphrase => _lookup2('sideband_api_db_set_passphrase');
 
@@ -1790,6 +1795,10 @@ class _MobileApi {
 
   Future<void> dbSetPassphrase(String passphrase) async {
     _withCString2<Object?>(await profilePath(), passphrase, _dbSetPassphrase);
+  }
+
+  Future<void> panicWipe() async {
+    _withCString1<Object?>(await profilePath(), _panicWipe);
   }
 
   String? _profilePath;
@@ -6112,6 +6121,57 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  /// Panic button: irreversibly wipe the whole profile (identity, contacts,
+  /// history, keys), then reset the app to first-run.
+  Future<void> _panicWipe() async {
+    if (!await _confirm(
+      'Delete everything?',
+      'This permanently deletes your identity, all contacts, and all message '
+          'history on this device. There is no undo.',
+    )) {
+      return;
+    }
+    try {
+      // Stop the desktop listener so it releases the profile files.
+      final listener = _listener;
+      if (listener != null) {
+        listener.kill(ProcessSignal.sigterm);
+        try {
+          await listener.exitCode.timeout(const Duration(seconds: 2));
+        } catch (_) {}
+        _listener = null;
+      }
+      if (_mobileReady) {
+        await _mobile!.panicWipe();
+      } else {
+        await _cli.panicWipe();
+        _cli.dbKey = null;
+      }
+      _poll?.cancel();
+      _poll = null;
+      if (mounted) {
+        setState(() {
+          _contacts = [];
+          _groups = [];
+          _msgs = [];
+          _pendingMsgs.clear();
+          _sel = null;
+          _selGroup = null;
+          _appLockEnabled = false;
+          _locked = false;
+          _listenerRunning = false;
+          _listenerStatus = 'wiped';
+          _error = null;
+          _loading = true;
+        });
+      }
+      _snack('Profile wiped');
+      await _bootstrap();
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
   Future<String?> _promptPassphrase({
     required String title,
     String? message,
@@ -6594,6 +6654,18 @@ class _ChatScreenState extends State<_ChatScreen>
                     onTap: () {
                       Navigator.pop(dialogContext);
                       unawaited(_clearAllHistory());
+                    },
+                  ),
+                  ListTile(
+                    leading: Icon(Icons.local_fire_department_outlined,
+                        color: Colors.red.shade400),
+                    title: Text('Panic — delete everything',
+                        style: TextStyle(color: Colors.red.shade400)),
+                    subtitle: const Text(
+                        'Wipe identity, contacts, and history. No undo.'),
+                    onTap: () {
+                      Navigator.pop(dialogContext);
+                      unawaited(_panicWipe());
                     },
                   ),
                   if (!_listenerRunning)

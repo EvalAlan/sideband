@@ -251,6 +251,15 @@ enum CommandKind {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Irreversibly wipe this profile — identity, contacts, history, keys, all of
+    /// it. Requires --yes; there is no undo.
+    PanicWipe {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Confirm the irreversible wipe.
+        #[arg(long)]
+        yes: bool,
+    },
     Contact {
         #[command(subcommand)]
         action: ContactAction,
@@ -4382,6 +4391,33 @@ fn clear_group_history(profile: &Path, group_filter: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// Emergency "panic" wipe: irreversibly delete the entire profile — identity,
+/// contacts, message history, ratchet + device state, Tor keys, and every other
+/// file under the profile directory — then leave an empty profile dir so the app
+/// restarts at first run. There is no undo. (At-rest encryption already keeps the
+/// data as ciphertext; this removes it outright.)
+pub(crate) fn panic_wipe_profile(profile: &Path) -> Result<()> {
+    // Forget any unlocked key so nothing tries to re-open the encrypted DB.
+    set_process_db_key(None);
+    if profile.exists() {
+        // Best-effort per-entry removal so one locked/odd file can't abort the
+        // rest of the wipe.
+        if let Ok(entries) = fs::read_dir(profile) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    // Recreate an empty, private profile dir so first-run bootstrap works.
+    create_private_dir(profile)?;
+    Ok(())
+}
+
 fn clear_history(profile: &Path, contact_filter: Option<&str>) -> Result<()> {
     let conn = init_db(profile)?;
     let deleted = if let Some(c) = contact_filter {
@@ -4788,6 +4824,17 @@ async fn main() -> Result<()> {
             // Print only the derived key (hex) on success; the caller captures it.
             let hex = unlock_db_with_passphrase(&profile, &passphrase)?;
             println!("{hex}");
+            Ok(())
+        }
+        CommandKind::PanicWipe { profile, yes } => {
+            let profile = profile.path()?;
+            if !yes {
+                return Err(anyhow!(
+                    "refusing to wipe without --yes (this irreversibly deletes the profile)"
+                ));
+            }
+            panic_wipe_profile(&profile)?;
+            println!("profile wiped");
             Ok(())
         }
         CommandKind::DbSetPassphrase { profile } => {
