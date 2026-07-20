@@ -172,19 +172,27 @@ re-signed; `3c6a85f`); 3b link handshake data model (`LinkRequest`/`LinkGrant`,
 `build_link_request`/`primary_grant_link`; `3c6af3b`). Both pure/testable, staged
 under `allow(dead_code)` (no CLI/transport wiring yet).
 
-**NEXT — Phase 3c (paused, the invasive one): secondary-device bootstrap.** A
-linked device holds its OWN device key as signing identity but must present the
-ACCOUNT pubkey to contacts — needs an `account.toml` (account public key only) +
-an `account_pubkey(profile)` accessor (no-op on primaries, where device key ==
-account key), threaded through `share`, `from`, and contact-matching. The state
-seed sent to a secondary MUST EXCLUDE the account secret key (else it's the
-rejected any-device model), so linking needs a seed package distinct from the
-normal export archive. Then 2d: receive maps inbound `from` (device key) →
-account via the sender's verified device list. Also still to do: the pairing
-transport (code-authenticated LAN/Tor channel), device-list push to contacts
-(store via `save_contact_device_list`, already built), and the GUI Linked
-Devices screen. Single-device accounts keep working unchanged (device list of
-length 1) at every phase; all fan-out is a no-op until a contact has >1 device.
+**Phase 3c crypto/data-model core — DONE.** 3c-1 `account.toml` +
+`account_pubkey()` accessor (`c4d9cc7`); 3c-2 AIK-excluding `LinkSeed`
+export/apply — transfers account key + device list + contacts + history to a
+secondary WITHOUT the account secret (`1717f8a`); 3c-3 `share` advertises
+`account_pubkey()` + `resolve_contact_by_sender` device→contact resolver
+(`abee75a`); 3c-4 per-`(contact,sender-device)` receive ratchet + 2d wired into
+`decrypt_and_verify` (v2 uses the sender device's X25519 from the verified list;
+v3 keys the Bob ratchet per sender device via `path_for_device`/`save_to` +
+`new_bob_from_their_x25519`; removed superseded `init_bob_ratchet_from_contact`)
+(`c78641c`). Single-device reduces byte-for-byte to prior behavior (from ==
+account key → legacy path); verified by all 9 ratchet tests + a new
+linked-device receive test + full 140-test suite.
+
+**NEXT — Phase 3d (plumbing, needs 2 devices to validate the UX):** the pairing
+transport (code-authenticated LAN/Tor channel carrying
+`LinkRequest`→`LinkGrant`→`LinkSeed`), device-list **push** to contacts on
+link/revoke (store via `save_contact_device_list`, already built), and the GUI
+**Linked Devices** screen (show QR to link, list devices, unlink). The whole
+cryptographic/data-model core is in place; what remains is wiring it over the
+wire + UI. Single-device accounts keep working unchanged (device list length 1);
+all fan-out/multi-device paths are inert until a contact actually has >1 device.
 
 **At-rest encryption (opt-in app lock) — DONE.** `messages.db` is **SQLCipher**
 (`rusqlite bundled-sqlcipher-vendored-openssl`; Android 4-ABI verified);
