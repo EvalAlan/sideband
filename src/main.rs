@@ -5163,7 +5163,6 @@ pub(crate) fn resolve_contact_name_by_pubkey(
 /// contact whose verified device list authorizes this device. Returns None for
 /// an unknown sender. For single-device senders this is exactly
 /// `find(|c| c.pubkey_b64 == from)`.
-#[allow(dead_code)] // wired into decrypt_and_verify with the per-device receive ratchet
 fn resolve_contact_by_sender<'a>(
     profile: &Path,
     contacts: &'a std::collections::HashMap<String, ContactFile>,
@@ -7055,42 +7054,6 @@ fn init_ratchet_bob(
     Ok(())
 }
 
-fn init_bob_ratchet_from_contact(
-    profile: &Path,
-    contact_name: &str,
-    contact: &ContactFile,
-    overwrite_existing: bool,
-) -> Result<RatchetState> {
-    let x25519_b64 = contact
-        .x25519_pubkey_b64
-        .as_deref()
-        .ok_or_else(|| anyhow!("sender has no x25519 key"))?;
-    let raw = B64
-        .decode(x25519_b64)
-        .context("decode sender x25519 pubkey")?;
-    let arr: [u8; 32] = raw
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("bad x25519 key len"))?;
-    let their_static = X25519PublicKey::from(arr);
-    let our_x25519 = load_x25519_secret(profile)?;
-    let our_x25519_pub = X25519PublicKey::from(&our_x25519);
-    let static_shared = our_x25519.diffie_hellman(&their_static);
-    if overwrite_existing {
-        Ok(RatchetState::new_bob(
-            static_shared.as_bytes(),
-            (&our_x25519, &our_x25519_pub),
-        ))
-    } else {
-        RatchetState::load_or_init_bob(
-            profile,
-            contact_name,
-            static_shared.as_bytes(),
-            (&our_x25519, &our_x25519_pub),
-        )
-    }
-}
-
 fn derive_shared_key(our_secret: &StaticSecret, their_public: &X25519PublicKey) -> Result<Key> {
     let shared = our_secret.diffie_hellman(their_public);
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
@@ -7161,6 +7124,39 @@ impl std::fmt::Display for ReplayedMessage {
 
 impl std::error::Error for ReplayedMessage {}
 
+/// The X25519 public key to use for a message's sender device. For the account
+/// key (device 0 / single-device) this is the contact's stored key; for a linked
+/// device it is that device's key from the contact's verified device list.
+/// Returns None if `from` is not a known device of `contact`.
+fn contact_device_x25519_b64(
+    profile: &Path,
+    contact: Option<&ContactFile>,
+    from: &str,
+) -> Option<String> {
+    let c = contact?;
+    if c.pubkey_b64 == from {
+        return c.x25519_pubkey_b64.clone();
+    }
+    let list = load_contact_device_list(profile, &c.name).ok()??;
+    if verify_device_list(&list, &c.pubkey_b64).is_ok() {
+        if let Some(cert) = list.devices.iter().find(|d| d.device_pubkey_b64 == from) {
+            return Some(cert.x25519_pubkey_b64.clone());
+        }
+    }
+    None
+}
+
+/// Initialize a receiver (Bob) ratchet from a specific peer device's X25519 key
+/// (rather than the contact's account key), so a per-sender-device session uses
+/// the right static base secret.
+fn new_bob_from_their_x25519(profile: &Path, their_x25519_b64: &str) -> Result<RatchetState> {
+    let their = x25519_pubkey_from_b64(their_x25519_b64)?;
+    let our = load_x25519_secret(profile)?;
+    let our_pub = X25519PublicKey::from(&our);
+    let shared = our.diffie_hellman(&their);
+    Ok(RatchetState::new_bob(shared.as_bytes(), (&our, &our_pub)))
+}
+
 /// Decrypt a v2 inbound message and verify the Ed25519 signature.
 /// v1 messages (no enc_body) pass through with plaintext verification.
 pub(crate) fn decrypt_and_verify(
@@ -7173,25 +7169,41 @@ pub(crate) fn decrypt_and_verify(
         if msg.ratchet_header_b64.is_empty() {
             return Err(anyhow!("v3 message missing ratchet header"));
         }
-        let contact = contacts.values().find(|c| c.pubkey_b64 == msg.from);
+        // The sender is a device; map it to the owning contact (account key or a
+        // linked device in the contact's verified list). The ratchet is keyed per
+        // (contact, sender-device) so two of a contact's devices don't collide;
+        // for a single-device sender this is exactly the legacy per-contact path.
+        let contact = resolve_contact_by_sender(our_profile, contacts, &msg.from);
         let contact_name = contact
             .map(|c| c.name.clone())
             .unwrap_or_else(|| msg.from.clone());
-        let ratchet_path = RatchetState::path(our_profile, std::path::Path::new(&contact_name));
+        let account_pk = contact
+            .map(|c| c.pubkey_b64.clone())
+            .unwrap_or_else(|| msg.from.clone());
+        // The sender device's X25519 for a fresh receiver ratchet: the contact
+        // device key, else the envelope's self-described key (trust-on-first-use).
+        let their_x25519 = || -> Option<String> {
+            contact_device_x25519_b64(our_profile, contact, &msg.from).or_else(|| {
+                (!msg.sender_x25519_pubkey_b64.is_empty())
+                    .then(|| msg.sender_x25519_pubkey_b64.clone())
+            })
+        };
+        let ratchet_path =
+            RatchetState::path_for_device(our_profile, &contact_name, &msg.from, &account_pk);
         let mut state = if ratchet_path.exists() {
             let bytes = read_encryptable(&ratchet_path)?;
             bincode::deserialize(&bytes).context("deserialize ratchet state")?
         } else {
-            // First v3 message from this contact: initialize receiver state
-            // from the same static X25519 shared secret the sender used.
-            let contact = contact.with_context(|| {
+            // First v3 message from this device: initialize receiver state from
+            // the same static X25519 shared secret the sender device used.
+            let their_x = their_x25519().with_context(|| {
                 format!(
                     "cannot initialize ratchet for unknown sender pubkey: {}",
                     msg.from
                 )
             })?;
-            let state = init_bob_ratchet_from_contact(our_profile, &contact_name, contact, false)?;
-            state.save(our_profile, &contact_name)?;
+            let state = new_bob_from_their_x25519(our_profile, &their_x)?;
+            state.save_to(&ratchet_path)?;
             state
         };
         let plaintext_bytes = match ratchet_decrypt(
@@ -7217,17 +7229,16 @@ pub(crate) fn decrypt_and_verify(
                 // incompatible Alice-first states. Treat the inbound v3 as a
                 // fresh peer-initiated ratchet, try Bob initialization, and
                 // overwrite the poisoned local state only if decrypt succeeds.
-                let contact = contact.with_context(|| {
+                let their_x = their_x25519().with_context(|| {
                     format!(
                         "cannot recover ratchet for unknown sender pubkey: {}",
                         msg.from
                     )
                 })?;
                 let mut recovered =
-                    init_bob_ratchet_from_contact(our_profile, &contact_name, contact, true)
-                        .with_context(|| {
-                            format!("ratchet recovery after decrypt failure: {first_err}")
-                        })?;
+                    new_bob_from_their_x25519(our_profile, &their_x).with_context(|| {
+                        format!("ratchet recovery after decrypt failure: {first_err}")
+                    })?;
                 let bytes = ratchet_decrypt(
                     &mut recovered,
                     &msg.ratchet_header_b64,
@@ -7241,7 +7252,7 @@ pub(crate) fn decrypt_and_verify(
                 bytes
             }
         };
-        state.save(our_profile, &contact_name)?;
+        state.save_to(&ratchet_path)?;
         let plaintext =
             String::from_utf8(plaintext_bytes).context("ratchet plaintext not valid utf8")?;
         // Verify Ed25519 signature on the plaintext.
@@ -7257,9 +7268,12 @@ pub(crate) fn decrypt_and_verify(
     // v2: static X25519 decrypt. If the sender is not in contacts yet, use
     // the signed self-description carried on the envelope to decrypt, verify,
     // then add the contact. This is local trust-on-first-contact, not magic PKI.
-    let known_contact = contacts.values().find(|c| c.pubkey_b64 == msg.from);
-    let candidate_x25519 = known_contact
-        .and_then(|c| c.x25519_pubkey_b64.as_deref())
+    let known_contact = resolve_contact_by_sender(our_profile, contacts, &msg.from);
+    // Prefer the sender device's X25519 (account key or a linked device in the
+    // contact's verified list); fall back to the envelope for trust-on-first-use.
+    let device_x = contact_device_x25519_b64(our_profile, known_contact, &msg.from);
+    let candidate_x25519 = device_x
+        .as_deref()
         .or_else(|| {
             if msg.sender_onion.trim().is_empty() {
                 None
@@ -9083,6 +9097,84 @@ mod tests {
         save_contact_device_list(dir.path(), "bob", &list).unwrap();
         assert_eq!(
             resolve_contact_by_sender(dir.path(), &contacts, &linked)
+                .unwrap()
+                .name,
+            "bob"
+        );
+    }
+
+    #[test]
+    fn receive_v2_from_a_contacts_linked_device_attributes_and_decrypts() {
+        use x25519_dalek::StaticSecret;
+        let alice = tempfile::tempdir().unwrap();
+        init_profile(alice.path()).unwrap();
+        let alice_x_pub = load_x25519_public(alice.path()).unwrap();
+
+        let bob_account = SigningKey::generate(&mut OsRng);
+        let bob_acct_pub = B64.encode(bob_account.verifying_key().to_bytes());
+        let bob_acct_x = B64.encode([7u8; 32]);
+
+        // Bob's linked device B1: its own ed25519 + x25519.
+        let b1_ed = SigningKey::generate(&mut OsRng);
+        let b1_pub = B64.encode(b1_ed.verifying_key().to_bytes());
+        let b1_x_secret = StaticSecret::random_from_rng(OsRng);
+        let b1_x_b64 = B64.encode(X25519PublicKey::from(&b1_x_secret).as_bytes());
+
+        // Alice knows Bob (account) + Bob's signed device list (account + B1).
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert(
+            "bob".to_string(),
+            test_contact("bob", "bob.onion", &bob_acct_pub, &bob_acct_x),
+        );
+        save_contacts(alice.path(), &contacts).unwrap();
+        let d0 = sign_device_cert(
+            &bob_account,
+            &bob_acct_pub,
+            "bob.onion",
+            &bob_acct_x,
+            1,
+            &["msg".to_string()],
+        );
+        let d1 = sign_device_cert(
+            &bob_account,
+            &b1_pub,
+            "bob-laptop.onion",
+            &b1_x_b64,
+            2,
+            &["msg".to_string()],
+        );
+        let list = sign_device_list(&bob_account, 2, vec![d0, d1]);
+        save_contact_device_list(alice.path(), "bob", &list).unwrap();
+
+        // B1 encrypts + signs a v2 message to Alice (shared = DH(B1, Alice)).
+        let plaintext = "hi from bob's laptop";
+        let shared = derive_shared_key(&b1_x_secret, &alice_x_pub).unwrap();
+        let mut msg = ChatMessage {
+            v: 2,
+            r#type: "chat_message".into(),
+            from: b1_pub.clone(),
+            sender_name: "Bob".into(),
+            sender_onion: "bob-laptop.onion".into(),
+            sender_x25519_pubkey_b64: b1_x_b64.clone(),
+            timestamp_ms: 1,
+            body: plaintext.into(),
+            sig_b64: String::new(),
+            enc_body: encrypt_body(&shared, plaintext).unwrap(),
+            ratchet_header_b64: String::new(),
+            ratchet_nonce_hex: String::new(),
+            ratchet_ct_hex: String::new(),
+            expires_at_ms: None,
+        };
+        sign_message(&b1_ed, &mut msg).unwrap();
+        msg.body.clear(); // plaintext never travels on the wire
+
+        // Alice attributes the linked-device sender to Bob and decrypts using
+        // B1's device X25519 (from the verified device list), not Bob's account.
+        let (decrypted, verified) = decrypt_and_verify(&mut msg, alice.path(), &contacts).unwrap();
+        assert_eq!(decrypted, plaintext);
+        assert!(verified);
+        assert_eq!(
+            resolve_contact_by_sender(alice.path(), &contacts, &b1_pub)
                 .unwrap()
                 .name,
             "bob"
