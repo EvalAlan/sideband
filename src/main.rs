@@ -5871,6 +5871,69 @@ fn revoke_device_from_self_list(profile: &Path, device_pubkey_b64: &str) -> Resu
     Ok(list)
 }
 
+// ── Multi-device: device linking handshake ──────────────────────────────────
+//
+// A new device generates its own device key / X25519 / onion, then presents a
+// LinkRequest to the primary over an authenticated pairing channel (the channel
+// + pairing-code authentication is the transport layer, built separately). The
+// primary validates it, adds the device to the account's signed device list
+// (primary-only authority), and returns a LinkGrant carrying the account pubkey
+// + the updated list. The contacts/history seed is transferred separately.
+
+/// A new device's request to join an account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LinkRequest {
+    device_pubkey_b64: String,
+    x25519_pubkey_b64: String,
+    onion: String,
+    name: String,
+}
+
+/// The primary's grant back to the new device: the account it now belongs to and
+/// the updated signed device list proving its authorization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LinkGrant {
+    account_pubkey_b64: String,
+    device_list: DeviceList,
+}
+
+/// New device: build a link request from this profile's own (device) keys.
+#[allow(dead_code)] // wired into the pairing transport (Phase 3 continued)
+fn build_link_request(profile: &Path, onion: &str, name: &str) -> Result<LinkRequest> {
+    let device_key = load_signing_key(profile)?;
+    let x25519_pub = load_x25519_public(profile)?;
+    Ok(LinkRequest {
+        device_pubkey_b64: B64.encode(device_key.verifying_key().to_bytes()),
+        x25519_pubkey_b64: B64.encode(x25519_pub.as_bytes()),
+        onion: onion.to_string(),
+        name: name.to_string(),
+    })
+}
+
+/// Primary: validate a link request and grant it — add the requesting device to
+/// the account's device list and return the account pubkey + updated list.
+#[allow(dead_code)] // wired into the pairing transport (Phase 3 continued)
+fn primary_grant_link(profile: &Path, req: &LinkRequest) -> Result<LinkGrant> {
+    // Reject malformed keys / onion before mutating the device list.
+    verifying_key_from_b64(&req.device_pubkey_b64).context("link request device pubkey")?;
+    x25519_pubkey_from_b64(&req.x25519_pubkey_b64).context("link request x25519 pubkey")?;
+    if !req.onion.ends_with(".onion") {
+        return Err(anyhow!("link request onion must be an onion address"));
+    }
+    let device_list = add_device_to_self_list(
+        profile,
+        &req.device_pubkey_b64,
+        &req.onion,
+        &req.x25519_pubkey_b64,
+        &[DEVICE_CAP_MESSAGING.to_string()],
+    )?;
+    let account_pubkey_b64 = B64.encode(load_signing_key(profile)?.verifying_key().to_bytes());
+    Ok(LinkGrant {
+        account_pubkey_b64,
+        device_list,
+    })
+}
+
 // ── Multi-device: a contact's device endpoints ──────────────────────────────
 //
 // A contact's known devices are stored as a signed `DeviceList` in an encrypted
@@ -8594,6 +8657,60 @@ mod tests {
 
         // Revoking an unknown device is rejected.
         assert!(revoke_device_from_self_list(dir.path(), &B64.encode([9u8; 32])).is_err());
+    }
+
+    #[test]
+    fn link_request_grant_adds_new_device_to_account() {
+        // Primary profile with an initialized self list.
+        let primary = tempfile::tempdir().unwrap();
+        init_profile(primary.path()).unwrap();
+        let acct_pub = B64.encode(
+            load_signing_key(primary.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+        build_self_device_list(primary.path(), "primary.onion", 1).unwrap();
+
+        // A separate new-device profile builds its link request from its own keys.
+        let newdev = tempfile::tempdir().unwrap();
+        init_profile(newdev.path()).unwrap();
+        let newdev_pub = B64.encode(
+            load_signing_key(newdev.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+        let req = build_link_request(newdev.path(), "newdev.onion", "Laptop").unwrap();
+        assert_eq!(req.device_pubkey_b64, newdev_pub);
+        assert_ne!(
+            req.device_pubkey_b64, acct_pub,
+            "new device has its own key"
+        );
+
+        // Primary grants the link.
+        let grant = primary_grant_link(primary.path(), &req).unwrap();
+        assert_eq!(grant.account_pubkey_b64, acct_pub);
+        assert!(verify_device_list(&grant.device_list, &acct_pub).is_ok());
+        assert_eq!(grant.device_list.devices.len(), 2);
+        assert_eq!(grant.device_list.version, 2);
+        let linked = grant
+            .device_list
+            .devices
+            .iter()
+            .find(|d| d.device_pubkey_b64 == newdev_pub)
+            .expect("new device present in granted list");
+        assert_eq!(linked.onion, "newdev.onion");
+
+        // A malformed request (bad onion) is rejected without mutating the list.
+        let mut bad = req.clone();
+        bad.onion = "not-an-onion".to_string();
+        assert!(primary_grant_link(primary.path(), &bad).is_err());
+        assert_eq!(
+            load_device_list(primary.path()).unwrap().unwrap().version,
+            2,
+            "rejected request left the list unchanged"
+        );
     }
 
     fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {
