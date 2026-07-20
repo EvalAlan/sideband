@@ -1394,7 +1394,6 @@ fn x25519_pubkey_from_b64(b64: &str) -> Result<X25519PublicKey> {
 /// state and X25519 key come from that device's endpoint, not the contact's
 /// primary. Device 0 uses the legacy per-contact ratchet + the contact's key,
 /// so it is byte-for-byte the current single-device behavior.
-#[allow(dead_code)] // wired into send_in_conversation delivery loop in step 2c-send
 #[allow(clippy::too_many_arguments)]
 fn build_outbound_message_for_endpoint(
     profile: &Path,
@@ -1511,6 +1510,71 @@ fn build_outbound_messages_fanout(
         out.push((ep, msg));
     }
     Ok(out)
+}
+
+/// Like [`build_outbound_messages_fanout`] but excludes device 0 (the device
+/// whose key is the contact's account key). The primary send path already built
+/// and delivered device 0's message — rebuilding it here would advance its
+/// ratchet a second time and desync it. Used to fan a message out to a contact's
+/// *additional* linked devices.
+fn build_outbound_messages_for_extra_devices(
+    profile: &Path,
+    contact_name: &str,
+    message_type: &str,
+    plaintext: &str,
+    sender_onion: &str,
+    expires_at_ms: Option<u128>,
+) -> Result<Vec<(ContactEndpoint, ChatMessage)>> {
+    let contacts = load_contacts(profile)?;
+    let contact = contacts
+        .get(contact_name)
+        .with_context(|| format!("unknown contact '{contact_name}'"))?;
+    let account_pubkey_b64 = contact.pubkey_b64.clone();
+    let endpoints = contact_endpoints(profile, contact);
+    let mut out = Vec::new();
+    for ep in endpoints {
+        if ep.device_pubkey_b64 == account_pubkey_b64 {
+            continue; // device 0 is handled by the primary send path
+        }
+        let msg = build_outbound_message_for_endpoint(
+            profile,
+            contact_name,
+            &ep,
+            &account_pubkey_b64,
+            message_type,
+            plaintext,
+            sender_onion,
+            expires_at_ms,
+        )?;
+        out.push((ep, msg));
+    }
+    Ok(out)
+}
+
+/// Single best-effort delivery of a framed payload to an onion over Tor. Used
+/// for multi-device fan-out to a contact's extra devices, where a failure is
+/// tolerated (no retry) and reconciled later by device self-sync.
+async fn deliver_payload_over_tor(
+    tor_client: &TorClient<PreferredRuntime>,
+    onion: &str,
+    payload: &str,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let to_addr = format!("{onion}:80");
+    let mut stream = tor_client
+        .connect(to_addr.as_str())
+        .await
+        .map_err(|e| anyhow!("connect: {e}"))?;
+    stream
+        .write_all(payload.as_bytes())
+        .await
+        .map_err(|e| anyhow!("write: {e}"))?;
+    stream.flush().await.map_err(|e| anyhow!("flush: {e}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| anyhow!("shutdown: {e}"))?;
+    Ok(())
 }
 
 async fn send_typed_message(
@@ -5578,7 +5642,6 @@ fn device_list_signing_bytes(
     buf
 }
 
-#[allow(dead_code)] // wired into send/receive in Phase 2
 fn verifying_key_from_b64(b64: &str) -> Result<VerifyingKey> {
     let bytes = B64
         .decode(b64.as_bytes())
@@ -5590,7 +5653,6 @@ fn verifying_key_from_b64(b64: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&arr).context("invalid ed25519 pubkey")
 }
 
-#[allow(dead_code)] // wired into send/receive in Phase 2
 fn signature_from_b64(b64: &str) -> Result<Signature> {
     let bytes = B64.decode(b64.as_bytes()).context("decode signature")?;
     let arr: [u8; 64] = bytes
@@ -5632,7 +5694,6 @@ fn sign_device_cert(
 /// Verify a cert is self-consistent: its signature validates under the account
 /// pubkey embedded in it. Binding that account to a *trusted* one is the
 /// caller's job (see `verify_device_list`).
-#[allow(dead_code)] // wired into receive verification in Phase 2
 fn verify_device_cert(cert: &DeviceCert) -> Result<()> {
     let vk = verifying_key_from_b64(&cert.account_pubkey_b64)?;
     let sig = signature_from_b64(&cert.account_sig_b64)?;
@@ -5673,7 +5734,6 @@ fn sign_device_list(
 /// Fully verify a device list against the account the caller *trusts*: the list
 /// claims that account, every cert belongs to and is signed by it, and the
 /// list-level signature is valid (so no dropped/replayed/injected device).
-#[allow(dead_code)] // wired into contact/receive verification in Phase 2
 fn verify_device_list(list: &DeviceList, expected_account_pubkey_b64: &str) -> Result<()> {
     if list.account_pubkey_b64 != expected_account_pubkey_b64 {
         return Err(anyhow!(
@@ -5709,7 +5769,7 @@ fn save_device_list(profile: &Path, list: &DeviceList) -> Result<()> {
     write_encryptable(&device_list_path(profile), toml.as_bytes())
 }
 
-#[allow(dead_code)] // wired into contact storage in Phase 2
+#[allow(dead_code)] // this-device self list; read by Phase 3 linking
 fn load_device_list(profile: &Path) -> Result<Option<DeviceList>> {
     let path = device_list_path(profile);
     if !path.exists() {
@@ -5800,7 +5860,6 @@ fn load_contact_device_list(profile: &Path, contact_name: &str) -> Result<Option
 /// list when present; otherwise falls back to the single legacy endpoint so
 /// single-device contacts are unchanged. A stored list that does not verify
 /// against the contact's account key is ignored (never trusted).
-#[allow(dead_code)] // wired into the send path in step 2c
 fn contact_endpoints(profile: &Path, contact: &ContactFile) -> Vec<ContactEndpoint> {
     if let Ok(Some(list)) = load_contact_device_list(profile, &contact.name) {
         if verify_device_list(&list, &contact.pubkey_b64).is_ok() {
@@ -8053,6 +8112,56 @@ pub(crate) async fn send_in_conversation(
     // won't match this fingerprint; retried messages just stay at Sent/Delivered.
     if stored_row_id > 0 && conversation_kind == "contact" {
         let _ = set_message_fingerprint(profile, stored_row_id, &message_replay_fingerprint(&msg));
+    }
+
+    // Multi-device fan-out: best-effort deliver to the contact's *other* devices.
+    // Device 0 (the primary `to`) was handled above and drives status/history/
+    // retry; additional linked devices are fire-and-forget for now (a failure is
+    // reconciled later by device self-sync, Phase 4). Skipped on retries so we
+    // don't re-fan on every retry attempt. A single-device contact has no extra
+    // devices, so this is a no-op today.
+    if conversation_kind == "contact" && !is_retry {
+        match build_outbound_messages_for_extra_devices(
+            profile,
+            contact_hint,
+            "msg",
+            &plaintext,
+            &sender_onion,
+            expires_at_ms,
+        ) {
+            Ok(extras) => {
+                for (ep, dmsg) in extras {
+                    let dpayload = match serde_json::to_string(&dmsg) {
+                        Ok(s) => format!("{s}\n"),
+                        Err(e) => {
+                            warn!(error=%e, "serialize fan-out message failed");
+                            continue;
+                        }
+                    };
+                    let tc = Arc::clone(&tor_client);
+                    let onion = ep.onion.clone();
+                    tokio::spawn(async move {
+                        match tokio::time::timeout(
+                            Duration::from_secs(60),
+                            deliver_payload_over_tor(&tc, &onion, &dpayload),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                info!(device_onion=%onion, "fan-out delivered to extra device")
+                            }
+                            Ok(Err(e)) => {
+                                warn!(device_onion=%onion, error=%e, "fan-out to extra device failed (best-effort)")
+                            }
+                            Err(_) => {
+                                warn!(device_onion=%onion, "fan-out to extra device timed out (best-effort)")
+                            }
+                        }
+                    });
+                }
+            }
+            Err(e) => warn!(error=%e, "building fan-out messages for extra devices failed"),
+        }
     }
 
     // On final failure, enqueue for background retry (contact-only, not groups).
