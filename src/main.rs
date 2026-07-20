@@ -5404,6 +5404,117 @@ pub(crate) fn import_profile_bytes(
     Ok(())
 }
 
+// ── Multi-device: link seed (secondary-device state transfer) ───────────────
+//
+// A LinkSeed carries the state a newly-linked device needs — the account public
+// key, the signed device list, contacts, and message history — but DELIBERATELY
+// NOT the account secret key or ratchet state. Excluding the account secret is
+// the crux of primary-only linking: a secondary can message and be recognized,
+// but cannot authorize further devices. The secondary keeps its own device
+// identity (identity.toml); ratchets start fresh per (contact, device).
+
+const LINK_SEED_MAGIC: &[u8] = b"SBLINK1\n";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LinkSeed {
+    version: u32,
+    account_pubkey_b64: String,
+    device_list: DeviceList,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contacts_toml: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    messages_db_b64: Option<String>,
+}
+
+/// Primary: build the encrypted state seed for a newly-linked device. Contains
+/// no identity secret and no ratchet state.
+#[allow(dead_code)] // wired into the pairing transport (Phase 3c continued)
+fn export_link_seed(profile: &Path, passphrase: &str) -> Result<Vec<u8>> {
+    if passphrase.is_empty() {
+        return Err(anyhow!("link passphrase must not be empty"));
+    }
+    let account_pubkey_b64 = account_pubkey(profile)?;
+    let device_list = load_device_list(profile)?
+        .ok_or_else(|| anyhow!("no device list; initialize the primary first"))?;
+    let contacts_toml = read_encryptable(&contacts_path(profile))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok());
+    let messages_db_b64 = export_messages_db_plaintext(profile)?.map(|b| B64.encode(b));
+    let seed = LinkSeed {
+        version: 1,
+        account_pubkey_b64,
+        device_list,
+        contacts_toml,
+        messages_db_b64,
+    };
+    let plaintext = serde_json::to_vec(&seed)?;
+
+    let mut salt = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+    let key = derive_export_key(passphrase, &salt)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let mut nonce_bytes = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
+        .map_err(|e| anyhow!("link seed encryption failed: {e}"))?;
+    let mut out = Vec::with_capacity(LINK_SEED_MAGIC.len() + 16 + 12 + ct.len());
+    out.extend_from_slice(LINK_SEED_MAGIC);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Secondary: apply a link seed. Records the account key (marking this a
+/// secondary), stores the signed device list, and restores contacts + history —
+/// WITHOUT touching this device's own identity.toml. Requires that this device's
+/// key appears in the granted device list.
+#[allow(dead_code)] // wired into the pairing transport (Phase 3c continued)
+fn apply_link_seed(profile: &Path, data: &[u8], passphrase: &str) -> Result<()> {
+    let header = LINK_SEED_MAGIC.len() + 16 + 12;
+    if data.len() < header || &data[..LINK_SEED_MAGIC.len()] != LINK_SEED_MAGIC {
+        return Err(anyhow!("not a Sideband link seed"));
+    }
+    let rest = &data[LINK_SEED_MAGIC.len()..];
+    let (salt, rest) = rest.split_at(16);
+    let (nonce_bytes, ct) = rest.split_at(12);
+    let key = derive_export_key(passphrase, salt)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+        .map_err(|_| anyhow!("decryption failed (wrong code or corrupt seed)"))?;
+    let seed: LinkSeed = serde_json::from_slice(&plaintext).context("parse link seed")?;
+    if seed.version != 1 {
+        return Err(anyhow!("unsupported link seed version {}", seed.version));
+    }
+    // The device list must be genuinely signed by the account it names, and this
+    // device must actually be in it (proof the primary authorized us).
+    verify_device_list(&seed.device_list, &seed.account_pubkey_b64)?;
+    let my_device = B64.encode(load_signing_key(profile)?.verifying_key().to_bytes());
+    if !seed
+        .device_list
+        .devices
+        .iter()
+        .any(|d| d.device_pubkey_b64 == my_device)
+    {
+        return Err(anyhow!("this device is not in the granted device list"));
+    }
+
+    create_private_dir(profile)?;
+    save_account_pubkey(profile, &seed.account_pubkey_b64)?;
+    save_device_list(profile, &seed.device_list)?;
+    if let Some(contacts) = &seed.contacts_toml {
+        write_encryptable(&contacts_path(profile), contacts.as_bytes())?;
+    }
+    if let Some(db_b64) = &seed.messages_db_b64 {
+        let bytes = B64.decode(db_b64).context("decode messages.db")?;
+        fs::write(db_path(profile), bytes).context("write messages.db")?;
+    }
+    // identity.toml (this device's own key) is intentionally left untouched.
+    Ok(())
+}
+
 /// Export a profile to `out_path` (encrypted, 0o600). Returns the byte count.
 pub(crate) fn export_profile_to(profile: &Path, out_path: &Path, passphrase: &str) -> Result<u64> {
     let bytes = export_profile_bytes(profile, passphrase)?;
@@ -8841,6 +8952,67 @@ mod tests {
             ),
             device_key
         );
+    }
+
+    #[test]
+    fn link_seed_transfers_account_and_history_but_not_the_identity_secret() {
+        // Primary with a contact, an (empty) message DB, and a self device list.
+        let primary = tempfile::tempdir().unwrap();
+        init_profile(primary.path()).unwrap();
+        let acct_pub = B64.encode(
+            load_signing_key(primary.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert(
+            "bob".to_string(),
+            test_contact("bob", "bob.onion", "BOBPUB", "BOBX"),
+        );
+        save_contacts(primary.path(), &contacts).unwrap();
+        init_db(primary.path()).unwrap(); // creates messages.db
+        build_self_device_list(primary.path(), "primary.onion", 1).unwrap();
+
+        // New device: its own identity, requests to link, primary grants.
+        let newdev = tempfile::tempdir().unwrap();
+        init_profile(newdev.path()).unwrap();
+        let newdev_key = B64.encode(
+            load_signing_key(newdev.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+        let req = build_link_request(newdev.path(), "newdev.onion", "Laptop").unwrap();
+        primary_grant_link(primary.path(), &req).unwrap();
+
+        // Primary exports the seed; the new device applies it.
+        let seed = export_link_seed(primary.path(), "pair-code-123").unwrap();
+        apply_link_seed(newdev.path(), &seed, "pair-code-123").unwrap();
+
+        // The new device now belongs to the account...
+        assert!(is_secondary_device(newdev.path()));
+        assert_eq!(account_pubkey(newdev.path()).unwrap(), acct_pub);
+        // ...has the contact + a message DB...
+        assert!(load_contacts(newdev.path()).unwrap().contains_key("bob"));
+        assert!(db_path(newdev.path()).exists());
+        // ...but keeps its OWN device signing key (the account secret was NOT
+        // transferred — this is what makes linking primary-only).
+        assert_eq!(
+            B64.encode(
+                load_signing_key(newdev.path())
+                    .unwrap()
+                    .verifying_key()
+                    .to_bytes()
+            ),
+            newdev_key
+        );
+        assert_ne!(newdev_key, acct_pub, "secondary cannot sign as the account");
+
+        // Wrong pairing code is rejected.
+        let fresh = tempfile::tempdir().unwrap();
+        init_profile(fresh.path()).unwrap();
+        assert!(apply_link_seed(fresh.path(), &seed, "wrong-code").is_err());
     }
 
     fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {
