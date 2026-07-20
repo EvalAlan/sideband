@@ -111,10 +111,27 @@ Each phase = TDD, green tree, single-device still works.
   (a contact must have >1 device and the receiver must know the list), which is
   Phase 3 work.
 
-### Phase 3 — Device linking / provisioning (now also carries 2b + 2d)
+### Phase 3 — Device linking / provisioning (now also carries 2b + 2d)  ← STARTED
+**Decision:** primary-only linking authority (only the AIK holder can add/revoke
+devices); account recovery via the AIK inside the encrypted export archive.
+
+- **[done] 3a** — primary-side `add_device_to_self_list` /
+  `revoke_device_from_self_list` (version-bumped + re-signed; device 0 cannot be
+  revoked; duplicates rejected). Commit `3c6a85f`.
+- **[done] 3b** — link handshake data model: `LinkRequest` (new device's keys +
+  onion) / `LinkGrant` (account pubkey + updated device list);
+  `build_link_request` / `primary_grant_link` (validates then adds). Commit
+  `3c6af3b`.
+- **[PAUSED — next, invasive] 3c** — secondary-device bootstrap. A linked device
+  holds its own device key as signing identity but presents the ACCOUNT pubkey to
+  contacts: add `account.toml` (account public key only) + an
+  `account_pubkey(profile)` accessor (no-op on primaries) threaded through
+  `share`, `from`, and contact-matching. The state seed to a secondary MUST
+  EXCLUDE the account secret (distinct from the normal export archive). First
+  part that really wants two devices to validate.
 - QR link flow: primary signs the new device's cert, transfers state (contacts +
-  device list + history seed via the encrypted export archive) over an
-  authenticated LAN/Tor channel.
+  device list + history seed via a NEW seed archive that omits the account
+  secret) over an authenticated LAN/Tor channel.
 - **(2b)** share code / QR carries the signed device list; contact-add parses +
   verifies it.
 - Push updated device list to all contacts (control message); store it via

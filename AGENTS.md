@@ -166,8 +166,24 @@ fallback (`58bd329`); 2c per-`(contact,device)` ratchet (`path_for_device`, devi
 `send_in_conversation` best-effort fan-out to a contact's extra devices
 (`362e873`). **2b (share/QR carries device list) + 2d (receive verifies sender
 device) are folded into Phase 3** (only meaningful once linking distributes device
-lists). **NEXT: Phase 3 — device linking/provisioning (QR link, push device list,
-2b, 2d, revoke).** Single-device accounts keep working unchanged (device list of
+lists). Phase 3 **started**: 3a primary-only device add/revoke on the self list
+(`add_device_to_self_list`/`revoke_device_from_self_list`, version-bumped +
+re-signed; `3c6a85f`); 3b link handshake data model (`LinkRequest`/`LinkGrant`,
+`build_link_request`/`primary_grant_link`; `3c6af3b`). Both pure/testable, staged
+under `allow(dead_code)` (no CLI/transport wiring yet).
+
+**NEXT — Phase 3c (paused, the invasive one): secondary-device bootstrap.** A
+linked device holds its OWN device key as signing identity but must present the
+ACCOUNT pubkey to contacts — needs an `account.toml` (account public key only) +
+an `account_pubkey(profile)` accessor (no-op on primaries, where device key ==
+account key), threaded through `share`, `from`, and contact-matching. The state
+seed sent to a secondary MUST EXCLUDE the account secret key (else it's the
+rejected any-device model), so linking needs a seed package distinct from the
+normal export archive. Then 2d: receive maps inbound `from` (device key) →
+account via the sender's verified device list. Also still to do: the pairing
+transport (code-authenticated LAN/Tor channel), device-list push to contacts
+(store via `save_contact_device_list`, already built), and the GUI Linked
+Devices screen. Single-device accounts keep working unchanged (device list of
 length 1) at every phase; all fan-out is a no-op until a contact has >1 device.
 
 **At-rest encryption (opt-in app lock) — DONE.** `messages.db` is **SQLCipher**
