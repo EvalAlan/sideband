@@ -2162,8 +2162,9 @@ pub(crate) fn set_db_passphrase(profile: &Path, new_passphrase: &str) -> Result<
     // sensitive profile files so they match.
     reencrypt_profile_file(&identity_path(profile))?;
     reencrypt_profile_file(&contacts_path(profile))?;
-    // Double Ratchet session state (per-contact under <profile>/ratchet/) and
-    // stored contact device lists (per-contact under <profile>/contact-devices/).
+    reencrypt_profile_file(&account_path(profile))?; // secondary devices only
+                                                     // Double Ratchet session state (per-contact under <profile>/ratchet/) and
+                                                     // stored contact device lists (per-contact under <profile>/contact-devices/).
     for sub in ["ratchet", "contact-devices"] {
         let dir = profile.join(sub);
         if dir.is_dir() {
@@ -5981,6 +5982,56 @@ fn primary_grant_link(profile: &Path, req: &LinkRequest) -> Result<LinkGrant> {
     })
 }
 
+// ── Multi-device: account identity on secondary devices ─────────────────────
+//
+// On the PRIMARY, the device signing key (identity.toml) IS the account key, so
+// there is no `account.toml` and `account_pubkey()` returns the device key. On a
+// LINKED (secondary) device, the signing key is the device's own key and the
+// account's public key is stored in `account.toml`; the device presents the
+// account key to contacts while signing with its device key. This accessor is
+// the single place the rest of the app asks "what account am I?", so primaries
+// are unaffected.
+
+fn account_path(profile: &Path) -> PathBuf {
+    profile.join("account.toml")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AccountFile {
+    account_pubkey_b64: String,
+}
+
+/// True if this profile is a linked (secondary) device — its signing key is not
+/// the account key.
+#[allow(dead_code)] // wired into share/from/contact-matching (Phase 3c continued)
+fn is_secondary_device(profile: &Path) -> bool {
+    account_path(profile).exists()
+}
+
+/// This profile's account (identity) public key, base64. On the primary this is
+/// the device signing key; on a secondary it is the stored account key.
+#[allow(dead_code)] // wired into share/from/contact-matching (Phase 3c continued)
+fn account_pubkey(profile: &Path) -> Result<String> {
+    let path = account_path(profile);
+    if path.exists() {
+        let bytes = read_encryptable(&path)?;
+        let s = String::from_utf8(bytes).context("account.toml not utf-8")?;
+        let acct: AccountFile = toml::from_str(&s).context("parse account.toml")?;
+        return Ok(acct.account_pubkey_b64);
+    }
+    Ok(B64.encode(load_signing_key(profile)?.verifying_key().to_bytes()))
+}
+
+/// Record the account public key on a secondary device (marks it secondary).
+#[allow(dead_code)] // wired into the secondary bootstrap (Phase 3c continued)
+fn save_account_pubkey(profile: &Path, account_pubkey_b64: &str) -> Result<()> {
+    let acct = AccountFile {
+        account_pubkey_b64: account_pubkey_b64.to_string(),
+    };
+    let toml = toml::to_string_pretty(&acct).context("serialize account.toml")?;
+    write_encryptable(&account_path(profile), toml.as_bytes())
+}
+
 // ── Multi-device: a contact's device endpoints ──────────────────────────────
 //
 // A contact's known devices are stored as a signed `DeviceList` in an encrypted
@@ -8757,6 +8808,38 @@ mod tests {
             load_device_list(primary.path()).unwrap().unwrap().version,
             2,
             "rejected request left the list unchanged"
+        );
+    }
+
+    #[test]
+    fn account_pubkey_is_device_key_on_primary_and_stored_on_secondary() {
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        let device_key = B64.encode(
+            load_signing_key(dir.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+
+        // Primary: no account.toml, so the account key IS the device key.
+        assert!(!is_secondary_device(dir.path()));
+        assert_eq!(account_pubkey(dir.path()).unwrap(), device_key);
+
+        // Mark it a secondary of some other account.
+        let other_account = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        save_account_pubkey(dir.path(), &other_account).unwrap();
+        assert!(is_secondary_device(dir.path()));
+        assert_eq!(account_pubkey(dir.path()).unwrap(), other_account);
+        // The device signing key is unchanged (still its own).
+        assert_eq!(
+            B64.encode(
+                load_signing_key(dir.path())
+                    .unwrap()
+                    .verifying_key()
+                    .to_bytes()
+            ),
+            device_key
         );
     }
 
