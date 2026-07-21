@@ -12,8 +12,7 @@ Run everything with:
 ```bash
 ./run-tests.sh fast   # default — no Tor, no emulator, runs in seconds. CI gate.
 ./run-tests.sh ui     # fast + real Flutter UI driving (Linux, and Android if attached)
-./run-tests.sh e2e    # the full two-peer test over real Tor (slow/flaky; nightly/manual)
-./run-tests.sh all
+./run-tests.sh all    # fast + ui
 ```
 
 ## Why not "three real clients talking over Tor"?
@@ -21,8 +20,9 @@ Run everything with:
 You *can* run the emulator, TUI, and desktop GUI on one machine at once — that's
 not the constraint. The constraints are that (1) the clients talk over **Tor**
 (30–60s bootstrap, nondeterministic) and (2) driving GUIs by screen pixels is
-flaky. So real-client-over-Tor is the **e2e** tier only: run it rarely. Almost
-all coverage lives in the fast tier, which never touches Tor.
+flaky. So almost all coverage lives in the **fast** tier, which never touches
+Tor; real cross-peer message exchange is exercised deterministically by the
+interop harness there (isolated temp profiles, real signed+encrypted messages).
 
 ## The layers
 
@@ -63,11 +63,13 @@ the emulator app profile first and drives first-run setup. Both disable listener
 startup, then cover contact add, `/add`, group creation, sidebar refresh, and
 group selection without waiting for Tor.
 
-### E2E tier (`run-tests.sh e2e`)
+### Over-Tor e2e (retired)
 
-[`test_e2e.sh`](test_e2e.sh): two `serve` instances bootstrap real Tor onion
-services and exchange a message. Slow and network-dependent; run nightly or by
-hand, never per-commit.
+The old `test_e2e.sh` (two `serve` instances over real Tor) targeted the
+pre-Arti system-`tor -f` / `tor/hs/hostname` profile layout and no longer
+matches the embedded-Arti core, so it was removed. A real deterministic
+two-peer embedded-Arti harness is a ROADMAP item; until then, cross-peer message
+exchange is covered by the interop harness in the **fast** tier.
 
 ## Profiles are always isolated
 

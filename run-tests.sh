@@ -4,8 +4,10 @@
 #
 #   ./run-tests.sh fast   # default: core + interop + FFI + desktop-CLI + Dart. No Tor, no emulator. Seconds.
 #   ./run-tests.sh ui     # fast + Flutter integration_test on Linux (and emulator if one is attached).
-#   ./run-tests.sh e2e     # the full two-peer test over real Tor (slow, flaky; nightly/manual).
-#   ./run-tests.sh all     # fast + ui + e2e.
+#   ./run-tests.sh all    # fast + ui.
+#
+# (An over-Tor e2e tier was retired — the old test_e2e.sh targeted the pre-Arti
+#  system-Tor layout. Real cross-peer coverage is the interop harness in `fast`.)
 #
 set -euo pipefail
 
@@ -105,15 +107,9 @@ run_ui() {
   fi
 }
 
-run_e2e() {
-  hr "two-peer end-to-end over Tor"
-  ./test_e2e.sh
-}
-
 case "$TIER" in
   fast) run_fast ;;
   ui)   run_fast; run_ui ;;
-  e2e)  run_e2e ;;
-  all)  run_fast; run_ui; run_e2e ;;
-  *)    red "unknown tier '$TIER' (use: fast | ui | e2e | all)"; exit 2 ;;
+  all)  run_fast; run_ui ;;
+  *)    red "unknown tier '$TIER' (use: fast | ui | all)"; exit 2 ;;
 esac
