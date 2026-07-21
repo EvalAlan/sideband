@@ -5572,6 +5572,118 @@ fn apply_link_seed(profile: &Path, data: &[u8], passphrase: &str) -> Result<()> 
     Ok(())
 }
 
+// ── Multi-device: pairing handshake (encrypted under a one-time code) ────────
+//
+// The primary shows a PairingOffer (its reachability + account key + a 32-byte
+// random secret) as a QR. The new device connects and the two exchange:
+//   new device → primary:  sealed LinkRequest
+//   primary → new device:  sealed LinkSeed (device added to the account first)
+// Both messages are ChaCha20-Poly1305-sealed under a key derived from the
+// pairing secret, which authenticates the channel (the QR carries 256 bits of
+// entropy, so no PAKE is needed) and stops a passive or active MITM. The socket
+// transport that carries these bytes is a thin layer on top; this is the
+// testable protocol core.
+
+/// What the primary encodes into the pairing QR.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PairingOffer {
+    /// Primary reachability (onion address, or ip:port on a trusted LAN).
+    addr: String,
+    account_pubkey_b64: String,
+    /// 32-byte one-time pairing secret, base64.
+    secret_b64: String,
+}
+
+/// Primary: mint a fresh pairing offer (for the QR) + return the raw secret to
+/// hold while the handshake runs.
+#[allow(dead_code)] // consumed by the pairing socket transport + GUI
+fn new_pairing_offer(profile: &Path, addr: &str) -> Result<(PairingOffer, Vec<u8>)> {
+    let mut secret = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut secret);
+    let offer = PairingOffer {
+        addr: addr.to_string(),
+        account_pubkey_b64: account_pubkey(profile)?,
+        secret_b64: B64.encode(secret),
+    };
+    Ok((offer, secret.to_vec()))
+}
+
+const PAIRING_MAGIC: &[u8] = b"SBPAIR1\n";
+
+fn pairing_key(secret: &[u8]) -> Result<Key> {
+    let hk = Hkdf::<Sha256>::new(None, secret);
+    let mut okm = [0u8; 32];
+    hk.expand(b"sideband-pairing-v1", &mut okm)
+        .map_err(|e| anyhow!("pairing hkdf: {e}"))?;
+    Ok(*Key::from_slice(&okm))
+}
+
+fn pairing_seal(secret: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new(&pairing_key(secret)?);
+    let mut nonce = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .map_err(|e| anyhow!("pairing seal failed: {e}"))?;
+    let mut out = Vec::with_capacity(PAIRING_MAGIC.len() + 12 + ct.len());
+    out.extend_from_slice(PAIRING_MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn pairing_open(secret: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
+    if sealed.len() < PAIRING_MAGIC.len() + 12 || &sealed[..PAIRING_MAGIC.len()] != PAIRING_MAGIC {
+        return Err(anyhow!("not a pairing envelope"));
+    }
+    let rest = &sealed[PAIRING_MAGIC.len()..];
+    let (nonce, ct) = rest.split_at(12);
+    let cipher = ChaCha20Poly1305::new(&pairing_key(secret)?);
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|_| anyhow!("pairing decrypt failed (wrong code or corrupt data)"))
+}
+
+/// New device: build the sealed LinkRequest to send to the primary.
+#[allow(dead_code)] // consumed by the pairing socket transport + GUI
+fn new_device_pairing_request(
+    profile: &Path,
+    secret: &[u8],
+    onion: &str,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let req = build_link_request(profile, onion, name)?;
+    pairing_seal(secret, &serde_json::to_vec(&req)?)
+}
+
+/// Primary: authorize a sealed LinkRequest (adds the device to the account) and
+/// return the sealed LinkSeed to send back.
+#[allow(dead_code)] // consumed by the pairing socket transport + GUI
+fn primary_handle_pairing_request(
+    profile: &Path,
+    secret: &[u8],
+    sealed_request: &[u8],
+) -> Result<Vec<u8>> {
+    let req: LinkRequest = serde_json::from_slice(&pairing_open(secret, sealed_request)?)
+        .context("parse pairing link request")?;
+    // Adds the device to our signed self list (must happen before we export the
+    // seed, so the seed carries the updated list that authorizes the new device).
+    let _grant = primary_grant_link(profile, &req)?;
+    let seed = export_link_seed(profile, &B64.encode(secret))?;
+    pairing_seal(secret, &seed)
+}
+
+/// New device: apply the primary's sealed response, becoming a linked device.
+#[allow(dead_code)] // consumed by the pairing socket transport + GUI
+fn new_device_apply_pairing_response(
+    profile: &Path,
+    secret: &[u8],
+    sealed_response: &[u8],
+) -> Result<()> {
+    let seed = pairing_open(secret, sealed_response)?;
+    apply_link_seed(profile, &seed, &B64.encode(secret))
+}
+
 /// Export a profile to `out_path` (encrypted, 0o600). Returns the byte count.
 pub(crate) fn export_profile_to(profile: &Path, out_path: &Path, passphrase: &str) -> Result<u64> {
     let bytes = export_profile_bytes(profile, passphrase)?;
@@ -9304,6 +9416,76 @@ mod tests {
         );
         store_pushed_device_list(dir.path(), "bob", &acct_pub, &json(&forged)).unwrap();
         assert_eq!(ver(dir.path()), Some(3), "forged push ignored");
+    }
+
+    #[test]
+    fn pairing_handshake_links_a_new_device_end_to_end() {
+        // Primary with a contact + an initialized self device list.
+        let primary = tempfile::tempdir().unwrap();
+        init_profile(primary.path()).unwrap();
+        let acct_pub = B64.encode(
+            load_signing_key(primary.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert(
+            "bob".to_string(),
+            test_contact("bob", "bob.onion", "BOBPUB", "BOBX"),
+        );
+        save_contacts(primary.path(), &contacts).unwrap();
+        build_self_device_list(primary.path(), "primary.onion", 1).unwrap();
+
+        // New device with its own identity.
+        let newdev = tempfile::tempdir().unwrap();
+        init_profile(newdev.path()).unwrap();
+        let newdev_key = B64.encode(
+            load_signing_key(newdev.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+
+        // The primary mints a pairing offer; the QR would carry `offer`.
+        let (offer, secret) = new_pairing_offer(primary.path(), "primary.onion").unwrap();
+        assert_eq!(offer.account_pubkey_b64, acct_pub);
+
+        // Handshake (bytes that the socket transport would carry both ways).
+        let req =
+            new_device_pairing_request(newdev.path(), &secret, "newdev.onion", "Laptop").unwrap();
+        let resp = primary_handle_pairing_request(primary.path(), &secret, &req).unwrap();
+        new_device_apply_pairing_response(newdev.path(), &secret, &resp).unwrap();
+
+        // New device is now a linked secondary of the account...
+        assert!(is_secondary_device(newdev.path()));
+        assert_eq!(account_pubkey(newdev.path()).unwrap(), acct_pub);
+        assert!(load_contacts(newdev.path()).unwrap().contains_key("bob"));
+        // ...keeps its own device signing key (account secret never transferred)...
+        assert_eq!(
+            B64.encode(
+                load_signing_key(newdev.path())
+                    .unwrap()
+                    .verifying_key()
+                    .to_bytes()
+            ),
+            newdev_key
+        );
+        // ...and the primary's device list now includes it (version bumped).
+        let primary_list = load_device_list(primary.path()).unwrap().unwrap();
+        assert_eq!(primary_list.version, 2);
+        assert!(primary_list
+            .devices
+            .iter()
+            .any(|d| d.device_pubkey_b64 == newdev_key));
+
+        // A wrong pairing code cannot complete the handshake.
+        let newdev2 = tempfile::tempdir().unwrap();
+        init_profile(newdev2.path()).unwrap();
+        let req2 =
+            new_device_pairing_request(newdev2.path(), &secret, "n2.onion", "Tablet").unwrap();
+        let wrong = vec![9u8; 32];
+        assert!(primary_handle_pairing_request(primary.path(), &wrong, &req2).is_err());
     }
 
     fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {
