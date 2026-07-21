@@ -187,14 +187,26 @@ v3 keys the Bob ratchet per sender device via `path_for_device`/`save_to` +
 account key → legacy path); verified by all 9 ratchet tests + a new
 linked-device receive test + full 140-test suite.
 
-**NEXT — Phase 3d (plumbing, needs 2 devices to validate the UX):** the pairing
-transport (code-authenticated LAN/Tor channel carrying
-`LinkRequest`→`LinkGrant`→`LinkSeed`), device-list **push** to contacts on
-link/revoke (store via `save_contact_device_list`, already built), and the GUI
-**Linked Devices** screen (show QR to link, list devices, unlink). The whole
-cryptographic/data-model core is in place; what remains is wiring it over the
-wire + UI. Single-device accounts keep working unchanged (device list length 1);
-all fan-out/multi-device paths are inert until a contact actually has >1 device.
+**Phase 3d protocol core — DONE.** 3d-1 device-list **push**: inbound
+`device_list` messages → `handle_device_list_push` → `store_pushed_device_list`
+(verifies the pushed list is signed by that contact's account + rollback
+protection); `broadcast_self_device_list` sends ours to all contacts (`2fa3787`).
+3d-2 **pairing handshake** (code-authenticated, the testable core): `PairingOffer`
+(QR = primary addr + account key + 32-byte secret), `pairing_seal`/`open`
+(ChaCha20-Poly1305 under HKDF(secret)), `new_device_pairing_request` →
+`primary_handle_pairing_request` → `new_device_apply_pairing_response`; full
+in-process round-trip test links a new device (`8b8a0c6`).
+
+**The entire crypto + protocol core of independent-peers multi-device is now
+complete and tested.** NEXT — Phase 3e, the **wire + UI plumbing** (genuinely
+wants ~2 endpoints to validate): the pairing **socket transport** (a LAN/Tor
+listener running `primary_handle_pairing_request` + a dialer running the new-
+device side, then `broadcast_self_device_list`) — testable with two processes on
+localhost like the two-instance LAN test; a **CLI/FFI** surface (`device
+list`/`pair`/`link`/`revoke`); and the GUI **Linked Devices** screen (show QR,
+list devices, unlink). Everything above is staged under `allow(dead_code)` until
+this wires it in. Single-device stays unchanged; all multi-device paths are inert
+until a contact/account actually has >1 device.
 
 **At-rest encryption (opt-in app lock) — DONE.** `messages.db` is **SQLCipher**
 (`rusqlite bundled-sqlcipher-vendored-openssl`; Android 4-ABI verified);
