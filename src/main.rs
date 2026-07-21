@@ -1825,6 +1825,42 @@ pub(crate) fn broadcast_presence_all(
     spawned
 }
 
+/// Push our current signed device list to every accepted contact over the full
+/// carrier path, so they update their view of our devices after we link or
+/// revoke one. Best-effort + concurrent, like presence. No-op if we have no
+/// device list yet.
+#[allow(dead_code)] // called from the link/revoke flow once the pairing transport lands
+pub(crate) fn broadcast_self_device_list(
+    profile: &Path,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> usize {
+    let Ok(Some(list)) = load_device_list(profile) else {
+        return 0;
+    };
+    let Ok(json) = serde_json::to_string(&list) else {
+        return 0;
+    };
+    let Ok(contacts) = load_contacts(profile) else {
+        return 0;
+    };
+    let mut spawned = 0usize;
+    for contact in contacts.values() {
+        if contact.pending || contact.blocked || contact.onion.is_empty() {
+            continue;
+        }
+        let profile = profile.to_path_buf();
+        let tc = tor_client.clone();
+        let json = json.clone();
+        let name = contact.name.clone();
+        let onion = contact.onion.clone();
+        tokio::spawn(async move {
+            let _ = send_typed_message(&profile, &onion, &name, "device_list", &json, tc).await;
+        });
+        spawned += 1;
+    }
+    spawned
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum DeliveryStatus {
     Sent = 0,
@@ -6193,7 +6229,6 @@ fn contact_device_list_path(profile: &Path, contact_name: &str) -> PathBuf {
     contact_devices_dir(profile).join(format!("{file}.toml"))
 }
 
-#[allow(dead_code)] // written by Phase 3 device linking / device-list push
 fn save_contact_device_list(profile: &Path, contact_name: &str, list: &DeviceList) -> Result<()> {
     create_private_dir(&contact_devices_dir(profile))?;
     let toml = toml::to_string_pretty(list).context("serialize contact device list")?;
@@ -6201,6 +6236,33 @@ fn save_contact_device_list(profile: &Path, contact_name: &str, list: &DeviceLis
         &contact_device_list_path(profile, contact_name),
         toml.as_bytes(),
     )
+}
+
+/// Apply a device list a contact pushed to us. The list JSON must be validly
+/// signed by that contact's account key, and its version must be newer than any
+/// list we already hold (rollback protection). Malformed / wrong-signer / stale
+/// pushes are silently ignored (return Ok so inbound handling never errors).
+pub(crate) fn store_pushed_device_list(
+    profile: &Path,
+    contact_name: &str,
+    account_pubkey_b64: &str,
+    list_json: &str,
+) -> Result<()> {
+    let list: DeviceList = match serde_json::from_str(list_json) {
+        Ok(l) => l,
+        Err(_) => return Ok(()),
+    };
+    // Must be genuinely signed by the contact's account and name that account.
+    if verify_device_list(&list, account_pubkey_b64).is_err() {
+        return Ok(());
+    }
+    // Reject rollback: only accept a strictly newer version than what we hold.
+    if let Ok(Some(current)) = load_contact_device_list(profile, contact_name) {
+        if list.version <= current.version {
+            return Ok(());
+        }
+    }
+    save_contact_device_list(profile, contact_name, &list)
 }
 
 fn load_contact_device_list(profile: &Path, contact_name: &str) -> Result<Option<DeviceList>> {
@@ -9179,6 +9241,69 @@ mod tests {
                 .name,
             "bob"
         );
+    }
+
+    #[test]
+    fn store_pushed_device_list_accepts_newer_rejects_rollback_and_forgery() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = SigningKey::generate(&mut OsRng);
+        let acct_pub = B64.encode(account.verifying_key().to_bytes());
+        let d0 = sign_device_cert(
+            &account,
+            &acct_pub,
+            "p.onion",
+            &B64.encode([1u8; 32]),
+            1,
+            &["msg".to_string()],
+        );
+        let linked = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let d1 = sign_device_cert(
+            &account,
+            &linked,
+            "l.onion",
+            &B64.encode([2u8; 32]),
+            2,
+            &["msg".to_string()],
+        );
+        let json = |l: &DeviceList| serde_json::to_string(l).unwrap();
+        let ver = |dir: &std::path::Path| {
+            load_contact_device_list(dir, "bob")
+                .unwrap()
+                .map(|l| l.version)
+        };
+
+        // Valid list is stored.
+        let v2 = sign_device_list(&account, 2, vec![d0.clone(), d1]);
+        store_pushed_device_list(dir.path(), "bob", &acct_pub, &json(&v2)).unwrap();
+        assert_eq!(ver(dir.path()), Some(2));
+
+        // Older version is rejected (rollback protection).
+        let v1 = sign_device_list(&account, 1, vec![d0.clone()]);
+        store_pushed_device_list(dir.path(), "bob", &acct_pub, &json(&v1)).unwrap();
+        assert_eq!(ver(dir.path()), Some(2));
+
+        // Newer version is accepted.
+        let v3 = sign_device_list(&account, 3, vec![d0]);
+        store_pushed_device_list(dir.path(), "bob", &acct_pub, &json(&v3)).unwrap();
+        assert_eq!(ver(dir.path()), Some(3));
+
+        // A list signed by a different account (even at a huge version) is ignored.
+        let evil = SigningKey::generate(&mut OsRng);
+        let evil_pub = B64.encode(evil.verifying_key().to_bytes());
+        let forged = sign_device_list(
+            &evil,
+            99,
+            vec![sign_device_cert(
+                &evil,
+                &evil_pub,
+                "x.onion",
+                &B64.encode([9u8; 32]),
+                1,
+                &["msg".to_string()],
+            )],
+        );
+        store_pushed_device_list(dir.path(), "bob", &acct_pub, &json(&forged)).unwrap();
+        assert_eq!(ver(dir.path()), Some(3), "forged push ignored");
     }
 
     fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {

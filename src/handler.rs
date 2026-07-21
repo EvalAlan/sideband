@@ -100,6 +100,10 @@ pub async fn handle_inbound(
         return handle_presence(profile, contacts, msg);
     }
 
+    if msg.r#type == "device_list" {
+        return handle_device_list_push(profile, contacts, msg);
+    }
+
     if msg.r#type == "transport_props" {
         handle_transport_props(profile, contacts, msg).await?;
         if let Ok(contact_name) = resolve_contact_name_by_pubkey(contacts, &msg.from) {
@@ -383,6 +387,30 @@ pub(crate) async fn handle_receipt(
 /// Handle an inbound presence heartbeat (A7): verify it came from an accepted
 /// contact, then record their state with a receiver-stamped validity window.
 /// Never stored as a message or shown; `seq` gates out stale/reordered packets.
+/// A contact pushed us their updated signed device list (they linked or revoked
+/// a device). Verify it came from that contact's account and store it, so our
+/// send fan-out + inbound attribution learn their new device set.
+pub(crate) fn handle_device_list_push(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let (plaintext, verified) = match decrypt_and_verify(msg, profile, contacts) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    if !verified {
+        return Ok(());
+    }
+    // Map the sending device to an accepted, non-blocked contact, then apply the
+    // list only if it is signed by that contact's account (store enforces this).
+    let (name, account) = match crate::resolve_contact_by_sender(profile, contacts, &msg.from) {
+        Some(c) if !c.pending && !c.blocked => (c.name.clone(), c.pubkey_b64.clone()),
+        _ => return Ok(()),
+    };
+    crate::store_pushed_device_list(profile, &name, &account, &plaintext)
+}
+
 pub(crate) fn handle_presence(
     profile: &Path,
     contacts: &ContactsMap,
