@@ -54,10 +54,12 @@ three benefit; only wire the thin UI shells separately.
 
 ```bash
 ./build.sh              # all: tui + desktop + android
-./build.sh tui          # Rust CLI/TUI        → target/release/sideband
-./build.sh desktop      # Linux GUI AppImage  → dist/
+./build.sh tui          # Rust CLI/TUI
+./build.sh desktop      # Linux GUI AppImage
 ./build.sh android      # Rust jniLibs (4 ABIs) + release APK
 ```
+All final artifacts are **staged into `dist/`** (which is gitignored):
+`dist/sideband` (TUI), `dist/sideband.apk` (APK), `dist/Sideband-<arch>.AppImage`.
 `ANDROID_NDK_HOME` auto-detects from `~/Android/Sdk/ndk/*`.
 
 ## Test
@@ -117,7 +119,7 @@ everything inline" or "spawn a subagent for each thing."
 
 - **Stale binaries bite constantly.** The desktop GUI spawns `sideband` from
   `PATH` (`~/.local/bin/sideband`). After core changes you must
-  `./build.sh tui && cp target/release/sideband ~/.local/bin/sideband` or the
+  `./build.sh tui && cp dist/sideband ~/.local/bin/sideband` or the
   GUI runs old code. Android needs the `.so` rebuilt: `./build.sh android`. The
   TUI header shows its build commit (`@<hash>`) — if it's not a commit in
   `main`, it's stale.

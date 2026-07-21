@@ -4,10 +4,15 @@
 #
 #   ./build.sh                 # build everything (tui + desktop + android)
 #   ./build.sh all
-#   ./build.sh tui             # the Rust CLI/TUI binary -> target/release/sideband
-#   ./build.sh desktop         # the Linux desktop GUI as an AppImage -> dist/
+#   ./build.sh tui             # the Rust CLI/TUI binary
+#   ./build.sh desktop         # the Linux desktop GUI as an AppImage
 #   ./build.sh android         # Rust jniLibs for all ABIs + the release APK
 #   ./build.sh tui android     # any combination of targets
+#
+# All final artifacts are staged into dist/:
+#   dist/sideband                  # TUI/CLI binary
+#   dist/sideband.apk              # Android release APK
+#   dist/Sideband-<arch>.AppImage  # Linux desktop AppImage
 #
 # Env:
 #   ANDROID_NDK_HOME   NDK path (auto-detected from ~/Android/Sdk/ndk/* if unset)
@@ -17,6 +22,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUI_DIR="${REPO_ROOT}/gui"
+DIST_DIR="${REPO_ROOT}/dist"
 cd "${REPO_ROOT}"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -24,8 +30,17 @@ log()  { echo -e "${GREEN}[build]${NC} $*"; }
 warn() { echo -e "${YELLOW}[build]${NC} $*"; }
 err()  { echo -e "${RED}[build]${NC} $*" >&2; }
 
+# Copy a freshly-built artifact into dist/ under a stable name. All final
+# artifacts live in dist/ so builds don't scatter across target/ and gui/build/.
+stage_artifact() {
+  local src="$1" name="$2"
+  mkdir -p "${DIST_DIR}"
+  cp -f "${src}" "${DIST_DIR}/${name}"
+  log "Staged ${DIST_DIR}/${name}"
+}
+
 usage() {
-  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -60,7 +75,7 @@ resolve_ndk() {
 build_tui() {
   log "Building Rust CLI/TUI (release)..."
   cargo build --release --bin sideband
-  log "Built ${REPO_ROOT}/target/release/sideband"
+  stage_artifact "${REPO_ROOT}/target/release/sideband" "sideband"
 }
 
 # --- android -----------------------------------------------------------------
@@ -103,7 +118,7 @@ build_android() {
 
   log "Building the release APK..."
   ( cd "${GUI_DIR}" && "$FLUTTER" build apk --release )
-  log "Built ${GUI_DIR}/build/app/outputs/flutter-apk/app-release.apk"
+  stage_artifact "${GUI_DIR}/build/app/outputs/flutter-apk/app-release.apk" "sideband.apk"
 }
 
 # --- desktop (Linux AppImage) ------------------------------------------------
@@ -120,7 +135,7 @@ build_desktop() {
 
   local build_dir="${GUI_DIR}/build/linux/${flutter_arch}/release/bundle"
   local appdir="${GUI_DIR}/AppDir"
-  local out_dir="${REPO_ROOT}/dist"
+  local out_dir="${DIST_DIR}"
 
   build_tui
 
@@ -284,4 +299,8 @@ for t in "${targets[@]}"; do
   esac
 done
 
+if [[ -d "${DIST_DIR}" ]]; then
+  log "Artifacts in dist/:"
+  ( cd "${DIST_DIR}" && ls -1sh sideband sideband.apk Sideband-*.AppImage 2>/dev/null ) | sed 's/^/  /'
+fi
 log "Done."

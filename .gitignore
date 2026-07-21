@@ -1,10 +1,15 @@
 /target/
 /profiles/
+/dist/
 .tools/
+.hermes/
 *.log
 *.db
 
+# Flutter / Android build output + AppImage scaffolding (all regenerable)
+gui/build/
+gui/AppDir/
+gui/android/app/src/main/jniLibs/
+
 # CI AppImage artifacts (should never be committed)
 sideband-appimage-*
-dist/Sideband-*.AppImage
-gui/android/app/src/main/jniLibs/
