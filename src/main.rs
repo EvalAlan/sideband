@@ -5674,7 +5674,6 @@ fn primary_handle_pairing_request(
 }
 
 /// New device: apply the primary's sealed response, becoming a linked device.
-#[allow(dead_code)] // consumed by the pairing socket transport + GUI
 fn new_device_apply_pairing_response(
     profile: &Path,
     secret: &[u8],
@@ -5682,6 +5681,93 @@ fn new_device_apply_pairing_response(
 ) -> Result<()> {
     let seed = pairing_open(secret, sealed_response)?;
     apply_link_seed(profile, &seed, &B64.encode(secret))
+}
+
+// ── Multi-device: pairing socket transport (LAN TCP) ────────────────────────
+//
+// The pairing handshake bytes ride a direct TCP connection between the two
+// devices (they are next to each other — LAN is the natural channel). Frames are
+// length-prefixed. The primary binds + shows the addr in the QR; the new device
+// dials it. Everything on the wire is already sealed under the pairing secret.
+
+const PAIRING_MAX_FRAME: usize = 64 * 1024 * 1024; // seed carries history
+const PAIRING_ACCEPT_TIMEOUT: Duration = Duration::from_secs(180);
+const PAIRING_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn pairing_write_frame(stream: &mut tokio::net::TcpStream, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let len = u32::try_from(bytes.len()).context("pairing frame too large")?;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(bytes).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn pairing_read_frame(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > PAIRING_MAX_FRAME {
+        return Err(anyhow!("pairing frame exceeds {PAIRING_MAX_FRAME} bytes"));
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Primary: bind a pairing listener. Returns the listener + the concrete addr to
+/// encode into the QR offer (so an ephemeral `:0` port is resolved).
+#[allow(dead_code)] // wired into the device CLI/FFI + GUI
+async fn pairing_bind(bind_addr: &str) -> Result<(tokio::net::TcpListener, std::net::SocketAddr)> {
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind pairing listener on {bind_addr}"))?;
+    let addr = listener.local_addr()?;
+    Ok((listener, addr))
+}
+
+/// Primary: accept exactly one pairing connection, complete the handshake (adds
+/// the new device to our account), and return the newly-linked device pubkey.
+/// The caller pushes the updated device list to contacts afterwards.
+#[allow(dead_code)] // wired into the device CLI/FFI + GUI
+async fn pairing_accept_one(
+    profile: &Path,
+    listener: tokio::net::TcpListener,
+    secret: &[u8],
+) -> Result<String> {
+    let (mut stream, _peer) = tokio::time::timeout(PAIRING_ACCEPT_TIMEOUT, listener.accept())
+        .await
+        .context("timed out waiting for a device to pair")??;
+    let sealed_req = pairing_read_frame(&mut stream).await?;
+    let sealed_resp = primary_handle_pairing_request(profile, secret, &sealed_req)?;
+    pairing_write_frame(&mut stream, &sealed_resp).await?;
+    // Re-open the (already-verified) request only to report which device linked.
+    let req: LinkRequest = serde_json::from_slice(&pairing_open(secret, &sealed_req)?)?;
+    Ok(req.device_pubkey_b64)
+}
+
+/// New device: dial the primary and complete the handshake, becoming a linked
+/// secondary of the account.
+#[allow(dead_code)] // wired into the device CLI/FFI + GUI
+async fn pairing_dial(
+    profile: &Path,
+    addr: &str,
+    secret: &[u8],
+    onion: &str,
+    name: &str,
+) -> Result<()> {
+    let mut stream = tokio::time::timeout(
+        PAIRING_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .with_context(|| format!("timed out connecting to {addr}"))?
+    .with_context(|| format!("connect to {addr}"))?;
+    let sealed_req = new_device_pairing_request(profile, secret, onion, name)?;
+    pairing_write_frame(&mut stream, &sealed_req).await?;
+    let sealed_resp = pairing_read_frame(&mut stream).await?;
+    new_device_apply_pairing_response(profile, secret, &sealed_resp)
 }
 
 /// Export a profile to `out_path` (encrypted, 0o600). Returns the byte count.

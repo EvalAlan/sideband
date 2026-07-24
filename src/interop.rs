@@ -893,3 +893,62 @@ async fn lan_two_instances_exchange_a_message_over_localhost() {
     assert!(found, "a message sent over LAN must land in Bob's history");
     pump.abort();
 }
+
+#[tokio::test]
+async fn pairing_over_tcp_links_a_new_device() {
+    use crate::{
+        account_pubkey, build_self_device_list, init_profile_with_name, is_secondary_device,
+        load_device_list, load_signing_key, pairing_accept_one, pairing_bind, pairing_dial, B64,
+    };
+
+    // Primary with an initialized self device list.
+    let primary = tempfile::tempdir().unwrap();
+    init_profile_with_name(primary.path(), "Primary").unwrap();
+    let acct_pub = B64.encode(
+        load_signing_key(primary.path())
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    );
+    build_self_device_list(primary.path(), "primary.onion", 1).unwrap();
+
+    let secret = vec![5u8; 32];
+    let (listener, addr) = pairing_bind("127.0.0.1:0").await.unwrap();
+
+    // Primary accepts one pairing connection in the background.
+    let primary_path = primary.path().to_path_buf();
+    let secret_p = secret.clone();
+    let accept =
+        tokio::spawn(async move { pairing_accept_one(&primary_path, listener, &secret_p).await });
+
+    // New device dials the primary over localhost TCP.
+    let newdev = tempfile::tempdir().unwrap();
+    init_profile_with_name(newdev.path(), "Laptop").unwrap();
+    let newdev_pub = B64.encode(
+        load_signing_key(newdev.path())
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    );
+    pairing_dial(
+        newdev.path(),
+        &addr.to_string(),
+        &secret,
+        "newdev.onion",
+        "Laptop",
+    )
+    .await
+    .unwrap();
+
+    // Primary reports the linked device; it now belongs to the account.
+    let granted = accept.await.unwrap().unwrap();
+    assert_eq!(granted, newdev_pub);
+    assert!(is_secondary_device(newdev.path()));
+    assert_eq!(account_pubkey(newdev.path()).unwrap(), acct_pub);
+    let list = load_device_list(primary.path()).unwrap().unwrap();
+    assert_eq!(list.devices.len(), 2);
+    assert!(list
+        .devices
+        .iter()
+        .any(|d| d.device_pubkey_b64 == newdev_pub));
+}
