@@ -4937,25 +4937,28 @@ async fn main() -> Result<()> {
             DeviceAction::List { profile, json } => {
                 let profile = profile.path()?;
                 ensure_profile(&profile)?;
-                match load_device_list(&profile)? {
-                    Some(list) if json => println!("{}", serde_json::to_string(&list)?),
-                    Some(list) => {
-                        println!(
-                            "account {} — {} device(s), v{}",
-                            list.account_pubkey_b64,
-                            list.devices.len(),
-                            list.version
-                        );
-                        for d in &list.devices {
-                            let tag = if d.device_pubkey_b64 == list.account_pubkey_b64 {
-                                "[primary]"
-                            } else {
-                                "[linked] "
-                            };
-                            println!("  {tag} {} {}", d.onion, d.device_pubkey_b64);
+                if json {
+                    println!("{}", serde_json::to_string(&device_list_json(&profile)?)?);
+                } else {
+                    match load_device_list(&profile)? {
+                        Some(list) => {
+                            println!(
+                                "account {} — {} device(s), v{}",
+                                list.account_pubkey_b64,
+                                list.devices.len(),
+                                list.version
+                            );
+                            for d in &list.devices {
+                                let tag = if d.device_pubkey_b64 == list.account_pubkey_b64 {
+                                    "[primary]"
+                                } else {
+                                    "[linked] "
+                                };
+                                println!("  {tag} {} {}", d.onion, d.device_pubkey_b64);
+                            }
                         }
+                        None => println!("no device list yet (single-device account)"),
                     }
-                    None => println!("no device list yet (single-device account)"),
                 }
                 Ok(())
             }
@@ -4992,18 +4995,8 @@ async fn main() -> Result<()> {
             } => {
                 let profile = profile.path()?;
                 ensure_profile(&profile)?;
-                let offer: PairingOffer =
-                    serde_json::from_str(&offer).context("parse pairing offer")?;
-                let secret = B64
-                    .decode(offer.secret_b64.as_bytes())
-                    .context("decode pairing secret")?;
-                let onion = if onion.is_empty() {
-                    "(unknown)"
-                } else {
-                    &onion
-                };
-                pairing_dial(&profile, &offer.addr, &secret, onion, &name).await?;
-                println!("linked to account {}", offer.account_pubkey_b64);
+                pairing_link_from_offer(&profile, &offer, &onion, &name).await?;
+                println!("linked to account {}", account_pubkey(&profile)?);
                 Ok(())
             }
             DeviceAction::Revoke { profile, pubkey } => {
@@ -5903,6 +5896,39 @@ async fn pairing_dial(
     new_device_apply_pairing_response(profile, secret, &sealed_resp)
 }
 
+/// New device: link to an account using a pairing offer (the QR/JSON printed by
+/// the primary's `device pair`). Parses the offer and dials.
+pub(crate) async fn pairing_link_from_offer(
+    profile: &Path,
+    offer_json: &str,
+    onion: &str,
+    name: &str,
+) -> Result<()> {
+    let offer: PairingOffer = serde_json::from_str(offer_json).context("parse pairing offer")?;
+    let secret = B64
+        .decode(offer.secret_b64.as_bytes())
+        .context("decode pairing secret")?;
+    let onion = if onion.trim().is_empty() {
+        "(unknown)"
+    } else {
+        onion
+    };
+    pairing_dial(profile, &offer.addr, &secret, onion, name).await
+}
+
+/// This account's device list as JSON (for the FFI). A single-device account
+/// (no list yet) yields an empty `devices` array under the account key.
+pub(crate) fn device_list_json(profile: &Path) -> Result<serde_json::Value> {
+    match load_device_list(profile)? {
+        Some(list) => Ok(serde_json::to_value(&list)?),
+        None => Ok(serde_json::json!({
+            "account_pubkey_b64": account_pubkey(profile)?,
+            "version": 0,
+            "devices": [],
+        })),
+    }
+}
+
 /// Export a profile to `out_path` (encrypted, 0o600). Returns the byte count.
 pub(crate) fn export_profile_to(profile: &Path, out_path: &Path, passphrase: &str) -> Result<u64> {
     let bytes = export_profile_bytes(profile, passphrase)?;
@@ -6396,8 +6422,10 @@ fn add_device_to_self_list(
 
 /// Primary-only: remove a linked device (revoke), bump the version, re-sign, and
 /// persist. Device 0 (the primary itself) cannot be revoked.
-#[allow(dead_code)] // wired into the device CLI + link flow (Phase 3 continued)
-fn revoke_device_from_self_list(profile: &Path, device_pubkey_b64: &str) -> Result<DeviceList> {
+pub(crate) fn revoke_device_from_self_list(
+    profile: &Path,
+    device_pubkey_b64: &str,
+) -> Result<DeviceList> {
     let account_key = load_signing_key(profile)?;
     let account_pubkey_b64 = B64.encode(account_key.verifying_key().to_bytes());
     if device_pubkey_b64 == account_pubkey_b64 {

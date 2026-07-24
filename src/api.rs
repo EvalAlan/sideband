@@ -383,6 +383,29 @@ pub fn api_panic_wipe(profile_path: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Multi-device: this account's device list as JSON.
+pub fn api_device_list(profile_path: &str) -> Result<serde_json::Value> {
+    let profile = expand_profile(profile_path);
+    crate::device_list_json(&profile)
+}
+
+/// Multi-device: revoke a linked device by pubkey. Returns the new device count.
+pub fn api_device_revoke(profile_path: &str, pubkey: &str) -> Result<serde_json::Value> {
+    let profile = expand_profile(profile_path);
+    let list = crate::revoke_device_from_self_list(&profile, pubkey)?;
+    Ok(serde_json::json!({ "version": list.version, "devices": list.devices.len() }))
+}
+
+/// Multi-device: link THIS device to an account using a pairing offer (the
+/// primary's QR/JSON). Dials the primary and applies the seed.
+pub fn api_device_link(profile_path: &str, offer_json: &str, name: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    shared_runtime()?.block_on(crate::pairing_link_from_offer(
+        &profile, offer_json, "", name,
+    ))?;
+    Ok(true)
+}
+
 /// Whether LAN discovery + delivery is enabled (default off).
 pub fn api_get_lan_enabled(profile_path: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
@@ -1007,6 +1030,44 @@ pub extern "C" fn sideband_api_db_set_passphrase(
 #[no_mangle]
 pub extern "C" fn sideband_api_panic_wipe(profile_path: *const c_char) -> *mut c_char {
     json_response((|| api_panic_wipe(cstr_arg(profile_path, "profile_path")?))())
+}
+
+/// Multi-device: this account's device list as JSON.
+#[no_mangle]
+pub extern "C" fn sideband_api_device_list(profile_path: *const c_char) -> *mut c_char {
+    json_response((|| {
+        api_device_list(cstr_arg(profile_path, "profile_path")?)
+    })())
+}
+
+/// Multi-device: revoke a linked device by pubkey.
+#[no_mangle]
+pub extern "C" fn sideband_api_device_revoke(
+    profile_path: *const c_char,
+    pubkey: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_device_revoke(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(pubkey, "pubkey")?,
+        )
+    })())
+}
+
+/// Multi-device: link this device to an account using a pairing offer.
+#[no_mangle]
+pub extern "C" fn sideband_api_device_link(
+    profile_path: *const c_char,
+    offer_json: *const c_char,
+    name: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_device_link(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(offer_json, "offer_json")?,
+            cstr_arg(name, "name")?,
+        )
+    })())
 }
 
 /// Whether LAN discovery + delivery is enabled (default off).
