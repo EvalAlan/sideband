@@ -197,16 +197,30 @@ protection); `broadcast_self_device_list` sends ours to all contacts (`2fa3787`)
 `primary_handle_pairing_request` → `new_device_apply_pairing_response`; full
 in-process round-trip test links a new device (`8b8a0c6`).
 
-**The entire crypto + protocol core of independent-peers multi-device is now
-complete and tested.** NEXT — Phase 3e, the **wire + UI plumbing** (genuinely
-wants ~2 endpoints to validate): the pairing **socket transport** (a LAN/Tor
-listener running `primary_handle_pairing_request` + a dialer running the new-
-device side, then `broadcast_self_device_list`) — testable with two processes on
-localhost like the two-instance LAN test; a **CLI/FFI** surface (`device
-list`/`pair`/`link`/`revoke`); and the GUI **Linked Devices** screen (show QR,
-list devices, unlink). Everything above is staged under `allow(dead_code)` until
-this wires it in. Single-device stays unchanged; all multi-device paths are inert
-until a contact/account actually has >1 device.
+**Phase 3e (wire + UI) — DONE; multi-device is usable end to end.** Pairing
+socket transport (LAN TCP, `pairing_bind`/`pairing_accept_one`/`pairing_dial`,
+length-framed; interop test over 127.0.0.1) `028ee59`. `device
+list`/`pair`/`link`/`revoke` CLI, verified across two processes `e8bf838`.
+Desktop **Linked Devices** screen (Settings → Linked devices: host pairing + show
+offer as QR, link-by-paste, revoke) `7f37fdb`. Device FFI
+(`sideband_api_device_list`/`_revoke`/`_link`) `b0b1289`. `qr --text` command +
+desktop QR render + **Android Linked Devices** (scan-to-link via the new FFI +
+`_MobileApi.deviceList/deviceRevoke/deviceLink`) `4072bcb`.
+
+**Cross-device flow that works today:** on the primary (desktop) → Settings →
+Linked devices → Link a new device → it shows a **QR**; on the other device
+(desktop paste, or Android **scan**) → link. Verified via CLI two-process smoke
+(pair→link→revoke, v1→v2→v3) and the interop TCP test. Remaining niceties (not
+blockers): the primary should `broadcast_self_device_list` after link/revoke from
+the serve loop so contacts auto-learn the device; and phone-as-primary pairing
+host (two-phase FFI) isn't wired (link a phone *from* a desktop for now). Only
+real two-radio LAN validation needs the user's hardware. Single-device stays
+byte-for-byte unchanged.
+
+**Multi-device epic (independent peers): functionally COMPLETE** — crypto core →
+CLI → desktop GUI → FFI → Android GUI, all tested/built. Phase 4 (self-sync of
+sent messages/read-state across your own devices) is a *future enhancement*, not
+required for linking to work.
 
 **At-rest encryption (opt-in app lock) — DONE.** `messages.db` is **SQLCipher**
 (`rusqlite bundled-sqlcipher-vendored-openssl`; Android 4-ABI verified);
