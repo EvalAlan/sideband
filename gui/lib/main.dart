@@ -940,6 +940,40 @@ class _Cli {
         .existsSync();
   }
 
+  // ── Multi-device (linked devices) ──────────────────────────────────────────
+
+  /// The account's devices as parsed maps (each has device_pubkey_b64, onion,
+  /// …). Empty for a single-device account (no list yet).
+  Future<Map<String, dynamic>> deviceList() async {
+    final raw = await _run(['device', 'list', '--profile', profile, '--json']);
+    try {
+      final d = jsonDecode(raw);
+      if (d is Map<String, dynamic> && d['devices'] is List) return d;
+    } catch (_) {}
+    return {'devices': <dynamic>[], 'account_pubkey_b64': '', 'version': 0};
+  }
+
+  Future<String> deviceRevoke(String pubkey) =>
+      _run(['device', 'revoke', '--profile', profile, '--pubkey', pubkey]);
+
+  /// This device links to another account using a pasted/scanned offer.
+  Future<String> deviceLink(String offer, {String name = 'desktop'}) => _run(
+      ['device', 'link', '--profile', profile, '--offer', offer, '--name', name]);
+
+  /// A LAN-reachable IPv4 address to host pairing on, so a second device on the
+  /// same network can connect. Falls back to localhost (same-machine only).
+  Future<String> _pairBindHost() async {
+    try {
+      for (final iface in await NetworkInterface.list(
+          type: InternetAddressType.IPv4, includeLoopback: false)) {
+        for (final a in iface.addresses) {
+          if (!a.isLoopback) return a.address;
+        }
+      }
+    } catch (_) {}
+    return '127.0.0.1';
+  }
+
   Future<String> _run(List<String> args) async {
     final r = await Process.run(_bin, args, environment: _dbEnv);
     if (r.exitCode != 0) {
@@ -6172,6 +6206,239 @@ class _ChatScreenState extends State<_ChatScreen>
     }
   }
 
+  /// Desktop Linked Devices manager: view the account's devices, host a pairing
+  /// session (show the offer for another device to use), link this device to an
+  /// account by pasting an offer, and remove a device. Uses the `device` CLI.
+  Future<void> _showLinkedDevicesDialog() async {
+    Map<String, dynamic> data;
+    try {
+      data = await _cli.deviceList();
+    } catch (e) {
+      if (mounted) _showInfo('Linked devices', '$e');
+      return;
+    }
+    if (!mounted) return;
+    Process? pairProc;
+    String? offer;
+    String status = '';
+    final linkCtl = TextEditingController();
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setInner) {
+          Future<void> refresh() async {
+            try {
+              data = await _cli.deviceList();
+            } catch (e) {
+              status = '$e';
+            }
+            setInner(() {});
+          }
+
+          Future<void> startPairing() async {
+            try {
+              final host = await _cli._pairBindHost();
+              final proc = await Process.start(
+                _cli.bin,
+                ['device', 'pair', '--profile', _cli.profile, '--bind', '$host:0'],
+                environment: _cli.dbKey != null
+                    ? {'SIDEBAND_DB_KEY': _cli.dbKey!}
+                    : null,
+              );
+              pairProc = proc;
+              setInner(() {
+                offer = null;
+                status = 'starting…';
+              });
+              proc.stdout
+                  .transform(utf8.decoder)
+                  .transform(const LineSplitter())
+                  .listen((line) {
+                final t = line.trim();
+                if (t.startsWith('{') && offer == null) {
+                  setInner(() {
+                    offer = t;
+                    status = 'Waiting for a device to connect on the same network…';
+                  });
+                }
+              });
+              unawaited(proc.exitCode.then((code) async {
+                pairProc = null;
+                if (code == 0) {
+                  offer = null;
+                  status = 'Device linked.';
+                  await refresh();
+                } else {
+                  setInner(() {
+                    offer = null;
+                    status = 'Pairing ended.';
+                  });
+                }
+              }));
+            } catch (e) {
+              setInner(() => status = '$e');
+            }
+          }
+
+          void cancelPairing() {
+            pairProc?.kill();
+            pairProc = null;
+            setInner(() {
+              offer = null;
+              status = '';
+            });
+          }
+
+          final devices = (data['devices'] as List?) ?? const [];
+          final account = data['account_pubkey_b64'] as String? ?? '';
+
+          return AlertDialog(
+            backgroundColor: _t.surface,
+            title: Text('Linked devices', style: TextStyle(color: _t.text)),
+            content: SizedBox(
+              width: 520,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (devices.isEmpty)
+                      Text('This is a single-device account.',
+                          style: TextStyle(color: _t.textDim)),
+                    for (final d in devices.cast<Map<String, dynamic>>())
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          d['device_pubkey_b64'] == account
+                              ? Icons.smartphone
+                              : Icons.devices,
+                          color: _t.textDim,
+                        ),
+                        title: Text(
+                          d['device_pubkey_b64'] == account
+                              ? 'This device (primary)'
+                              : (d['onion'] as String? ?? 'linked device'),
+                          style: TextStyle(color: _t.text, fontSize: 14),
+                        ),
+                        subtitle: Text(
+                          '${d['device_pubkey_b64']}'.substring(0, 16),
+                          style: TextStyle(
+                              color: _t.textDim,
+                              fontFamily: 'monospace',
+                              fontSize: 11),
+                        ),
+                        trailing: d['device_pubkey_b64'] == account
+                            ? null
+                            : IconButton(
+                                icon: Icon(Icons.link_off,
+                                    color: Colors.red.shade400, size: 20),
+                                tooltip: 'Remove device',
+                                onPressed: () async {
+                                  try {
+                                    await _cli.deviceRevoke(
+                                        d['device_pubkey_b64'] as String);
+                                    await refresh();
+                                  } catch (e) {
+                                    setInner(() => status = '$e');
+                                  }
+                                },
+                              ),
+                      ),
+                    const Divider(height: 24),
+                    // Host a pairing session for a new device.
+                    if (offer == null)
+                      FilledButton.icon(
+                        icon: const Icon(Icons.add_link, size: 18),
+                        label: const Text('Link a new device'),
+                        onPressed: pairProc == null ? startPairing : null,
+                      )
+                    else ...[
+                      Text('On the new device, choose “Link to an account” and '
+                          'enter this offer:',
+                          style: TextStyle(color: _t.textDim, fontSize: 12.5)),
+                      const SizedBox(height: 8),
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: _t.bg,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: SelectableText(
+                          offer!,
+                          style: TextStyle(
+                              color: _t.text,
+                              fontFamily: 'monospace',
+                              fontSize: 11),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(children: [
+                        TextButton.icon(
+                          icon: const Icon(Icons.copy, size: 16),
+                          label: const Text('Copy'),
+                          onPressed: () => Clipboard.setData(
+                              ClipboardData(text: offer!)),
+                        ),
+                        const Spacer(),
+                        TextButton(
+                            onPressed: cancelPairing,
+                            child: const Text('Cancel')),
+                      ]),
+                    ],
+                    if (status.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(status,
+                          style: TextStyle(color: _t.textDim, fontSize: 12)),
+                    ],
+                    const Divider(height: 24),
+                    // Link THIS device to an account using a pasted offer.
+                    Text('Link this device to another account',
+                        style: TextStyle(color: _t.text, fontSize: 13)),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: linkCtl,
+                      style: TextStyle(color: _t.text, fontSize: 12),
+                      minLines: 1,
+                      maxLines: 3,
+                      decoration: const InputDecoration(
+                          hintText: 'Paste the offer from the primary device'),
+                    ),
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: FilledButton(
+                        onPressed: () async {
+                          final o = linkCtl.text.trim();
+                          if (o.isEmpty) return;
+                          try {
+                            await _cli.deviceLink(o);
+                            setInner(() => status = 'Linked to account.');
+                            await refresh();
+                          } catch (e) {
+                            setInner(() => status = '$e');
+                          }
+                        },
+                        child: const Text('Link this device'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('Close'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    pairProc?.kill();
+  }
+
   Future<String?> _promptPassphrase({
     required String title,
     String? message,
@@ -6379,6 +6646,18 @@ class _ChatScreenState extends State<_ChatScreen>
                       await _showAppLockDialog();
                     },
                   ),
+                  if (!_canUseMobileBackend)
+                    ListTile(
+                      leading: const Icon(Icons.devices_outlined),
+                      title: const Text('Linked devices'),
+                      subtitle: const Text(
+                          'Use this account on another device (pair over LAN)'),
+                      trailing: const Icon(Icons.chevron_right, size: 20),
+                      onTap: () async {
+                        Navigator.of(dialogContext).pop();
+                        await _showLinkedDevicesDialog();
+                      },
+                    ),
                   SwitchListTile(
                     secondary: const Icon(Icons.notifications_active_outlined),
                     title: Text(_canUseMobileBackend
