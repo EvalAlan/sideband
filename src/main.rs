@@ -264,6 +264,11 @@ enum CommandKind {
         #[command(subcommand)]
         action: ContactAction,
     },
+    /// Manage this account's devices (multi-device: list / pair / link / revoke).
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
     Group {
         #[command(subcommand)]
         action: GroupAction,
@@ -326,6 +331,49 @@ enum CommandKind {
         overwrite: bool,
     },
     Tui(ProfileArg),
+}
+
+#[derive(Debug, Subcommand)]
+enum DeviceAction {
+    /// Show this account's linked devices.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Primary: host a pairing session — print a pairing offer, then wait for a
+    /// new device to connect and link. Default bind is localhost (two terminals);
+    /// pass --bind <lan-ip>:0 to pair a device on the LAN.
+    Pair {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: String,
+        /// This (primary) device's onion, recorded in its device-0 cert.
+        #[arg(long, default_value = "")]
+        onion: String,
+    },
+    /// New device: link to a primary using the offer JSON it printed.
+    Link {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        offer: String,
+        /// This device's onion address to advertise.
+        #[arg(long, default_value = "")]
+        onion: String,
+        /// A label for this device.
+        #[arg(long, default_value = "device")]
+        name: String,
+    },
+    /// Primary: revoke a linked device by its Ed25519 pubkey (base64).
+    Revoke {
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[arg(long)]
+        pubkey: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -4885,6 +4933,91 @@ async fn main() -> Result<()> {
             println!("ok");
             Ok(())
         }
+        CommandKind::Device { action } => match action {
+            DeviceAction::List { profile, json } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                match load_device_list(&profile)? {
+                    Some(list) if json => println!("{}", serde_json::to_string(&list)?),
+                    Some(list) => {
+                        println!(
+                            "account {} — {} device(s), v{}",
+                            list.account_pubkey_b64,
+                            list.devices.len(),
+                            list.version
+                        );
+                        for d in &list.devices {
+                            let tag = if d.device_pubkey_b64 == list.account_pubkey_b64 {
+                                "[primary]"
+                            } else {
+                                "[linked] "
+                            };
+                            println!("  {tag} {} {}", d.onion, d.device_pubkey_b64);
+                        }
+                    }
+                    None => println!("no device list yet (single-device account)"),
+                }
+                Ok(())
+            }
+            DeviceAction::Pair {
+                profile,
+                bind,
+                onion,
+            } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                // Ensure our own device-0 list exists before we can add another.
+                if load_device_list(&profile)?.is_none() {
+                    let onion = if onion.is_empty() {
+                        "(unknown)"
+                    } else {
+                        &onion
+                    };
+                    build_self_device_list(&profile, onion, 1)?;
+                }
+                let (listener, addr) = pairing_bind(&bind).await?;
+                let (offer, secret) = new_pairing_offer(&profile, &addr.to_string())?;
+                println!("{}", serde_json::to_string(&offer)?);
+                eprintln!("waiting for a device to connect on {addr} …");
+                let device = pairing_accept_one(&profile, listener, &secret).await?;
+                eprintln!("linked device {device}");
+                eprintln!("(run `serve` to push the updated device list to your contacts)");
+                Ok(())
+            }
+            DeviceAction::Link {
+                profile,
+                offer,
+                onion,
+                name,
+            } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let offer: PairingOffer =
+                    serde_json::from_str(&offer).context("parse pairing offer")?;
+                let secret = B64
+                    .decode(offer.secret_b64.as_bytes())
+                    .context("decode pairing secret")?;
+                let onion = if onion.is_empty() {
+                    "(unknown)"
+                } else {
+                    &onion
+                };
+                pairing_dial(&profile, &offer.addr, &secret, onion, &name).await?;
+                println!("linked to account {}", offer.account_pubkey_b64);
+                Ok(())
+            }
+            DeviceAction::Revoke { profile, pubkey } => {
+                let profile = profile.path()?;
+                ensure_profile(&profile)?;
+                let list = revoke_device_from_self_list(&profile, &pubkey)?;
+                println!(
+                    "revoked; device list now v{} with {} device(s)",
+                    list.version,
+                    list.devices.len()
+                );
+                Ok(())
+            }
+        },
         CommandKind::Contact { action } => match action {
             ContactAction::Add {
                 profile,
