@@ -956,6 +956,13 @@ class _Cli {
   Future<String> deviceRevoke(String pubkey) =>
       _run(['device', 'revoke', '--profile', profile, '--pubkey', pubkey]);
 
+  /// QR matrix (rows of "0/1") for arbitrary text, for _QrPainter.
+  Future<List<String>> qrMatrix(String text) async {
+    final raw = await _run(['qr', '--text', text]);
+    final d = jsonDecode(raw);
+    return (d as List).map((e) => e.toString()).toList();
+  }
+
   /// This device links to another account using a pasted/scanned offer.
   Future<String> deviceLink(String offer, {String name = 'desktop'}) => _run(
       ['device', 'link', '--profile', profile, '--offer', offer, '--name', name]);
@@ -1814,6 +1821,9 @@ class _MobileApi {
   _Ptr2 get _cancelTransfer => _lookup2('sideband_api_cancel_transfer');
   _Ptr1 get _dbStatus => _lookup1('sideband_api_db_status');
   _Ptr1 get _panicWipe => _lookup1('sideband_api_panic_wipe');
+  _Ptr1 get _deviceListPtr => _lookup1('sideband_api_device_list');
+  _Ptr2 get _deviceRevokePtr => _lookup2('sideband_api_device_revoke');
+  _Ptr3 get _deviceLinkPtr => _lookup3('sideband_api_device_link');
   _Ptr2 get _dbUnlock => _lookup2('sideband_api_db_unlock');
   _Ptr2 get _dbSetPassphrase => _lookup2('sideband_api_db_set_passphrase');
 
@@ -1833,6 +1843,29 @@ class _MobileApi {
 
   Future<void> panicWipe() async {
     _withCString1<Object?>(await profilePath(), _panicWipe);
+  }
+
+  Future<Map<String, dynamic>> deviceList() async {
+    final d = _withCString1<Map<dynamic, dynamic>>(
+        await profilePath(), _deviceListPtr);
+    return Map<String, dynamic>.from(d);
+  }
+
+  Future<void> deviceRevoke(String pubkey) async {
+    _withCString2<Object?>(await profilePath(), pubkey, _deviceRevokePtr);
+  }
+
+  Future<void> deviceLink(String offer, {String name = 'phone'}) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final coffer = offer.toNativeUtf8();
+    final cname = name.toNativeUtf8();
+    try {
+      _decode<Object?>(_deviceLinkPtr(profile, coffer, cname));
+    } finally {
+      calloc.free(profile);
+      calloc.free(coffer);
+      calloc.free(cname);
+    }
   }
 
   String? _profilePath;
@@ -6220,6 +6253,7 @@ class _ChatScreenState extends State<_ChatScreen>
     if (!mounted) return;
     Process? pairProc;
     String? offer;
+    List<String>? offerQr;
     String status = '';
     final linkCtl = TextEditingController();
 
@@ -6261,6 +6295,10 @@ class _ChatScreenState extends State<_ChatScreen>
                     offer = t;
                     status = 'Waiting for a device to connect on the same network…';
                   });
+                  _cli
+                      .qrMatrix(t)
+                      .then((m) => setInner(() => offerQr = m))
+                      .catchError((_) {});
                 }
               });
               unawaited(proc.exitCode.then((code) async {
@@ -6354,9 +6392,25 @@ class _ChatScreenState extends State<_ChatScreen>
                         onPressed: pairProc == null ? startPairing : null,
                       )
                     else ...[
-                      Text('On the new device, choose “Link to an account” and '
-                          'enter this offer:',
+                      Text('On the new device, choose “Link this device” and '
+                          'scan this code (or paste the offer):',
                           style: TextStyle(color: _t.textDim, fontSize: 12.5)),
+                      const SizedBox(height: 8),
+                      if (offerQr != null)
+                        Center(
+                          child: Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: SizedBox(
+                              width: 220,
+                              height: 220,
+                              child: CustomPaint(painter: _QrPainter(offerQr!)),
+                            ),
+                          ),
+                        ),
                       const SizedBox(height: 8),
                       Container(
                         padding: const EdgeInsets.all(10),
@@ -6437,6 +6491,156 @@ class _ChatScreenState extends State<_ChatScreen>
       ),
     );
     pairProc?.kill();
+  }
+
+  /// Scan a single QR and return its raw string (Android only).
+  Future<String?> _scanQrString(String title) async {
+    if (!_canUseMobileBackend) return null;
+    final controller =
+        MobileScannerController(cameraResolution: const Size(1280, 720));
+    try {
+      return await showDialog<String>(
+        context: context,
+        builder: (dc) => AlertDialog(
+          backgroundColor: _t.surface,
+          title: Text(title, style: TextStyle(color: _t.text)),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 320,
+            child: MobileScanner(
+              controller: controller,
+              onDetect: (capture) {
+                for (final b in capture.barcodes) {
+                  final v = b.rawValue;
+                  if (v != null && v.trim().isNotEmpty) {
+                    Navigator.pop(dc, v);
+                    return;
+                  }
+                }
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(dc),
+                child: const Text('Cancel')),
+          ],
+        ),
+      );
+    } finally {
+      await controller.dispose();
+    }
+  }
+
+  /// Mobile Linked Devices: view the account's devices, scan a primary's QR to
+  /// link this phone, and remove a device. (Hosting a pairing session from the
+  /// phone is not wired yet — link a phone from a desktop/primary.)
+  Future<void> _showMobileLinkedDevicesDialog() async {
+    Map<String, dynamic> data;
+    try {
+      data = await _mobile!.deviceList();
+    } catch (e) {
+      if (mounted) _showInfo('Linked devices', '$e');
+      return;
+    }
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setInner) {
+          Future<void> refresh() async {
+            try {
+              data = await _mobile!.deviceList();
+            } catch (_) {}
+            setInner(() {});
+          }
+
+          final devices = (data['devices'] as List?) ?? const [];
+          final account = data['account_pubkey_b64'] as String? ?? '';
+          return AlertDialog(
+            backgroundColor: _t.surface,
+            title: Text('Linked devices', style: TextStyle(color: _t.text)),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (devices.isEmpty)
+                    Text('This is a single-device account.',
+                        style: TextStyle(color: _t.textDim)),
+                  for (final d in devices.cast<Map<String, dynamic>>())
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(
+                        d['device_pubkey_b64'] == account
+                            ? Icons.smartphone
+                            : Icons.devices,
+                        color: _t.textDim,
+                      ),
+                      title: Text(
+                        d['device_pubkey_b64'] == account
+                            ? 'This device (primary)'
+                            : (d['onion'] as String? ?? 'linked device'),
+                        style: TextStyle(color: _t.text, fontSize: 14),
+                      ),
+                      subtitle: Text('${d['device_pubkey_b64']}'.substring(0, 16),
+                          style: TextStyle(
+                              color: _t.textDim,
+                              fontFamily: 'monospace',
+                              fontSize: 11)),
+                      trailing: d['device_pubkey_b64'] == account
+                          ? null
+                          : IconButton(
+                              icon: Icon(Icons.link_off,
+                                  color: Colors.red.shade400, size: 20),
+                              onPressed: () async {
+                                try {
+                                  await _mobile!.deviceRevoke(
+                                      d['device_pubkey_b64'] as String);
+                                  await refresh();
+                                } catch (e) {
+                                  _snack('$e');
+                                }
+                              },
+                            ),
+                    ),
+                  const Divider(height: 24),
+                  Text(
+                      'Link this phone to your account: on your other device, open '
+                      'Settings → Linked devices → Link a new device, then scan its QR.',
+                      style: TextStyle(color: _t.textDim, fontSize: 12.5)),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: FilledButton.icon(
+                      icon: const Icon(Icons.qr_code_scanner, size: 18),
+                      label: const Text('Scan to link this device'),
+                      onPressed: () async {
+                        final raw = await _scanQrString('Scan pairing QR');
+                        if (raw == null || raw.trim().isEmpty) return;
+                        try {
+                          await _mobile!.deviceLink(raw.trim());
+                          _snack('Linked to account');
+                          await refresh();
+                        } catch (e) {
+                          _snack('Link failed: $e');
+                        }
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Close')),
+            ],
+          );
+        },
+      ),
+    );
   }
 
   Future<String?> _promptPassphrase({
@@ -6646,18 +6850,22 @@ class _ChatScreenState extends State<_ChatScreen>
                       await _showAppLockDialog();
                     },
                   ),
-                  if (!_canUseMobileBackend)
-                    ListTile(
-                      leading: const Icon(Icons.devices_outlined),
-                      title: const Text('Linked devices'),
-                      subtitle: const Text(
-                          'Use this account on another device (pair over LAN)'),
-                      trailing: const Icon(Icons.chevron_right, size: 20),
-                      onTap: () async {
-                        Navigator.of(dialogContext).pop();
+                  ListTile(
+                    leading: const Icon(Icons.devices_outlined),
+                    title: const Text('Linked devices'),
+                    subtitle: Text(_canUseMobileBackend
+                        ? 'Add this phone to an account (scan a QR)'
+                        : 'Use this account on another device (pair over LAN)'),
+                    trailing: const Icon(Icons.chevron_right, size: 20),
+                    onTap: () async {
+                      Navigator.of(dialogContext).pop();
+                      if (_mobileReady) {
+                        await _showMobileLinkedDevicesDialog();
+                      } else {
                         await _showLinkedDevicesDialog();
-                      },
-                    ),
+                      }
+                    },
+                  ),
                   SwitchListTile(
                     secondary: const Icon(Icons.notifications_active_outlined),
                     title: Text(_canUseMobileBackend

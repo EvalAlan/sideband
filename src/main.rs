@@ -264,6 +264,11 @@ enum CommandKind {
         #[command(subcommand)]
         action: ContactAction,
     },
+    /// Print the QR matrix (JSON array of "0/1" row strings) for arbitrary text.
+    Qr {
+        #[arg(long)]
+        text: String,
+    },
     /// Manage this account's devices (multi-device: list / pair / link / revoke).
     Device {
         #[command(subcommand)]
@@ -4931,6 +4936,10 @@ async fn main() -> Result<()> {
             }
             set_db_passphrase(&profile, &passphrase)?;
             println!("ok");
+            Ok(())
+        }
+        CommandKind::Qr { text } => {
+            println!("{}", serde_json::to_string(&qr_matrix(&text)?)?);
             Ok(())
         }
         CommandKind::Device { action } => match action {
