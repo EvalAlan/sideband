@@ -46,6 +46,7 @@ pub trait Transport: Send + Sync {
     async fn try_recv(&self) -> Result<Option<Envelope>>;
 }
 
+pub mod ble;
 pub mod bluetooth;
 pub mod btp;
 pub mod lan;
