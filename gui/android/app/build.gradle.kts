@@ -59,9 +59,27 @@ android {
         release {
             // Real release signing when android/key.properties is present; otherwise fall
             // back to the debug key so local/dev `flutter run --release` builds keep working.
+            //
+            // A debug-signed build must NEVER be distributed: users could not install
+            // updates signed with the real key, and app stores reject it. Distribution
+            // builds therefore pass -PrequireReleaseSigning=true (see build.sh release)
+            // which turns the silent fallback into a hard failure.
+            val requireReleaseSigning =
+                (project.findProperty("requireReleaseSigning") as String?)?.toBoolean() ?: false
+            if (!hasReleaseSigningConfig && requireReleaseSigning) {
+                throw GradleException(
+                    "Release signing required but android/key.properties is missing. " +
+                        "See ANDROID_BUILD.md to generate a keystore, or drop " +
+                        "-PrequireReleaseSigning for a local debug-signed build."
+                )
+            }
             signingConfig = if (hasReleaseSigningConfig) {
                 signingConfigs.getByName("release")
             } else {
+                logger.warn(
+                    "WARNING: signing this release build with the DEBUG key " +
+                        "(android/key.properties not found). Do not distribute this artifact."
+                )
                 signingConfigs.getByName("debug")
             }
             // Flutter runs R8 on release builds. Keep it on (smaller APK) but apply our

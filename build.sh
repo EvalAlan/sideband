@@ -7,11 +7,14 @@
 #   ./build.sh tui             # the Rust CLI/TUI binary
 #   ./build.sh desktop         # the Linux desktop GUI as an AppImage
 #   ./build.sh android         # Rust jniLibs for all ABIs + the release APK
+#   ./build.sh release         # per-ABI APKs + App Bundle for distribution
 #   ./build.sh tui android     # any combination of targets
 #
 # All final artifacts are staged into dist/:
 #   dist/sideband                  # TUI/CLI binary
-#   dist/sideband.apk              # Android release APK
+#   dist/sideband.apk              # Android release APK (all ABIs; dev/testing)
+#   dist/sideband-<abi>.apk        # per-ABI APKs   (./build.sh release)
+#   dist/sideband.aab              # Play App Bundle (./build.sh release)
 #   dist/Sideband-<arch>.AppImage  # Linux desktop AppImage
 #
 # Env:
@@ -119,6 +122,36 @@ build_android() {
   log "Building the release APK..."
   ( cd "${GUI_DIR}" && "$FLUTTER" build apk --release )
   stage_artifact "${GUI_DIR}/build/app/outputs/flutter-apk/app-release.apk" "sideband.apk"
+}
+
+# --- android release artifacts (store / distribution) ------------------------
+#
+# The fat APK carries every ABI (~133MB) because each one embeds a ~20MB Rust
+# static lib plus a Flutter engine. Nobody should download that:
+#   * Google Play requires an App Bundle for new apps anyway; Play then serves
+#     each device only its own slice.
+#   * For direct downloads (GitHub Releases / Obtainium / sideloading), ship
+#     per-ABI APKs — an arm64 phone downloads roughly a third of the fat APK.
+
+build_android_release() {
+  build_android
+
+  log "Building per-ABI release APKs..."
+  ( cd "${GUI_DIR}" && "$FLUTTER" build apk --release --split-per-abi \
+      -PrequireReleaseSigning=true )
+  local apk_dir="${GUI_DIR}/build/app/outputs/flutter-apk"
+  for abi in arm64-v8a armeabi-v7a x86_64; do
+    local built="${apk_dir}/app-${abi}-release.apk"
+    [[ -f "${built}" ]] && stage_artifact "${built}" "sideband-${abi}.apk"
+  done
+
+  log "Building the App Bundle (Google Play)..."
+  ( cd "${GUI_DIR}" && "$FLUTTER" build appbundle --release \
+      -PrequireReleaseSigning=true )
+  stage_artifact "${GUI_DIR}/build/app/outputs/bundle/release/app-release.aab" "sideband.aab"
+
+  warn "Release artifacts must be signed with the RELEASE key."
+  warn "Verify with: apksigner verify --print-certs dist/sideband-arm64-v8a.apk"
 }
 
 # --- desktop (Linux AppImage) ------------------------------------------------
@@ -294,8 +327,9 @@ for t in "${targets[@]}"; do
     tui)     build_tui ;;
     desktop) build_desktop ;;
     android) build_android ;;
+    release) build_android_release ;;
     all)     build_tui; build_android; build_desktop ;;
-    *)       err "unknown target '$t' (use: tui | desktop | android | all)"; usage 2 ;;
+    *)       err "unknown target '$t' (use: tui | desktop | android | release | all)"; usage 2 ;;
   esac
 done
 
