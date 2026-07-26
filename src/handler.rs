@@ -104,6 +104,10 @@ pub async fn handle_inbound(
         return handle_device_list_push(profile, contacts, msg);
     }
 
+    if msg.r#type == "device_sync" {
+        return handle_device_sync(profile, contacts, msg);
+    }
+
     if msg.r#type == "transport_props" {
         handle_transport_props(profile, contacts, msg).await?;
         if let Ok(contact_name) = resolve_contact_name_by_pubkey(contacts, &msg.from) {
@@ -387,6 +391,28 @@ pub(crate) async fn handle_receipt(
 /// Handle an inbound presence heartbeat (A7): verify it came from an accepted
 /// contact, then record their state with a receiver-stamped validity window.
 /// Never stored as a message or shown; `seq` gates out stale/reordered packets.
+/// One of our own devices synced state to us (a message the user sent there, or
+/// what they've read). `apply_device_sync` enforces that the sender is genuinely
+/// one of this account's devices before touching any data.
+pub(crate) fn handle_device_sync(
+    profile: &Path,
+    contacts: &ContactsMap,
+    msg: &mut ChatMessage,
+) -> Result<()> {
+    let (plaintext, verified) = match decrypt_and_verify(msg, profile, contacts) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    if !verified {
+        return Ok(());
+    }
+    let applied = crate::apply_device_sync(profile, &msg.from, &plaintext)?;
+    if applied {
+        tracing::debug!("applied a device sync op from a sibling device");
+    }
+    Ok(())
+}
+
 /// A contact pushed us their updated signed device list (they linked or revoked
 /// a device). Verify it came from that contact's account and store it, so our
 /// send fan-out + inbound attribution learn their new device set.

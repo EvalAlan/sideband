@@ -3558,6 +3558,12 @@ pub(crate) async fn send_read_receipt(
     up_to_ms: u128,
     tor_client: Arc<TorClient<PreferredRuntime>>,
 ) -> Result<()> {
+    // Tell our own other devices what we've read, so the unread badge clears
+    // everywhere. This is independent of the read-receipt privacy setting, which
+    // only governs telling the *contact*.
+    let sync = device_sync_read_state(contact_name, up_to_ms);
+    broadcast_device_sync(profile, &sync, Arc::clone(&tor_client));
+
     if !read_receipts_enabled(profile) {
         return Ok(());
     }
@@ -6633,6 +6639,205 @@ pub(crate) fn store_pushed_device_list(
     save_contact_device_list(profile, contact_name, &list)
 }
 
+// ── Multi-device: self-sync across your own devices ─────────────────────────
+//
+// Fan-out delivers a contact's messages to every one of your devices directly,
+// so INBOUND history converges on its own. What doesn't is state only one of
+// your devices knows: a message YOU sent from your phone, and what you've read.
+// Those are replicated over a device-to-device sync op, encrypted to the sibling
+// device and applied idempotently (deduped by sync_id, reusing the sync_seen
+// table). A sync op is only ever accepted from a device in OUR OWN signed device
+// list — that check is what stops a contact injecting fake history.
+
+const DEVICE_SYNC_KIND: &str = "device_sync";
+const DEVICE_SYNC_OP_MESSAGE_ECHO: &str = "message_echo";
+const DEVICE_SYNC_OP_READ_STATE: &str = "read_state";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DeviceSyncPayload {
+    pub kind: String,
+    pub op: String,
+    /// 32-hex dedup id (see `sync::mark_received`).
+    pub sync_id: String,
+    /// The conversation this op belongs to (contact name).
+    pub contact: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub timestamp_ms: u64,
+    #[serde(default)]
+    pub up_to_ms: u64,
+}
+
+fn new_sync_id() -> String {
+    let mut id = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id);
+    hex::encode(id)
+}
+
+/// The cert for one of THIS account's *other* devices, if `device_pubkey_b64` is
+/// in our own verified device list and isn't us. `None` for anyone else — the
+/// gate that stops a contact (or an attacker) injecting sync ops into our data.
+fn sibling_device(profile: &Path, device_pubkey_b64: &str) -> Option<DeviceCert> {
+    let me = B64.encode(load_signing_key(profile).ok()?.verifying_key().to_bytes());
+    if device_pubkey_b64 == me {
+        return None; // our own echo coming back
+    }
+    let account = account_pubkey(profile).ok()?;
+    let list = load_device_list(profile).ok()??;
+    if verify_device_list(&list, &account).is_err() {
+        return None;
+    }
+    list.devices
+        .iter()
+        .find(|d| d.device_pubkey_b64 == device_pubkey_b64)
+        .cloned()
+}
+
+/// Apply a sync op received from one of our own devices. Idempotent: the same
+/// `sync_id` from the same device is applied at most once. Returns whether it
+/// was applied (false = ignored/duplicate, never an error, so inbound handling
+/// can't be wedged by a malformed op).
+pub(crate) fn apply_device_sync(
+    profile: &Path,
+    from_device_b64: &str,
+    payload_json: &str,
+) -> Result<bool> {
+    let payload: DeviceSyncPayload = match serde_json::from_str(payload_json) {
+        Ok(p) => p,
+        Err(_) => return Ok(false),
+    };
+    if payload.kind != DEVICE_SYNC_KIND || payload.contact.trim().is_empty() {
+        return Ok(false);
+    }
+    // Only our own devices may sync state into this profile.
+    if sibling_device(profile, from_device_b64).is_none() {
+        return Ok(false);
+    }
+    // Dedup: apply only the first delivery of this op from this device.
+    match crate::sync::mark_received(profile, from_device_b64, &payload.sync_id) {
+        Ok(true) => {}
+        _ => return Ok(false),
+    }
+    match payload.op.as_str() {
+        DEVICE_SYNC_OP_MESSAGE_ECHO => {
+            // A message the user sent from another of their devices: record it
+            // as outbound here so the conversation reads the same everywhere.
+            store_message(
+                profile,
+                "out",
+                &payload.contact,
+                "",
+                &payload.body,
+                payload.timestamp_ms as u128,
+                DeliveryStatus::Sent,
+            )?;
+        }
+        DEVICE_SYNC_OP_READ_STATE => {
+            mark_read_up_to(profile, &payload.contact, payload.up_to_ms as u128)?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Build the op announcing a message we just sent, for our other devices.
+fn device_sync_message_echo(contact: &str, body: &str, timestamp_ms: u128) -> DeviceSyncPayload {
+    DeviceSyncPayload {
+        kind: DEVICE_SYNC_KIND.to_string(),
+        op: DEVICE_SYNC_OP_MESSAGE_ECHO.to_string(),
+        sync_id: new_sync_id(),
+        contact: contact.to_string(),
+        body: body.to_string(),
+        timestamp_ms: timestamp_ms as u64,
+        up_to_ms: 0,
+    }
+}
+
+/// Build the op announcing that we read a conversation, for our other devices.
+fn device_sync_read_state(contact: &str, up_to_ms: u128) -> DeviceSyncPayload {
+    DeviceSyncPayload {
+        kind: DEVICE_SYNC_KIND.to_string(),
+        op: DEVICE_SYNC_OP_READ_STATE.to_string(),
+        sync_id: new_sync_id(),
+        contact: contact.to_string(),
+        body: String::new(),
+        timestamp_ms: 0,
+        up_to_ms: up_to_ms as u64,
+    }
+}
+
+/// Send a sync op to every other device of this account, best-effort and
+/// concurrent (a device that's offline simply misses it; inbound history still
+/// converges via fan-out). No-op for a single-device account.
+fn broadcast_device_sync(
+    profile: &Path,
+    payload: &DeviceSyncPayload,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> usize {
+    let Ok(Some(list)) = load_device_list(profile) else {
+        return 0;
+    };
+    let Ok(me) = load_signing_key(profile).map(|k| B64.encode(k.verifying_key().to_bytes())) else {
+        return 0;
+    };
+    let Ok(body) = serde_json::to_string(payload) else {
+        return 0;
+    };
+    let account = list.account_pubkey_b64.clone();
+    let sender_onion = std::env::var("SIDEBAND_REPLY_ONION").unwrap_or_default();
+    let mut spawned = 0usize;
+    for device in list.devices {
+        if device.device_pubkey_b64 == me || device.onion.is_empty() {
+            continue;
+        }
+        // Our own device is not a contact, so encrypt straight to the device's
+        // X25519 key from its cert (the per-endpoint builder takes it directly).
+        let endpoint = ContactEndpoint {
+            device_pubkey_b64: device.device_pubkey_b64.clone(),
+            onion: device.onion.clone(),
+            x25519_pubkey_b64: device.x25519_pubkey_b64.clone(),
+        };
+        let msg = match build_outbound_message_for_endpoint(
+            profile,
+            &device.device_pubkey_b64,
+            &endpoint,
+            &account,
+            "device_sync",
+            &body,
+            &sender_onion,
+            None,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error=%e, "building device-sync message failed");
+                continue;
+            }
+        };
+        let wire = match serde_json::to_string(&msg) {
+            Ok(s) => format!("{s}\n"),
+            Err(_) => continue,
+        };
+        let tc = tor_client.clone();
+        let onion = device.onion.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                deliver_payload_over_tor(&tc, &onion, &wire),
+            )
+            .await
+            {
+                Ok(Ok(())) => tracing::debug!(device_onion=%onion, "device sync delivered"),
+                _ => {
+                    tracing::debug!(device_onion=%onion, "device sync not delivered (best-effort)")
+                }
+            }
+        });
+        spawned += 1;
+    }
+    spawned
+}
+
 fn load_contact_device_list(profile: &Path, contact_name: &str) -> Result<Option<DeviceList>> {
     let path = contact_device_list_path(profile, contact_name);
     if !path.exists() {
@@ -8921,10 +9126,19 @@ pub(crate) async fn send_in_conversation(
         let _ = set_message_fingerprint(profile, stored_row_id, &message_replay_fingerprint(&msg));
     }
 
+    // Self-sync: tell our OWN other devices about the message we just sent, so
+    // the conversation reads the same on the user's phone and laptop. Inbound
+    // messages already reach every device via the contact's fan-out; only what
+    // we originate here needs replicating. Best-effort; no-op single-device.
+    if conversation_kind == "contact" && !is_retry && status == DeliveryStatus::Sent {
+        let echo = device_sync_message_echo(contact_hint, &body_for_history, msg.timestamp_ms);
+        broadcast_device_sync(profile, &echo, Arc::clone(&tor_client));
+    }
+
     // Multi-device fan-out: best-effort deliver to the contact's *other* devices.
     // Device 0 (the primary `to`) was handled above and drives status/history/
-    // retry; additional linked devices are fire-and-forget for now (a failure is
-    // reconciled later by device self-sync, Phase 4). Skipped on retries so we
+    // retry; additional linked devices are fire-and-forget (a failure is
+    // reconciled later by device self-sync). Skipped on retries so we
     // don't re-fan on every retry attempt. A single-device contact has no extra
     // devices, so this is a no-op today.
     if conversation_kind == "contact" && !is_retry {
@@ -9742,6 +9956,100 @@ mod tests {
             new_device_pairing_request(newdev2.path(), &secret, "n2.onion", "Tablet").unwrap();
         let wrong = vec![9u8; 32];
         assert!(primary_handle_pairing_request(primary.path(), &wrong, &req2).is_err());
+    }
+
+    /// Give `profile` a 2-device self list and return the sibling device's
+    /// pubkey (a device that belongs to this account but isn't us).
+    fn add_sibling_device(profile: &std::path::Path) -> String {
+        build_self_device_list(profile, "me.onion", 1).unwrap();
+        let sibling = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        add_device_to_self_list(
+            profile,
+            &sibling,
+            "sibling.onion",
+            &B64.encode([4u8; 32]),
+            &["msg".to_string()],
+        )
+        .unwrap();
+        sibling
+    }
+
+    #[test]
+    fn device_sync_echo_and_read_state_apply_once_from_our_own_device() {
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        init_db(dir.path()).unwrap();
+        let sibling = add_sibling_device(dir.path());
+
+        // A message the user sent from their other device lands in history here.
+        let echo = device_sync_message_echo("bob", "sent from my phone", 4242);
+        let json = serde_json::to_string(&echo).unwrap();
+        assert!(apply_device_sync(dir.path(), &sibling, &json).unwrap());
+        let history = load_history(dir.path(), Some("bob"), 50).unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|row| row.body.contains("sent from my phone")),
+            "the sibling device's sent message should appear in our history"
+        );
+
+        // Replaying the exact same op is ignored (idempotent), so no duplicate.
+        assert!(!apply_device_sync(dir.path(), &sibling, &json).unwrap());
+        let after = load_history(dir.path(), Some("bob"), 50).unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|row| row.body.contains("sent from my phone"))
+                .count(),
+            1,
+            "a replayed sync op must not duplicate history"
+        );
+
+        // Read state from our other device applies too.
+        let read = device_sync_read_state("bob", 9999);
+        assert!(
+            apply_device_sync(dir.path(), &sibling, &serde_json::to_string(&read).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn device_sync_is_ignored_from_anyone_who_is_not_our_device() {
+        let dir = tempfile::tempdir().unwrap();
+        init_profile(dir.path()).unwrap();
+        init_db(dir.path()).unwrap();
+        add_sibling_device(dir.path());
+
+        // A stranger (or a contact) cannot inject history into our account.
+        let stranger = B64.encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let forged = device_sync_message_echo("bob", "injected by an attacker", 1);
+        assert!(!apply_device_sync(
+            dir.path(),
+            &stranger,
+            &serde_json::to_string(&forged).unwrap()
+        )
+        .unwrap());
+        let history = load_history(dir.path(), Some("bob"), 50).unwrap();
+        assert!(
+            !history
+                .iter()
+                .any(|r| r.body.contains("injected by an attacker")),
+            "a non-device must never write history"
+        );
+
+        // Our own key is not a "sibling" either (don't apply our own echo back).
+        let me = B64.encode(
+            load_signing_key(dir.path())
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert!(!apply_device_sync(
+            dir.path(),
+            &me,
+            &serde_json::to_string(&device_sync_message_echo("bob", "self echo", 2)).unwrap()
+        )
+        .unwrap());
     }
 
     fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {
