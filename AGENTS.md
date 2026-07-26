@@ -146,6 +146,44 @@ everything inline" or "spawn a subagent for each thing."
 
 _Update this section as part of the handoff protocol._
 
+**Where things stand (2026-07-26) — paused for a break, tree clean + pushed.**
+
+- **Multi-device (independent peers): COMPLETE.** Phases 1–5 shipped (crypto
+  core → CLI → desktop GUI → FFI → Android GUI w/ QR scan), plus **Phase 4
+  self-sync** (`a100902`): a message sent from one of your devices echoes to the
+  others, and read-state syncs. Sync ops are accepted **only** from a device in
+  your own signed device list, and are idempotent via `sync::mark_received`.
+  Only Phase 6 (hardening: revocation propagation, version conflicts,
+  adversarial device lists) remains, and it's optional.
+
+- **Bluetooth: root-caused and reworked, UNVERIFIED ON HARDWARE.** The original
+  bug: a peer's BT address was only ever learned from `transport_props` sent
+  over Tor/LAN, so BT could never work without prior internet — no stored prop
+  means `outbound_routes` yields no BT route and sends fall through to Tor.
+  Fixes: the share code now carries the BT address (`0fbb0ab`), and we adopted
+  **Briar's model** (`78a02c6`) — **insecure RFCOMM** (the secure variants
+  require system bonding; that one API choice forced pairing), a **rotating
+  service UUID** derived from account key + 15-min epoch (replacing a random
+  static UUID that had to be shipped out-of-band), and **discovery** via
+  `ACTION_FOUND` since `bondedDevices` is empty without bonding.
+  **NEXT for BT:** the last Briar piece — SDP UUID matching, so a peer's address
+  is learned purely from scanning. Then **BLE** (plan:
+  `docs/plans/2026-07-24-ble-transport.md`, BLE-1 adv-identity done in
+  `a59709c`) for passive/background discovery, battery, and mesh.
+  ⚠️ Radio behaviour cannot be tested in this environment — needs Alan's two
+  phones. Rust logic is unit-tested; Kotlin is compile-verified only.
+
+- **Distribution groundwork (`f674bc3`):** added `LICENSE` (MIT) and
+  `PRIVACY.md`; `./build.sh release` now emits per-ABI APKs + an App Bundle (the
+  fat APK is ~133MB because each ABI embeds a ~20MB Rust lib + Flutter engine);
+  release builds no longer silently fall back to the **debug** key —
+  `-PrequireReleaseSigning=true` makes that a hard failure.
+  **Open items before any public release:** generate + back up a release
+  keystore, host PRIVACY.md at a URL, decide the **ML Kit** question (the
+  `mobile_scanner` → Play Services dependency blocks F-Droid), run
+  `/security-review`, bump `0.1.0`. Recommended first channel: GitHub Releases +
+  Obtainium beta, not a store.
+
 **Direction note (2026-07-17):** the Beeper-style **Connected Apps / Matrix
 bridges** and the **LoRa** work are **parked** on the `bridges-parked` branch
 (now also pushed to `origin`); `main` was resolved by **force-push** so local ==

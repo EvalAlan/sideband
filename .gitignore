@@ -8,6 +8,7 @@
 
 # Flutter / Android build output + AppImage scaffolding (all regenerable)
 gui/build/
+gui/android/build/
 gui/AppDir/
 gui/android/app/src/main/jniLibs/
 
