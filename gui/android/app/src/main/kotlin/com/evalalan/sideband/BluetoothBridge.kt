@@ -5,7 +5,10 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
@@ -78,6 +81,7 @@ internal class BluetoothBridge(
         // long, so peers that connect then stall can't hold the fixed ioExecutor.
         private const val SESSION_IDLE_TIMEOUT_MS = 120_000L
         private const val WATCHDOG_INTERVAL_MS = 5_000L
+        private const val DISCOVERED_MAX = 64
     }
 
     private val appContext = context.applicationContext
@@ -97,6 +101,7 @@ internal class BluetoothBridge(
     private val inFlightDials = mutableMapOf<Long, BluetoothSocket>()
     private val nextInboundSession = AtomicLong(1)
 
+    @Volatile private var discoveryRegistered: Boolean = false
     @Volatile private var localSocket: LocalSocket? = null
     @Volatile private var serverSocket: BluetoothServerSocket? = null
 
@@ -108,7 +113,15 @@ internal class BluetoothBridge(
         if (!adapter.isEnabled) throw IllegalStateException("Bluetooth is disabled")
 
         try {
-            serverSocket = adapter.listenUsingRfcommWithServiceRecord(SERVICE_NAME, serviceUuid)
+            // INSECURE RFCOMM on purpose (Briar does the same): the secure
+            // variant requires the two devices to be bonded in system Bluetooth
+            // settings, which makes offline first-contact impossible. We do not
+            // need Bluetooth's link-layer security — every byte on this socket is
+            // already end-to-end encrypted and authenticated by Sideband's own
+            // crypto (BTP). Dropping bonding only widens who may *open* a socket;
+            // they still cannot produce valid frames for a contact they aren't.
+            serverSocket =
+                adapter.listenUsingInsecureRfcommWithServiceRecord(SERVICE_NAME, serviceUuid)
         } catch (e: SecurityException) {
             running.set(false)
             throw SecurityException("Bluetooth permission denied", e)
@@ -116,6 +129,18 @@ internal class BluetoothBridge(
             running.set(false)
             throw IOException("could not open Bluetooth listener", e)
         }
+        try {
+            appContext.registerReceiver(
+                discoveryReceiver,
+                IntentFilter(BluetoothDevice.ACTION_FOUND),
+            )
+            discoveryRegistered = true
+        } catch (_: Exception) {
+            discoveryRegistered = false
+        }
+        // Prime the cache so an unpaired contact nearby is resolvable by name.
+        startDiscovery(adapter)
+
         acceptExecutor.execute(::acceptLoop)
         localExecutor.execute(::localSocketLoop)
         watchdog.scheduleWithFixedDelay(
@@ -214,7 +239,9 @@ internal class BluetoothBridge(
                 val adapter = BluetoothAdapter.getDefaultAdapter()
                     ?: throw IOException("Bluetooth unavailable")
                 val device: BluetoothDevice = resolveDevice(adapter, address)
-                socket = device.createRfcommSocketToServiceRecord(uuid)
+                // Insecure to match the listener: no bonding required, so a
+                // contact met offline can be reached without system pairing.
+                socket = device.createInsecureRfcommSocketToServiceRecord(uuid)
                 synchronized(sessionLock) { inFlightDials[id] = socket }
                 // Watchdog: closing the socket makes a stuck connect() throw, so a
                 // stalled/unreachable peer can't block the dial executor forever.
@@ -250,9 +277,65 @@ internal class BluetoothBridge(
         if (BluetoothAdapter.checkBluetoothAddress(hint)) return adapter.getRemoteDevice(hint)
         val name = hint.removePrefix("name:")
         if (name.isEmpty()) throw IOException("invalid Bluetooth device")
-        val matches = adapter.bondedDevices.filter { it.name == name }
-        if (matches.size != 1) throw IOException("Bluetooth device is not uniquely paired")
-        return matches.single()
+        // Bonded devices first (cheap), then anything we have seen while
+        // scanning. Since we use INSECURE RFCOMM the peer is usually NOT bonded,
+        // so discovery is the path that normally resolves a name.
+        adapter.bondedDevices.filter { it.name == name }.let { bonded ->
+            if (bonded.size == 1) return bonded.single()
+        }
+        discoveredByName(name)?.let { return it }
+        // Not seen yet: kick a scan so the next attempt (or the retry queue) can
+        // resolve it, and fail this one cleanly.
+        startDiscovery(adapter)
+        throw IOException("Bluetooth device not found nearby")
+    }
+
+    /** Devices seen while scanning: name -> address. Bounded, newest wins. */
+    private val discovered = LinkedHashMap<String, String>()
+
+    private fun discoveredByName(name: String): BluetoothDevice? {
+        val address = synchronized(sessionLock) { discovered[name] } ?: return null
+        return try {
+            BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(address)
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
+
+    private fun noteDiscovered(device: BluetoothDevice) {
+        val name = try {
+            device.name
+        } catch (_: SecurityException) {
+            null
+        } ?: return
+        if (name.isBlank()) return
+        synchronized(sessionLock) {
+            discovered.remove(name)
+            discovered[name] = device.address
+            while (discovered.size > DISCOVERED_MAX) {
+                val oldest = discovered.keys.firstOrNull() ?: break
+                discovered.remove(oldest)
+            }
+        }
+    }
+
+    private val discoveryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothDevice.ACTION_FOUND) return
+            val device: BluetoothDevice? =
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+            device?.let { noteDiscovered(it) }
+        }
+    }
+
+    /** Start a bounded inquiry so unpaired contacts nearby become resolvable. */
+    private fun startDiscovery(adapter: BluetoothAdapter) {
+        if (!running.get()) return
+        try {
+            if (!adapter.isDiscovering) adapter.startDiscovery()
+        } catch (_: SecurityException) {
+            // Scan permission not granted; name resolution simply won't work.
+        }
     }
 
     private fun handleWrite(command: JSONObject) {
@@ -406,6 +489,17 @@ internal class BluetoothBridge(
 
     override fun close() {
         running.set(false)
+        if (discoveryRegistered) {
+            try {
+                appContext.unregisterReceiver(discoveryReceiver)
+            } catch (_: IllegalArgumentException) {
+            }
+            discoveryRegistered = false
+        }
+        try {
+            BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery()
+        } catch (_: SecurityException) {
+        }
         serverSocket?.closeQuietly()
         serverSocket = null
         val sockets = synchronized(sessionLock) {

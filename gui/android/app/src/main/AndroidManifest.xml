@@ -15,6 +15,10 @@
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Discovery: find an unpaired contact nearby. neverForLocation so no
+         location permission is required just to reach a peer over Bluetooth. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <application
         android:label="Sideband"

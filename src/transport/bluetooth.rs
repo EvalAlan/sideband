@@ -61,6 +61,76 @@ fn valid_uuid(value: &str) -> bool {
         })
 }
 
+// ── Briar-style rotating service UUID ───────────────────────────────────────
+//
+// The legacy scheme advertises a random STATIC uuid that has to reach a contact
+// out-of-band (transport_props over Tor/LAN, or the share code). That makes
+// offline-first Bluetooth impossible, and exposes a stable identifier anyone
+// running an SDP scan can use to recognise this device forever.
+//
+// Briar's approach, adopted here: derive the advertised uuid from the ACCOUNT
+// KEY plus the current time epoch. A contact — who already holds our public key
+// — recomputes the same uuid and connects to it; nobody else can attribute it,
+// and it rotates. Combined with an SDP scan of nearby devices this removes the
+// need to know a peer's address at all: discover, match the uuid, learn the
+// address.
+
+/// How often the advertised service uuid rotates.
+pub(crate) const BT_UUID_EPOCH_SECS: u64 = 900; // 15 minutes
+
+const BT_UUID_DOMAIN: &[u8] = b"sideband-bt-service-uuid-v1";
+
+/// The epoch an absolute time falls in.
+pub(crate) fn bt_uuid_epoch(now_ms: u128) -> u64 {
+    (now_ms / 1000 / BT_UUID_EPOCH_SECS as u128) as u64
+}
+
+fn uuid_from_bytes(bytes: &[u8]) -> String {
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&bytes[..16]);
+    // Shape it as a valid RFC-4122 v4 uuid so Android's parser accepts it.
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex::encode(&b[0..4]),
+        hex::encode(&b[4..6]),
+        hex::encode(&b[6..8]),
+        hex::encode(&b[8..10]),
+        hex::encode(&b[10..16])
+    )
+}
+
+/// The RFCOMM service uuid a device with `account_pubkey_b64` advertises during
+/// `epoch`. Deterministic, so a contact can compute it from the public key alone.
+pub(crate) fn rotating_service_uuid(account_pubkey_b64: &str, epoch: u64) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(BT_UUID_DOMAIN);
+    hasher.update(account_pubkey_b64.as_bytes());
+    hasher.update(epoch.to_be_bytes());
+    uuid_from_bytes(&hasher.finalize()[..16])
+}
+
+/// Match a service uuid discovered on a nearby device against known account
+/// keys, tolerating a one-epoch skew (clock drift / rotation boundary). Returns
+/// the matching key — i.e. "that device over there is this contact".
+pub(crate) fn match_service_uuid<'a, I>(candidates: I, uuid: &str, now_ms: u128) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let epoch = bt_uuid_epoch(now_ms);
+    let candidates: Vec<&str> = candidates.into_iter().collect();
+    for probe in [epoch, epoch.saturating_sub(1), epoch.saturating_add(1)] {
+        for key in &candidates {
+            if rotating_service_uuid(key, probe).eq_ignore_ascii_case(uuid) {
+                return Some((*key).to_string());
+            }
+        }
+    }
+    None
+}
+
 const SERVICE_UUID_KEY: &str = "bluetooth_service_uuid";
 const LOCAL_DEVICE_KEY: &str = "bluetooth_local_device";
 
@@ -537,6 +607,51 @@ mod tests {
             &value.replace("12345678-1234-5678-9abc-def012345678", "bad")
         )
         .is_err());
+    }
+
+    #[test]
+    fn rotating_service_uuid_is_recognised_by_contacts_and_rotates() {
+        let alice = "ALICE_ACCOUNT_PUBKEY";
+        let bob = "BOB_ACCOUNT_PUBKEY";
+        let now = 1_700_000_000_000u128;
+        let epoch_ms = (BT_UUID_EPOCH_SECS as u128) * 1000;
+
+        // Alice advertises; Bob, who holds her key, recomputes and recognises it
+        // with no address exchange and nothing shared out of band.
+        let advertised = rotating_service_uuid(alice, bt_uuid_epoch(now));
+        assert!(valid_uuid(&advertised), "must be a well-formed uuid");
+        assert_eq!(
+            match_service_uuid([alice, bob], &advertised, now),
+            Some(alice.to_string())
+        );
+
+        // Someone who does not hold Alice's key learns nothing from the advert.
+        assert_eq!(match_service_uuid([bob], &advertised, now), None);
+
+        // It rotates, so a device cannot be tracked across epochs by its uuid.
+        let later = now + epoch_ms * 5;
+        assert_ne!(
+            advertised,
+            rotating_service_uuid(alice, bt_uuid_epoch(later))
+        );
+        assert_eq!(match_service_uuid([alice], &advertised, later), None);
+    }
+
+    #[test]
+    fn rotating_service_uuid_tolerates_one_epoch_of_clock_skew() {
+        let alice = "ALICE_ACCOUNT_PUBKEY";
+        let now = 1_700_000_000_000u128;
+        let epoch = bt_uuid_epoch(now);
+        // Two phones whose clocks differ, or an advert minted either side of a
+        // rotation boundary, must still find each other.
+        for probe in [epoch - 1, epoch + 1] {
+            let advertised = rotating_service_uuid(alice, probe);
+            assert_eq!(
+                match_service_uuid([alice], &advertised, now),
+                Some(alice.to_string()),
+                "uuid from epoch {probe} should match at epoch {epoch}"
+            );
+        }
     }
 
     #[test]

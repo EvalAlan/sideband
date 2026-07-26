@@ -1,10 +1,44 @@
-# BLE transport (bitchat-style offline messaging) — design & phased plan
+# Offline Bluetooth: Briar-parity now, BLE next — design & phased plan
 
-**Decision (2026-07-24):** add a **BLE carrier** so Sideband works like bitchat
-offline: walk into range of someone you know, no internet, **no OS Bluetooth
-pairing**, and messages flow. The existing classic-RFCOMM carrier stays (it
-works once addresses are known and is fine for larger payloads), but BLE becomes
-the offline-first path.
+**Decision (2026-07-24), revised:** the goal is offline messaging with **no OS
+Bluetooth pairing** and **no prior internet** — walk into range of someone you
+know and it works.
+
+Originally scoped as "build BLE". On reviewing **Briar** (the closest
+philosophical sibling) it turned out most of the win needs no BLE at all:
+
+| | Pairing needed? | Needs known address? |
+|---|---|---|
+| Sideband (before) | **yes** — secure RFCOMM | **yes** |
+| Briar | no — **insecure RFCOMM** | no — rotating UUID + scan |
+| bitchat | no — BLE | no — BLE advert |
+
+So the plan is now **two stages**: reach Briar parity on classic Bluetooth
+(cheap, unblocks the user's hardware today), then move to BLE for the things
+classic BT is genuinely bad at (passive/background discovery, battery, mesh).
+
+## Stage A — Briar parity on classic Bluetooth  ← IN PROGRESS
+
+1. **Insecure RFCOMM** (`listenUsingInsecureRfcommWithServiceRecord` /
+   `createInsecureRfcommSocketToServiceRecord`). Bonding is what forced system
+   pairing; we don't need Bluetooth's link security because every byte is
+   already E2E encrypted + authenticated by Sideband (BTP). Dropping it only
+   widens who may *open* a socket — they still can't forge frames.
+2. **Rotating service UUID** derived from the account key + time epoch
+   (`rotating_service_uuid` / `match_service_uuid`, `transport/bluetooth.rs`).
+   Replaces a random static UUID that had to be shipped out-of-band, and stops a
+   passive SDP scan from recognising a device across epochs.
+3. **Discovery** so an unpaired peer is reachable: cache devices seen via
+   `ACTION_FOUND`, resolve `name:` hints against bonded ∪ discovered.
+4. *(next)* **SDP UUID matching** — fetch a discovered device's service UUIDs and
+   match them against the expected per-contact UUID, so a peer's address is
+   learned automatically with no share-code/`transport_props` exchange at all.
+
+## Stage B — BLE carrier
+
+Why still do it: classic-BT inquiry is slow (~12s), power hungry, and Android
+throttles it in the background — bad for "always on, notices a friend walking
+in". BLE advertise+scan is built for exactly that, and is the path to mesh.
 
 ## Why the current Bluetooth carrier can't do this
 

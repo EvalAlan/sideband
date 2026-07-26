@@ -353,7 +353,12 @@ class MainActivity : FlutterActivity() {
             result.success(true)
             return
         }
-        val permissions = arrayOf(Manifest.permission.BLUETOOTH_CONNECT)
+        // SCAN as well as CONNECT: with insecure RFCOMM the peer is not bonded,
+        // so discovery is how an unpaired contact nearby gets resolved.
+        val permissions = arrayOf(
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_SCAN,
+        )
         if (permissions.all {
                 ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
             }) {
