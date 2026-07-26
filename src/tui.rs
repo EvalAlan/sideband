@@ -495,8 +495,14 @@ impl App {
                     let onion = fields[1].clone();
                     let pubkey = fields[2].clone();
                     let x25519_pubkey = fields[3].clone();
+                    // Optional trailing "bt:<b64>" token carries the sender's
+                    // Bluetooth address, so BT works with no prior internet.
+                    let bt_hint = fields.get(4).cloned();
                     match crate::contact_add(&self.profile, &name, &onion, &pubkey, &x25519_pubkey)
-                    {
+                        .and_then(|()| {
+                            crate::store_share_bt_hint(&self.profile, &name, bt_hint.as_deref())
+                                .map(|_| ())
+                        }) {
                         Ok(()) => {
                             self.reload_contacts();
                             self.push_sys(&format!("contact '{}' added", name), "info");

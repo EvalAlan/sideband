@@ -339,11 +339,15 @@ class Contact {
     this.blocked = false,
     this.presence = '',
     this.status = '',
+    this.btHint,
   });
   final String name;
   final String onion;
   final String pubkey;
   final String x25519Pubkey;
+  /// Optional "bt:<base64>" token from a scanned share code: the contact's
+  /// Bluetooth address, so BT delivery works with no prior internet contact.
+  final String? btHint;
   final bool ratchetActive;
   final bool pending;
   final bool blocked;
@@ -410,11 +414,13 @@ Contact? parseAddCommandContact(String raw) {
     ];
   }
   if (parts.length < 5) return null;
+  final btHint = parts.length > 5 && parts[5].startsWith('bt:') ? parts[5] : null;
   return Contact(
     name: parts[1],
     onion: parts[2],
     pubkey: parts[3],
     x25519Pubkey: parts[4],
+    btHint: btHint,
     ratchetActive: false,
     pending: false,
     blocked: false,
@@ -1822,6 +1828,7 @@ class _MobileApi {
   _Ptr1 get _dbStatus => _lookup1('sideband_api_db_status');
   _Ptr1 get _panicWipe => _lookup1('sideband_api_panic_wipe');
   _Ptr1 get _deviceListPtr => _lookup1('sideband_api_device_list');
+  _Ptr3 get _setContactBtHintPtr => _lookup3('sideband_api_set_contact_bt_hint');
   _Ptr2 get _deviceRevokePtr => _lookup2('sideband_api_device_revoke');
   _Ptr3 get _deviceLinkPtr => _lookup3('sideband_api_device_link');
   _Ptr2 get _dbUnlock => _lookup2('sideband_api_db_unlock');
@@ -1843,6 +1850,20 @@ class _MobileApi {
 
   Future<void> panicWipe() async {
     _withCString1<Object?>(await profilePath(), _panicWipe);
+  }
+
+  /// Store a scanned share code's Bluetooth address for a contact.
+  Future<void> setContactBtHint(String contact, String token) async {
+    final profile = (await profilePath()).toNativeUtf8();
+    final ccontact = contact.toNativeUtf8();
+    final ctoken = token.toNativeUtf8();
+    try {
+      _decode<Object?>(_setContactBtHintPtr(profile, ccontact, ctoken));
+    } finally {
+      calloc.free(profile);
+      calloc.free(ccontact);
+      calloc.free(ctoken);
+    }
   }
 
   Future<Map<String, dynamic>> deviceList() async {
@@ -5235,6 +5256,14 @@ class _ChatScreenState extends State<_ChatScreen>
           pubkey: contact.pubkey,
           x25519Pubkey: contact.x25519Pubkey,
         );
+        // A code scanned in person can carry the contact's Bluetooth address,
+        // so BT delivery works without them ever being online.
+        final bt = contact.btHint;
+        if (bt != null && bt.isNotEmpty) {
+          try {
+            await _mobile!.setContactBtHint(contact.name, bt);
+          } catch (_) {}
+        }
       } else {
         await _cli.addContact(
           name: contact.name,

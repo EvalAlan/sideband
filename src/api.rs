@@ -124,6 +124,7 @@ pub fn api_list_contacts(profile_path: &str) -> Result<Vec<ApiContact>> {
             ratchet_active: crate::ratchet_is_active(&profile, &c.name),
             presence: crate::get_contact_presence(&profile, &c.pubkey_b64),
             status: crate::get_contact_status(&profile, &c.pubkey_b64),
+            bt: None,
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -156,7 +157,11 @@ pub fn api_add_contact(profile_path: &str, contact: ApiContact) -> Result<()> {
         &contact.onion,
         &contact.ed25519_pubkey_b64,
         &x25519,
-    )
+    )?;
+    // A share code scanned in person can carry the contact's Bluetooth address,
+    // so BT delivery works without them ever being reachable over the internet.
+    let _ = crate::store_share_bt_hint(&profile, &contact.name, contact.bt.as_deref());
+    Ok(())
 }
 
 pub fn api_delete_contact(profile_path: &str, name: &str) -> Result<bool> {
@@ -381,6 +386,13 @@ pub fn api_panic_wipe(profile_path: &str) -> Result<bool> {
     let profile = expand_profile(profile_path);
     crate::panic_wipe_profile(&profile)?;
     Ok(true)
+}
+
+/// Store a Bluetooth address carried by a scanned share code for `contact` (its
+/// trailing `bt:<base64>` token), so Bluetooth works with no prior internet.
+pub fn api_set_contact_bt_hint(profile_path: &str, contact: &str, token: &str) -> Result<bool> {
+    let profile = expand_profile(profile_path);
+    crate::store_share_bt_hint(&profile, contact, Some(token))
 }
 
 /// Multi-device: this account's device list as JSON.
@@ -1032,6 +1044,22 @@ pub extern "C" fn sideband_api_panic_wipe(profile_path: *const c_char) -> *mut c
     json_response((|| api_panic_wipe(cstr_arg(profile_path, "profile_path")?))())
 }
 
+/// Store a share-code Bluetooth hint for a contact.
+#[no_mangle]
+pub extern "C" fn sideband_api_set_contact_bt_hint(
+    profile_path: *const c_char,
+    contact: *const c_char,
+    token: *const c_char,
+) -> *mut c_char {
+    json_response((|| {
+        api_set_contact_bt_hint(
+            cstr_arg(profile_path, "profile_path")?,
+            cstr_arg(contact, "contact")?,
+            cstr_arg(token, "token")?,
+        )
+    })())
+}
+
 /// Multi-device: this account's device list as JSON.
 #[no_mangle]
 pub extern "C" fn sideband_api_device_list(profile_path: *const c_char) -> *mut c_char {
@@ -1181,6 +1209,7 @@ pub extern "C" fn sideband_api_add_contact(
                 ratchet_active: false,
                 presence: String::new(),
                 status: String::new(),
+                bt: None,
             },
         )
     })())

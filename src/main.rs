@@ -6890,13 +6890,53 @@ pub(crate) fn share_command(profile: &Path, onion: &str) -> Result<String> {
     let ed25519_b64 = account_pubkey(profile)?;
     let x25519_pub = load_x25519_public(profile)?;
     let display_name = load_display_name(profile)?;
-    Ok(format!(
+    let mut command = format!(
         "/add {} {} {} {}",
         display_name,
         onion,
         ed25519_b64,
         B64.encode(x25519_pub.as_bytes())
-    ))
+    );
+    // Carry our Bluetooth address in the share code when BT is on, so a contact
+    // added in person can reach us over Bluetooth with no prior internet
+    // contact. Without this the BT address only ever propagates in a
+    // transport_props message over Tor/LAN, which makes offline-first BT
+    // impossible. Older clients ignore trailing tokens they don't know.
+    if let Ok(Some(property)) = crate::transport::bluetooth::local_property(profile) {
+        if let Ok(json) = serde_json::to_string(&property) {
+            command.push_str(&format!(" {SHARE_BT_PREFIX}{}", B64.encode(json)));
+        }
+    }
+    Ok(command)
+}
+
+/// Marker for the optional Bluetooth token in a share/`/add` line.
+pub(crate) const SHARE_BT_PREFIX: &str = "bt:";
+
+/// Store the Bluetooth address carried by a share code (the optional `bt:` token
+/// on an `/add` line) for `contact_name`. Returns whether a hint was applied.
+/// Unknown/garbage tokens are ignored rather than failing the contact add.
+pub(crate) fn store_share_bt_hint(
+    profile: &Path,
+    contact_name: &str,
+    token: Option<&str>,
+) -> Result<bool> {
+    let Some(token) = token.and_then(|t| t.strip_prefix(SHARE_BT_PREFIX)) else {
+        return Ok(false);
+    };
+    let Ok(decoded) = B64.decode(token.as_bytes()) else {
+        return Ok(false);
+    };
+    let Ok(value) = String::from_utf8(decoded) else {
+        return Ok(false);
+    };
+    // Only store something the Bluetooth carrier can actually parse.
+    if crate::transport::bluetooth::BluetoothProperty::parse(&value).is_err() {
+        return Ok(false);
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    set_contact_transport_prop(profile, contact_name, "bluetooth", &value, now)?;
+    Ok(true)
 }
 
 pub(crate) fn qr_unicode(payload: &str) -> Result<String> {
@@ -10050,6 +10090,46 @@ mod tests {
             &serde_json::to_string(&device_sync_message_echo("bob", "self echo", 2)).unwrap()
         )
         .unwrap());
+    }
+
+    #[test]
+    fn share_code_carries_bluetooth_address_for_offline_contact_add() {
+        // A phone with Bluetooth on advertises its BT address in its share code.
+        let sender = tempfile::tempdir().unwrap();
+        init_profile(sender.path()).unwrap();
+        init_db(sender.path()).unwrap();
+        set_bluetooth_enabled(sender.path(), true).unwrap();
+        crate::transport::bluetooth::set_local_device(sender.path(), "name:Alice Phone").unwrap();
+
+        let share = share_command(sender.path(), "alice.onion").unwrap();
+        let bt_token = share
+            .split_whitespace()
+            .find(|t| t.starts_with(SHARE_BT_PREFIX))
+            .expect("share code should carry a bt: token when Bluetooth is on");
+
+        // The contact scans it in person — with no prior internet contact, the
+        // Bluetooth address is stored and a BT route becomes available.
+        let receiver = tempfile::tempdir().unwrap();
+        init_profile(receiver.path()).unwrap();
+        init_db(receiver.path()).unwrap();
+        assert!(store_share_bt_hint(receiver.path(), "alice", Some(bt_token)).unwrap());
+        let stored = get_contact_transport_prop(receiver.path(), "alice", "bluetooth")
+            .unwrap()
+            .expect("bluetooth transport property stored from the share code");
+        assert_eq!(
+            crate::transport::bluetooth::BluetoothProperty::parse(&stored)
+                .unwrap()
+                .device,
+            "name:Alice Phone"
+        );
+
+        // With Bluetooth off there is no token, and junk is ignored (never fails
+        // the contact add).
+        set_bluetooth_enabled(sender.path(), false).unwrap();
+        let plain = share_command(sender.path(), "alice.onion").unwrap();
+        assert!(!plain.contains(SHARE_BT_PREFIX));
+        assert!(!store_share_bt_hint(receiver.path(), "bob", Some("bt:notbase64!!")).unwrap());
+        assert!(!store_share_bt_hint(receiver.path(), "bob", None).unwrap());
     }
 
     fn test_contact(name: &str, onion: &str, pubkey_b64: &str, x: &str) -> ContactFile {

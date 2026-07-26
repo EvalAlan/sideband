@@ -23,6 +23,11 @@ pub struct ApiContact {
     /// presence expiry.
     #[serde(default)]
     pub status: String,
+    /// Optional Bluetooth hint from a scanned/pasted share code (the trailing
+    /// `bt:<base64>` token). Lets Bluetooth delivery work with a contact added
+    /// in person, with no prior internet contact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
