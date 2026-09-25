@@ -48,6 +48,9 @@ jobs:
         working-directory: gui
         run: flutter pub get
 
+      - name: Build sideband binary
+        run: cargo build --bin sideband
+
       - name: Run fast gate
         run: ./run-tests.sh fast
 
