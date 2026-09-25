@@ -2,6 +2,16 @@ name: Build Linux AppImage
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'gui/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'run-tests.sh'
+      - '.github/workflows/appimage.yml'
   push:
     branches: [main]
     paths:
@@ -10,9 +20,37 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'build.rs'
+      - 'run-tests.sh'
       - '.github/workflows/appimage.yml'
 
 jobs:
+  fast:
+    name: Fast gate
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Fetch Flutter dependencies
+        working-directory: gui
+        run: flutter pub get
+
+      - name: Run fast gate
+        run: ./run-tests.sh fast
+
   appimage:
     name: AppImage (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
